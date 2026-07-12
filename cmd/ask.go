@@ -101,7 +101,7 @@ func runAsk(paneID, question string) error {
 	return nil
 }
 
-func waitForResponse(ctx context.Context, ex *tmux.Executor, paneID, baseline string) (string, error) {
+func waitForResponse(ctx context.Context, ex tmux.Executor, paneID, baseline string) (string, error) {
 	interval := time.Duration(askInterval) * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

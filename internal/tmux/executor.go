@@ -22,13 +22,13 @@ type PaneInfo struct {
 	WindowActive bool
 }
 
-type Executor struct{}
+type executorImpl struct{}
 
-func NewExecutor() *Executor {
-	return &Executor{}
+func NewExecutor() Executor {
+	return &executorImpl{}
 }
 
-func (e *Executor) exec(args ...string) (string, error) {
+func (e *executorImpl) exec(args ...string) (string, error) {
 	cmd := exec.Command("tmux", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -37,11 +37,11 @@ func (e *Executor) exec(args ...string) (string, error) {
 	return string(out), nil
 }
 
-func (e *Executor) Exec(args ...string) (string, error) {
+func (e *executorImpl) Exec(args ...string) (string, error) {
 	return e.exec(args...)
 }
 
-func (e *Executor) CapturePane(paneID string, lines int) (string, error) {
+func (e *executorImpl) CapturePane(paneID string, lines int) (string, error) {
 	if lines <= 0 {
 		lines = 100
 	}
@@ -52,7 +52,7 @@ func (e *Executor) CapturePane(paneID string, lines int) (string, error) {
 	return strings.TrimRight(out, "\n"), nil
 }
 
-func (e *Executor) CapturePaneClean(paneID string, lines int) (string, error) {
+func (e *executorImpl) CapturePaneClean(paneID string, lines int) (string, error) {
 	raw, err := e.CapturePane(paneID, lines)
 	if err != nil {
 		return "", err
@@ -60,12 +60,12 @@ func (e *Executor) CapturePaneClean(paneID string, lines int) (string, error) {
 	return ansiRegex.ReplaceAllString(raw, ""), nil
 }
 
-func (e *Executor) SendKeys(paneID, keys string) error {
+func (e *executorImpl) SendKeys(paneID, keys string) error {
 	_, err := e.exec("send-keys", "-t", paneID, keys, "Enter")
 	return err
 }
 
-func (e *Executor) SendLines(paneID, content string) error {
+func (e *executorImpl) SendLines(paneID, content string) error {
 	tmpfile, err := os.CreateTemp("", "tmux-ai-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -87,7 +87,7 @@ func (e *Executor) SendLines(paneID, content string) error {
 	return nil
 }
 
-func (e *Executor) NewWindow(name, command, cwd string) (string, error) {
+func (e *executorImpl) NewWindow(name, command, cwd string) (string, error) {
 	args := []string{"new-window", "-P", "-F", "#{window_id}"}
 	if name != "" {
 		args = append(args, "-n", name)
@@ -105,7 +105,7 @@ func (e *Executor) NewWindow(name, command, cwd string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-func (e *Executor) SplitPane(target, direction, command string) error {
+func (e *executorImpl) SplitPane(target, direction, command string) error {
 	args := []string{"split-window", "-t", target}
 	if direction == "horizontal" {
 		args = append(args, "-h")
@@ -119,7 +119,7 @@ func (e *Executor) SplitPane(target, direction, command string) error {
 	return err
 }
 
-func (e *Executor) SelectPane(paneID string) error {
+func (e *executorImpl) SelectPane(paneID string) error {
 	// switch-client moves the user's view; fall back to select-pane for headless use
 	if _, err := e.exec("switch-client", "-t", paneID); err == nil {
 		return nil
@@ -128,7 +128,7 @@ func (e *Executor) SelectPane(paneID string) error {
 	return err
 }
 
-func (e *Executor) SelectWindow(windowID string) error {
+func (e *executorImpl) SelectWindow(windowID string) error {
 	// switch-client navigates the client to the target window (including cross-session).
 	// select-window only works within the already-visible session.
 	if _, err := e.exec("switch-client", "-t", windowID); err == nil {
@@ -138,17 +138,17 @@ func (e *Executor) SelectWindow(windowID string) error {
 	return err
 }
 
-func (e *Executor) KillPane(paneID string) error {
+func (e *executorImpl) KillPane(paneID string) error {
 	_, err := e.exec("kill-pane", "-t", paneID)
 	return err
 }
 
-func (e *Executor) KillWindow(windowID string) error {
+func (e *executorImpl) KillWindow(windowID string) error {
 	_, err := e.exec("kill-window", "-t", windowID)
 	return err
 }
 
-func (e *Executor) ListPanes(windowID string) ([]string, error) {
+func (e *executorImpl) ListPanes(windowID string) ([]string, error) {
 	args := []string{"list-panes", "-a"}
 	if windowID != "" {
 		args = []string{"list-panes", "-t", windowID}
@@ -170,7 +170,7 @@ func (e *Executor) ListPanes(windowID string) ([]string, error) {
 	return result, nil
 }
 
-func (e *Executor) ListWindows(sessionID string) ([]string, error) {
+func (e *executorImpl) ListWindows(sessionID string) ([]string, error) {
 	args := []string{"list-windows", "-a"}
 	if sessionID != "" {
 		args = []string{"list-windows", "-t", sessionID}
@@ -194,7 +194,7 @@ func (e *Executor) ListWindows(sessionID string) ([]string, error) {
 
 // ResolveTarget converts any tmux target (alias, session:window, session:window.pane, %id)
 // to a canonical %pane_id by asking tmux directly.
-func (e *Executor) ResolveTarget(target string) (string, error) {
+func (e *executorImpl) ResolveTarget(target string) (string, error) {
 	out, err := e.exec("display-message", "-p", "-t", target, "#{pane_id}")
 	if err != nil {
 		return "", fmt.Errorf("cannot resolve target %q: %w", target, err)
@@ -202,7 +202,7 @@ func (e *Executor) ResolveTarget(target string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
-func (e *Executor) ListPanesDetailed() ([]PaneInfo, error) {
+func (e *executorImpl) ListPanesDetailed() ([]PaneInfo, error) {
 	const sep = "|"
 	format := strings.Join([]string{
 		"#{session_name}",

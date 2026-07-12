@@ -19,8 +19,8 @@ import (
 
 
 type Runner struct {
-	ollamaClient      *ollama.Client
-	tmux              *tmux.Executor
+	ollamaClient      ollama.Client
+	tmux              tmux.Executor
 	maxIterations     int
 	verbose           bool
 	CheckpointFile    string

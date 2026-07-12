@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-type Client struct {
+type clientImpl struct {
 	host   string
 	model  string
 	client *http.Client
@@ -61,8 +61,8 @@ type ChatResponse struct {
 	Done    bool    `json:"done"`
 }
 
-func NewClient(host, model string) *Client {
-	return &Client{
+func NewClient(host, model string) Client {
+	return &clientImpl{
 		host:  host,
 		model: model,
 		client: &http.Client{
@@ -71,7 +71,7 @@ func NewClient(host, model string) *Client {
 	}
 }
 
-func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
+func (c *clientImpl) Chat(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
 	reqBody := ChatRequest{
 		Model:    c.model,
 		Messages: messages,

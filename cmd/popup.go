@@ -103,7 +103,7 @@ func runPopup() error {
 	return nil
 }
 
-func printPopupHeader(ex *tmux.Executor, paneID string) {
+func printPopupHeader(ex tmux.Executor, paneID string) {
 	const reset = "\033[0m"
 	const bold = "\033[1m"
 	const dim = "\033[2m"
