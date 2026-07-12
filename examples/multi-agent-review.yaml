@@ -1,0 +1,37 @@
+name: multi-agent-review
+description: 平行讓多個 agent review，最後彙整結論
+
+params:
+  target_session: github
+  reviewer1: claude-sport
+  reviewer2: opencode-linker
+  summary_pane: claude-main
+
+steps:
+  # Step 1: 平行取得兩個 agent 的 review（無 depends，自動平行執行）
+  - name: review-correctness
+    type: run
+    pane: "{{params.reviewer1}}"
+    instruction: "請 review 目前 git diff 的 correctness，列出所有問題"
+
+  - name: review-security
+    type: run
+    pane: "{{params.reviewer2}}"
+    instruction: "請 review 目前 git diff 的 security 與 edge cases"
+
+  # Step 2: 兩個都完成後彙整（DAG sync point）
+  - name: summarize
+    type: run
+    pane: "{{params.summary_pane}}"
+    instruction: "根據以下兩份 review，整理出最終的 action items"
+    context_from:
+      - review-correctness
+      - review-security
+    depends: [review-correctness, review-security]
+
+  # Step 3: 通知
+  - name: notify
+    type: shell
+    command: 'notify-send "Code Review" "Review complete, check {{params.summary_pane}}"'
+    depends: [summarize]
+    on_failure: continue

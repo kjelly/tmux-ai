@@ -1,0 +1,33 @@
+name: review-pr
+description: 給定 GitHub PR 網址，clone repo 後在新 tmux 視窗啟動 Claude Code 執行 review
+
+params:
+  pr_url: ""              # 必填：GitHub PR 網址，例如 https://github.com/owner/repo/pull/123
+  window_name: pr-review  # 新視窗名稱（預設 pr-review）
+
+steps:
+  - name: clone-repo
+    type: shell
+    command: |
+      set -e
+      PR_URL="{{params.pr_url}}"
+      if [ -z "$PR_URL" ]; then
+        echo "錯誤：請提供 pr_url 參數" >&2
+        echo "用法：tmux-ai workflow run examples/review-pr.yaml --param pr_url=https://github.com/owner/repo/pull/123" >&2
+        exit 1
+      fi
+      REPO_SLUG=$(echo "$PR_URL" | sed 's|https://github.com/||' | cut -d'/' -f1,2)
+      CLONE_DIR=$(mktemp -d)
+      echo "正在 clone $REPO_SLUG ..."
+      gh repo clone "$REPO_SLUG" "$CLONE_DIR/repo" --quiet
+      echo "$CLONE_DIR/repo"
+
+  - name: open-claude-review
+    type: launch
+    depends: [clone-repo]
+    window: "{{params.window_name}}"
+    cwd: "{{steps.clone-repo.output}}"
+    command: claude
+    pattern: ">"
+    timeout: 30
+    input: "/review {{params.pr_url}}"

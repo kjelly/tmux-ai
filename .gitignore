@@ -1,0 +1,16 @@
+# Build artifacts
+/tmux-ai
+/bin/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch / working notes
+/docs/tmp/

@@ -1,0 +1,46 @@
+name: deploy-pipeline
+description: build → test → deploy，任一失敗立即通知
+
+params:
+  dev_pane: dev-shell
+  test_pane: test-pane
+  claude_pane: claude-sport
+  service: myapp
+
+steps:
+  - name: build
+    type: run
+    pane: "{{params.dev_pane}}"
+    instruction: "在這個 pane 執行 make build，等待完成後回報結果"
+
+  - name: test
+    type: run
+    pane: "{{params.test_pane}}"
+    instruction: "執行 make test，等待全部測試完成並回報通過/失敗數量"
+    depends: [build]
+
+  - name: deploy
+    type: run
+    pane: "{{params.dev_pane}}"
+    instruction: "執行 make deploy {{params.service}}，等待 deploy 完成"
+    when: "not_contains(steps.test.output, 'FAIL')"
+    depends: [test]
+
+  - name: rollback-on-fail
+    type: run
+    pane: "{{params.claude_pane}}"
+    instruction: "測試失敗，請分析原因並建議修正方向"
+    context_from: test
+    when: "contains(steps.test.output, 'FAIL')"
+    depends: [test]
+
+  - name: final-notify
+    type: shell
+    command: |
+      if command -v notify-send &>/dev/null; then
+        notify-send "Deploy Pipeline" "{{params.service}} pipeline finished"
+      fi
+      echo "Pipeline complete for {{params.service}}"
+    when: always
+    depends: [deploy, rollback-on-fail]
+    on_failure: continue

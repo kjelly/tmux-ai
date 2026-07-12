@@ -1,0 +1,47 @@
+name: build-and-fix
+description: 執行 build，失敗時自動請 claude 修正
+
+params:
+  build_pane: build-pane      # 執行 build 的 pane alias
+  claude_pane: claude-sport   # 負責修正的 claude pane
+  build_cmd: "make build"     # 可覆寫：--param build_cmd="go build ./..."
+
+steps:
+  - name: start-build
+    type: shell
+    command: "echo 'Starting build...'"
+
+  - name: run-build
+    type: run
+    pane: "{{params.build_pane}}"
+    instruction: "執行 {{params.build_cmd}} 並等待完成"
+    depends: [start-build]
+
+  - name: watch-result
+    type: watch
+    pane: "{{params.build_pane}}"
+    pattern: "error:|Error:|FAILED|Build succeeded|ok  "
+    timeout: 120
+    depends: [run-build]
+
+  - name: fix-errors
+    type: run
+    pane: "{{params.claude_pane}}"
+    instruction: "修正上方的 build 錯誤"
+    context_from: watch-result
+    when: "contains(steps.watch-result.output, 'error:')"
+    depends: [watch-result]
+
+  - name: notify-success
+    type: shell
+    command: "echo 'Build passed!'"
+    when: "not_contains(steps.watch-result.output, 'error:')"
+    depends: [watch-result]
+
+  - name: notify-done
+    type: run
+    pane: "{{params.build_pane}}"
+    instruction: "send_notification 'Build workflow complete'"
+    when: always
+    depends: [fix-errors, notify-success]
+    on_failure: continue
