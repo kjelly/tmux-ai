@@ -15,22 +15,9 @@ import (
 
 	"github.com/llmore/tmux-ai/internal/ollama"
 	"github.com/llmore/tmux-ai/internal/tmux"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 )
 
-// sanitizeLine keeps only printable ASCII, trims trailing space, and caps at 100 chars.
-func sanitizeLine(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= 32 && r < 127 {
-			b.WriteRune(r)
-		}
-	}
-	result := strings.TrimRight(b.String(), " \t")
-	if len(result) > 100 {
-		result = result[:100]
-	}
-	return result
-}
 
 type Runner struct {
 	ollamaClient      *ollama.Client
@@ -210,7 +197,7 @@ func (r *Runner) getTmuxState() (string, error) {
 				lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 				shown := 0
 				for i := len(lines) - 1; i >= 0 && shown < 3; i-- {
-					clean := sanitizeLine(lines[i])
+					clean := tmuxutil.SanitizeLine(lines[i], 100)
 					if clean != "" {
 						sb.WriteString(fmt.Sprintf("    | %s\n", clean))
 						shown++
@@ -512,10 +499,7 @@ func (r *Runner) executeTool(ctx context.Context, tc ollama.ToolCall) string {
 			return fmt.Sprintf("error: %v", err)
 		}
 		cmdName = strings.TrimSpace(cmdName)
-		shells := map[string]bool{
-			"bash": true, "zsh": true, "sh": true, "fish": true, "ksh": true, "csh": true, "tmux": true,
-		}
-		if shells[cmdName] {
+		if tmuxutil.IsIdle(cmdName) {
 			return "idle"
 		}
 		return fmt.Sprintf("busy (%s)", cmdName)

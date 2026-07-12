@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/timeparser"
-	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -72,32 +69,11 @@ func runSchedule(timeExpr, instruction, pane, session, window string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 	defer cancel()
 
-	aliases, _ := config.LoadAliases()
-	ex := tmux.NewExecutor()
+	resolver := newResolver()
+	paneID := resolver.ResolvePaneFromFlags(pane, session, window)
 
-	paneID := resolveScheduleTarget(pane, session, window, aliases, ex)
+	runner := newRunner()
+	runner.TargetPane = paneID
 
-	r := agent.NewRunner(ollamaHost, model, maxIterations, verbose)
-	r.TargetPane = paneID
-
-	return r.Run(ctx, instruction)
-}
-
-func resolveScheduleTarget(pane, session, window string, aliases config.Aliases, ex *tmux.Executor) string {
-	raw := pane
-	if raw == "" && session != "" {
-		if window != "" {
-			raw = session + ":" + window
-		} else {
-			raw = session + ":"
-		}
-	}
-	if raw == "" {
-		return ""
-	}
-	resolved := aliases.Resolve(raw)
-	if id, err := ex.ResolveTarget(resolved); err == nil {
-		return id
-	}
-	return resolved
+	return runner.Run(ctx, instruction)
 }

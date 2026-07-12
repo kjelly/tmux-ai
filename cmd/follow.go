@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -53,8 +53,8 @@ Examples:
   tmux-ai follow %25 --from-start`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		aliases, _ := config.LoadAliases()
-		paneID := resolveToPane(aliases.Resolve(args[0]))
+		r := newResolver()
+		paneID := r.ResolvePane(args[0])
 		return runFollow(paneID)
 	},
 }
@@ -80,8 +80,8 @@ func runFollow(paneID string) error {
 
 	thenPane := paneID
 	if followThenPane != "" {
-		aliases, _ := config.LoadAliases()
-		thenPane = resolveToPane(aliases.Resolve(followThenPane))
+		r := newResolver()
+		thenPane = r.ResolvePane(followThenPane)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -100,7 +100,7 @@ func runFollow(paneID string) error {
 
 	if followFromStart {
 		for _, line := range seenLines {
-			fmt.Println(sanitizeLine(line))
+			fmt.Println(tmuxutil.SanitizeLine(line, 100))
 		}
 	}
 
@@ -121,7 +121,7 @@ func runFollow(paneID string) error {
 		// Find new lines by looking for where our known tail ends in the new content
 		newStart := findNewStart(seenLines, newLines)
 		for _, line := range newLines[newStart:] {
-			clean := sanitizeLine(line)
+			clean := tmuxutil.SanitizeLine(line, 100)
 			if clean != "" {
 				fmt.Println(clean)
 			}

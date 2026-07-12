@@ -3,9 +3,9 @@ package cmd
 import (
 	"fmt"
 	"strings"
-	"unicode"
 
 	"github.com/llmore/tmux-ai/internal/tmux"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 	"github.com/spf13/cobra"
 )
 
@@ -19,22 +19,6 @@ var listCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(listCmd)
-}
-
-// sanitizeLine keeps only printable ASCII characters and truncates to 80 chars.
-// Returns empty string if the line has no readable ASCII content.
-func sanitizeLine(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= 32 && r < 127 {
-			b.WriteRune(r)
-		}
-	}
-	result := strings.TrimRightFunc(b.String(), unicode.IsSpace)
-	if len(result) > 80 {
-		result = result[:80]
-	}
-	return result
 }
 
 func printTmuxState() error {
@@ -73,7 +57,7 @@ func printTmuxState() error {
 		winMap[k] = append(winMap[k], p)
 	}
 
-	shells := map[string]bool{"bash": true, "zsh": true, "sh": true, "fish": true, "ksh": true, "csh": true, "nu": true, "tmux": true}
+	// shells map now comes from tmuxutil.ShellCommands
 
 	for _, sess := range sessionOrder {
 		fmt.Printf("Session: %s\n", sess)
@@ -93,7 +77,7 @@ func printTmuxState() error {
 					pActive = "* "
 				}
 				status := "busy"
-				if shells[p.Command] {
+				if tmuxutil.IsIdle(p.Command) {
 					status = "idle"
 				}
 				fmt.Printf("    %s%s  cmd=%-12s  [%s]\n", pActive, p.PaneID, p.Command, status)
@@ -105,7 +89,7 @@ func printTmuxState() error {
 				shown := 0
 				lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
 				for i := len(lines) - 1; i >= 0 && shown < 3; i-- {
-					clean := sanitizeLine(lines[i])
+					clean := tmuxutil.SanitizeLine(lines[i], 80)
 					if clean != "" {
 						fmt.Printf("       | %s\n", clean)
 						shown++

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -65,7 +64,7 @@ func init() {
 }
 
 func runBroadcast(instruction string) error {
-	aliases, _ := config.LoadAliases()
+	r := newResolver()
 	ex := tmux.NewExecutor()
 
 	seen := map[string]bool{}
@@ -98,7 +97,7 @@ func runBroadcast(instruction string) error {
 		for _, part := range strings.Split(broadcastPanes, ",") {
 			part = strings.TrimSpace(part)
 			if part != "" {
-				addPane(aliases.Resolve(part))
+				addPane(r.ResolvePane(part))
 			}
 		}
 	}

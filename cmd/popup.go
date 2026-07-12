@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
+	// config no longer directly used
 	"github.com/llmore/tmux-ai/internal/tmux"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 	"github.com/spf13/cobra"
 )
 
@@ -51,18 +52,8 @@ func init() {
 
 func runPopup() error {
 	ex := tmux.NewExecutor()
-	aliases, _ := config.LoadAliases()
-
-	// Resolve target pane
-	var target string
-	switch {
-	case popupPane != "":
-		target = resolveToPane(aliases.Resolve(popupPane))
-	case popupSession != "" && popupWindow != "":
-		target = resolveToPane(popupSession + ":" + popupWindow)
-	case popupSession != "":
-		target = resolveToPane(popupSession + ":")
-	}
+	r := newResolver()
+	target := r.ResolvePaneFromFlags(popupPane, popupSession, popupWindow)
 
 	printPopupHeader(ex, target)
 
@@ -130,13 +121,9 @@ func printPopupHeader(ex *tmux.Executor, paneID string) {
 				if p.PaneID != paneID {
 					continue
 				}
-				shells := map[string]bool{
-					"bash": true, "zsh": true, "sh": true,
-					"fish": true, "ksh": true, "nu": true, "tmux": true,
-				}
 				statusColor := green
 				status := "idle"
-				if !shells[p.Command] {
+				if !tmuxutil.IsIdle(p.Command) {
 					statusColor = yellow
 					status = "busy"
 				}

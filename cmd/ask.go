@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -51,8 +50,8 @@ Examples:
   tmux-ai ask %25 "some text" --no-enter`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		aliases, _ := config.LoadAliases()
-		paneID := resolveToPane(aliases.Resolve(args[0]))
+		r := newResolver()
+		paneID := r.ResolvePane(args[0])
 		question := args[1]
 		return runAsk(paneID, question)
 	},

@@ -5,12 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
-	"time"
 
-	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
-	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -62,62 +57,21 @@ func init() {
 	runCmd.Flags().StringVar(&reportPath, "report", "", "Path to generate HTML visualization report on completion")
 }
 
-// buildTarget resolves the effective tmux target from flags in priority order:
-// --pane (or alias) > --session + --window > --session alone
-func buildTarget() string {
-	aliases, _ := config.LoadAliases()
-
-	if targetPane != "" {
-		return aliases.Resolve(targetPane)
-	}
-	if targetSession != "" {
-		if targetWindow != "" {
-			return targetSession + ":" + targetWindow
-		}
-		return targetSession + ":"
-	}
-	return ""
-}
-
-// resolveToPane resolves a tmux target string to a canonical %pane_id.
-// Falls back to the original string if resolution fails (tmux still accepts most formats).
-func resolveToPane(target string) string {
-	if target == "" {
-		return ""
-	}
-	ex := tmux.NewExecutor()
-	if id, err := ex.ResolveTarget(target); err == nil {
-		return id
-	}
-	return target
-}
-
-// windowIndex tries to parse a string as an integer window index.
-// Returns the string unchanged if it is not numeric (window name case).
-func windowIndex(s string) string {
-	if _, err := strconv.Atoi(s); err == nil {
-		return s // numeric, leave as-is for tmux
-	}
-	return s
-}
-
 func runAgent(instruction string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-	defer cancel()
-
-	runner := agent.NewRunner(ollamaHost, model, maxIterations, verbose)
+	runner := newRunner()
 	runner.CheckpointFile = resumePath
 	runner.ReportFile = reportPath
 
-	if t := buildTarget(); t != "" {
-		_ = windowIndex // used implicitly via targetWindow
-		runner.TargetPane = resolveToPane(t)
+	r := newResolver()
+	if t := r.ResolvePaneFromFlags(targetPane, targetSession, targetWindow); t != "" {
+		runner.TargetPane = t
 	}
 
-	if err := runner.Run(ctx, instruction); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		return err
-	}
-
-	return nil
+	return runWithTimeout(func(ctx context.Context) error {
+		if err := runner.Run(ctx, instruction); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return err
+		}
+		return nil
+	})
 }

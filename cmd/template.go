@@ -8,9 +8,7 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
-	"github.com/llmore/tmux-ai/internal/agent"
 	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -165,25 +163,15 @@ var templateRunCmd = &cobra.Command{
 			return fmt.Errorf("template %q not found", args[0])
 		}
 
-		aliases, _ := config.LoadAliases()
+		resolver := newResolver()
+		tpane := resolver.ResolvePaneFromFlags(tmplRunPane, tmplRunSession, tmplRunWindow)
 
-		var tpane string
-		switch {
-		case tmplRunPane != "":
-			tpane = resolveToPane(aliases.Resolve(tmplRunPane))
-		case tmplRunSession != "" && tmplRunWindow != "":
-			tpane = resolveToPane(tmplRunSession + ":" + tmplRunWindow)
-		case tmplRunSession != "":
-			tpane = resolveToPane(tmplRunSession + ":")
-		}
+		runner := newRunner()
+		runner.TargetPane = tpane
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-		defer cancel()
-
-		r := agent.NewRunner(ollamaHost, model, maxIterations, verbose)
-		r.TargetPane = tpane
-
-		return r.Run(ctx, instr)
+		return runWithTimeout(func(ctx context.Context) error {
+			return runner.Run(ctx, instr)
+		})
 	},
 }
 

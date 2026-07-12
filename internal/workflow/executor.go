@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/pane"
 	"github.com/llmore/tmux-ai/internal/timeparser"
 	"github.com/llmore/tmux-ai/internal/tmux"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 )
 
 // Executor runs a Workflow as a DAG.
@@ -270,10 +270,8 @@ func (e *Executor) runStep(ctx context.Context, s *Step) *StepResult {
 }
 
 func (e *Executor) runAgentStep(ctx context.Context, s *Step) (string, error) {
-	aliases, _ := config.LoadAliases()
-	ex := tmux.NewExecutor()
 
-	target := e.resolvePane(s, aliases, ex)
+	target := e.resolvePane(s, tmuxutil.NewResolver())
 	extraCtx := e.buildExtraContext(s)
 	instruction := e.expand(s.Instruction)
 
@@ -295,10 +293,9 @@ func (e *Executor) runAgentStep(ctx context.Context, s *Step) (string, error) {
 }
 
 func (e *Executor) runWatchStep(ctx context.Context, s *Step) (string, error) {
-	aliases, _ := config.LoadAliases()
 	ex := tmux.NewExecutor()
 
-	paneID := e.resolvePane(s, aliases, ex)
+	paneID := e.resolvePane(s, tmuxutil.NewResolver())
 	pattern := e.expand(s.Pattern)
 	rangeExpr := e.expand(s.Range)
 	lines := s.Lines
@@ -508,13 +505,13 @@ func (e *Executor) runWaitStep(_ context.Context, s *Step) (string, error) {
 }
 
 func (e *Executor) runRelayStep(ctx context.Context, s *Step) (string, error) {
-	aliases, _ := config.LoadAliases()
+	resolver := tmuxutil.NewResolver()
 	ex := tmux.NewExecutor()
 
 	fromRaw := e.expand(s.From)
 	toRaw := e.expand(s.To)
-	from := resolveTarget(aliases, ex, fromRaw)
-	to := resolveTarget(aliases, ex, toRaw)
+	from := resolver.ResolvePane(fromRaw)
+	to := resolver.ResolvePane(toRaw)
 
 	lines := s.Lines
 	if lines == 0 {
@@ -551,8 +548,8 @@ func (e *Executor) runRelayStep(ctx context.Context, s *Step) (string, error) {
 }
 
 func (e *Executor) runBroadcastStep(ctx context.Context, s *Step) (string, error) {
-	aliases, _ := config.LoadAliases()
 	ex := tmux.NewExecutor()
+	broadcastResolver := tmuxutil.NewResolver()
 
 	allPanes, err := ex.ListPanesDetailed()
 	if err != nil {
@@ -580,7 +577,7 @@ func (e *Executor) runBroadcastStep(ctx context.Context, s *Step) (string, error
 		for _, part := range strings.Split(e.expand(s.Panes), ",") {
 			part = strings.TrimSpace(part)
 			if part != "" {
-				add(resolveTarget(aliases, ex, part))
+				add(broadcastResolver.ResolvePane(part))
 			}
 		}
 	}
@@ -644,28 +641,11 @@ func (e *Executor) runBroadcastStep(ctx context.Context, s *Step) (string, error
 }
 
 // resolvePane returns the canonical %pane_id for a step's pane/session/window fields.
-func (e *Executor) resolvePane(s *Step, aliases config.Aliases, ex *tmux.Executor) string {
-	raw := e.expand(s.Pane)
-	if raw == "" && s.Session != "" {
-		sess := e.expand(s.Session)
-		if s.Window != "" {
-			raw = sess + ":" + e.expand(s.Window)
-		} else {
-			raw = sess + ":"
-		}
-	}
-	return resolveTarget(aliases, ex, raw)
-}
-
-func resolveTarget(aliases config.Aliases, ex *tmux.Executor, raw string) string {
-	if raw == "" {
-		return ""
-	}
-	resolved := aliases.Resolve(raw)
-	if id, err := ex.ResolveTarget(resolved); err == nil {
-		return id
-	}
-	return resolved
+func (e *Executor) resolvePane(s *Step, resolver *tmuxutil.Resolver) string {
+	pane := e.expand(s.Pane)
+	session := e.expand(s.Session)
+	window := e.expand(s.Window)
+	return resolver.ResolvePaneFromFlags(pane, session, window)
 }
 
 // buildExtraContext gathers context_from step outputs and joins them.

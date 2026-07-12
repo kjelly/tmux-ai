@@ -1,15 +1,12 @@
 package cmd
 
 import (
-	"context"
 	"fmt"
+	"context"
 	"io"
 	"os"
 	"strings"
-	"time"
 
-	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/spf13/cobra"
 )
 
@@ -48,26 +45,16 @@ Examples:
 		}
 		extraCtx := fmt.Sprintf("%s:\n%s", label, stdin)
 
-		aliases, _ := config.LoadAliases()
+		resolver := newResolver()
+		tpane := resolver.ResolvePaneFromFlags(pipePaneFlag, pipeSessionFlag, pipeWindowFlag)
 
-		var tpane string
-		switch {
-		case pipePaneFlag != "":
-			tpane = resolveToPane(aliases.Resolve(pipePaneFlag))
-		case pipeSessionFlag != "" && pipeWindowFlag != "":
-			tpane = resolveToPane(pipeSessionFlag + ":" + pipeWindowFlag)
-		case pipeSessionFlag != "":
-			tpane = resolveToPane(pipeSessionFlag + ":")
-		}
+		runner := newRunner()
+		runner.ExtraContext = extraCtx
+		runner.TargetPane = tpane
 
-		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
-		defer cancel()
-
-		r := agent.NewRunner(ollamaHost, model, maxIterations, verbose)
-		r.ExtraContext = extraCtx
-		r.TargetPane = tpane
-
-		return r.Run(ctx, args[0])
+		return runWithTimeout(func(ctx context.Context) error {
+			return runner.Run(ctx, args[0])
+		})
 	},
 }
 

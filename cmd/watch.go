@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/pane"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
@@ -52,13 +51,13 @@ Examples:
   tmux-ai watch %25 "FAIL|ERROR" --notify "Something failed" --once=false`,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		aliases, _ := config.LoadAliases()
-		paneID := resolveToPane(aliases.Resolve(args[0]))
+		r := newResolver()
+		paneID := r.ResolvePane(args[0])
 		pattern := args[1]
 
 		thenPane := paneID
 		if watchThenPane != "" {
-			thenPane = resolveToPane(aliases.Resolve(watchThenPane))
+			thenPane = r.ResolvePane(watchThenPane)
 		}
 
 		return runWatch(paneID, pattern, thenPane, watchAbsent, watchRange)

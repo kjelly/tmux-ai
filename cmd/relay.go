@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -53,9 +52,9 @@ Examples:
 		if relayFrom == "" || relayTo == "" {
 			return fmt.Errorf("--from and --to are required")
 		}
-		aliases, _ := config.LoadAliases()
-		from := resolveToPane(aliases.Resolve(relayFrom))
-		to := resolveToPane(aliases.Resolve(relayTo))
+		r := newResolver()
+		from := r.ResolvePane(relayFrom)
+		to := r.ResolvePane(relayTo)
 		return runRelay(instruction, from, to)
 	},
 }
