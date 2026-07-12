@@ -7,34 +7,13 @@ import (
 	"github.com/llmore/tmux-ai/internal/ollama"
 )
 
-var SystemPrompt = `You are a tmux automation assistant. The user will give you a natural language instruction to accomplish a task involving tmux windows and panes.
+// baseSystemPrompt is the static portion of the system prompt — everything
+// except the tool listing, which is now auto-generated from the ToolRegistry.
+const baseSystemPrompt = `You are a tmux automation assistant. The user will give you a natural language instruction to accomplish a task involving tmux windows and panes.
 
-You have access to tmux tools (via function calling) to:
-- capture_pane: See what's displayed in a pane
-- capture_pane_clean: See clean text in a pane with ANSI escape codes stripped
-- send_keys: Type text/commands into a pane
-- send_lines: Send multi-line content to a pane
-- list_panes / list_windows: Get current tmux layout
-- new_window / split_pane: Create new panes/windows
-- select_pane / select_window: Switch focus
-- kill_pane / kill_window: Close panes/windows
-- sleep: Wait for a duration
-- wait_for_pattern: Efficiently monitor/poll a pane until a specific pattern/regex is found
-- send_keys_and_wait: Send keys to a pane and block-wait until an expected pattern appears (aborts with Ctrl+C on timeout)
-- abort_command: Send Ctrl+C (\x03) to a pane to abort a running command
-- ask_user: Ask the human user for decision input, clarification, or guidance when stuck
-- run_local_command: Run a local shell command in the workspace outside of tmux (e.g. to run tests or local checks)
-- log_progress: Print structured execution status to the console to inform the user of progress
-- find_pane_by_process: Dynamically locate a pane ID by searching for running processes (e.g. 'claude', 'python')
-- read_file: Read file contents in the local workspace directly
-- write_file: Write or modify file content in the local workspace directly
-- replace_text_in_file: Replace a specific unique target text block in a file with a new replacement text block (recommended over reading/writing the whole file to save tokens)
-- git_status_summary: Get a quick summary of modified, added, and deleted files in the git workspace
-- check_pane_idle: Check if a tmux pane is currently idle (waiting at a shell prompt) or busy
-- search_pane_history: Search the entire scrollback history of a tmux pane for a pattern, returning matching lines with context
-- send_notification: Send a system desktop notification or terminal alert to notify the user of important events or actions
-- clear_pane_history: Clear a tmux pane's history buffer to avoid matching older output logs when waiting/searching
-- finish: Complete the task
+You have access to the following tools (via function calling):`
+
+const systemPromptFooter = `
 
 IMPORTANT:
 - Think step by step. Use capture_pane to verify results.
@@ -47,6 +26,26 @@ IMPORTANT:
 - If "Captured context" is provided, treat it as the current state of the source pane when deciding what to do.
 
 Current tmux state will be provided in the user message.`
+
+// buildSystemPrompt constructs the full system prompt by combining the
+// static base text with an auto-generated tool listing from the registry.
+// This ensures the prompt always stays in sync with registered tools.
+func buildSystemPrompt(reg *ToolRegistry) string {
+	var sb strings.Builder
+	sb.WriteString(baseSystemPrompt)
+	sb.WriteString("\n")
+	for _, desc := range reg.Descriptions() {
+		sb.WriteString(desc)
+		sb.WriteString("\n")
+	}
+	sb.WriteString(systemPromptFooter)
+	return sb.String()
+}
+
+// SystemPrompt is kept for backward compatibility but now delegates to
+// buildSystemPrompt with a default registry. Prefer using buildSystemPrompt
+// directly when a ToolRegistry is available.
+var SystemPrompt = baseSystemPrompt + systemPromptFooter
 
 // BuildInitialMessage constructs the first user message.
 // targetPane: hints to the agent which pane to focus on (can be empty).
