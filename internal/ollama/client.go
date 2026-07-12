@@ -16,10 +16,10 @@ type clientImpl struct {
 }
 
 type Message struct {
-	Role      string      `json:"role"`
-	Content   string      `json:"content"`
-	ToolCalls []ToolCall  `json:"tool_calls,omitempty"`
-	ToolCallID string    `json:"tool_call_id,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
 
 type ToolCall struct {
@@ -46,8 +46,8 @@ type ChatRequest struct {
 }
 
 type Tool struct {
-	Type     string   `json:"type"`
-	Function ToolDef  `json:"function"`
+	Type     string  `json:"type"`
+	Function ToolDef `json:"function"`
 }
 
 type ToolDef struct {

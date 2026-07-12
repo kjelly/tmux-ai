@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/llmore/tmux-ai/internal/ansi"
 	"github.com/llmore/tmux-ai/internal/ollama"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/llmore/tmux-ai/internal/tmuxutil"
@@ -138,7 +139,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		if err != nil {
 			return fmt.Sprintf("error: %v", err)
 		}
-		return fmt.Sprintf("%v", panes)
+		return strings.Join(panes, "\n")
 	})
 
 	// ── list_windows ──
@@ -160,7 +161,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		if err != nil {
 			return fmt.Sprintf("error: %v", err)
 		}
-		return fmt.Sprintf("%v", windows)
+		return strings.Join(windows, "\n")
 	})
 
 	// ── new_window ──
@@ -319,7 +320,13 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		},
 	}, func(ctx context.Context, args map[string]interface{}) string {
 		ms := intArg(args, "ms", 0)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		timer := time.NewTimer(time.Duration(ms) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return "cancelled"
+		case <-timer.C:
+		}
 		return "ok"
 	})
 
@@ -347,8 +354,14 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		timeoutMs := intArg(args, "timeout_ms", 30000)
 		re, _ := regexp.Compile(pattern)
 		interval := 1000 * time.Millisecond
-		elapsed := 0
-		for elapsed < timeoutMs {
+		deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+		for {
+			if ctx.Err() != nil {
+				return fmt.Sprintf("cancelled: %v", ctx.Err())
+			}
+			if time.Now().After(deadline) {
+				break
+			}
 			content, err := tmuxExec.CapturePaneClean(paneID, 100)
 			if err == nil {
 				found := strings.Contains(content, pattern) || (re != nil && re.MatchString(content))
@@ -356,8 +369,13 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 					return content
 				}
 			}
-			time.Sleep(interval)
-			elapsed += int(interval / time.Millisecond)
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return fmt.Sprintf("cancelled: %v", ctx.Err())
+			case <-timer.C:
+			}
 		}
 		cond := "found"
 		if absent {
@@ -385,6 +403,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		fmt.Printf("\n[tmux-ai] QUESTION: %s\n", question)
 		fmt.Print("Your response: ")
 		scanner := bufio.NewScanner(os.Stdin)
+		scanner.Buffer(make([]byte, 0, 1024), 1024*1024) // 1MB max
 		if scanner.Scan() {
 			return scanner.Text()
 		}
@@ -410,7 +429,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		if verbose {
 			fmt.Printf("Executing local command: %s\n", command)
 		}
-		cmd := exec.Command("bash", "-c", command)
+		cmd := exec.CommandContext(ctx, "bash", "-c", command)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Sprintf("error: %v\noutput: %s", err, string(output))
@@ -444,8 +463,15 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 			return fmt.Sprintf("error: failed to send keys: %v", err)
 		}
 		interval := 1000 * time.Millisecond
-		elapsed := 0
-		for elapsed < timeoutMs {
+		deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+		for {
+			if ctx.Err() != nil {
+				_ = tmuxExec.SendKeys(paneID, "\x03")
+				return fmt.Sprintf("cancelled: %v", ctx.Err())
+			}
+			if time.Now().After(deadline) {
+				break
+			}
 			content, err := tmuxExec.CapturePaneClean(paneID, 100)
 			if err == nil {
 				if strings.Contains(content, pattern) {
@@ -455,8 +481,14 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 					return content
 				}
 			}
-			time.Sleep(interval)
-			elapsed += int(interval / time.Millisecond)
+			timer := time.NewTimer(interval)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				_ = tmuxExec.SendKeys(paneID, "\x03")
+				return fmt.Sprintf("cancelled: %v", ctx.Err())
+			case <-timer.C:
+			}
 		}
 		_ = tmuxExec.SendKeys(paneID, "\x03")
 		return fmt.Sprintf("error: pattern '%s' not found within %dms. sent Ctrl+C to abort.", pattern, timeoutMs)
@@ -657,8 +689,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		if err != nil {
 			return fmt.Sprintf("error: %v", err)
 		}
-		ansiRegex := regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-		cleanOut := ansiRegex.ReplaceAllString(out, "")
+		cleanOut := ansi.Strip(out)
 		lines := strings.Split(cleanOut, "\n")
 		re, err := regexp.Compile(query)
 		isRegex := err == nil

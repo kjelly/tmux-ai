@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
-	"github.com/llmore/tmux-ai/internal/tmuxutil"
 	"github.com/llmore/tmux-ai/internal/tmux"
+	"github.com/llmore/tmux-ai/internal/tmuxutil"
 	"github.com/spf13/cobra"
 )
 

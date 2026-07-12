@@ -3,18 +3,18 @@ package tmux
 // FakeExecutor is a test double for the Executor interface.
 // It records all calls and returns configurable responses.
 type FakeExecutor struct {
-	Captures         map[string]string // paneID → captured content
-	CaptureCalls     []captureCall
-	SendKeysCalls    []sendKeysCall
-	SendLinesCalls   []sendLinesCall
-	NewWindowCalls   []newWindowCall
-	NewWindowResult  string
-	ResolveResult    map[string]string // target → resolved pane ID
-	ListPanesResult  []string
+	Captures          map[string]string // paneID → captured content
+	CaptureCalls      []captureCall
+	SendKeysCalls     []sendKeysCall
+	SendLinesCalls    []sendLinesCall
+	NewWindowCalls    []newWindowCall
+	NewWindowResult   string
+	ResolveResult     map[string]string // target → resolved pane ID
+	ListPanesResult   []string
 	ListWindowsResult []string
-	PanesDetailed    []PaneInfo
-	ExecResult       map[string]string // joined args → result
-	ExecError        error
+	PanesDetailed     []PaneInfo
+	ExecResult        map[string]string // joined args → result
+	ExecError         error
 }
 
 type captureCall struct {
@@ -75,10 +75,10 @@ func (f *FakeExecutor) SplitPane(target, direction, command string) error {
 	return nil
 }
 
-func (f *FakeExecutor) SelectPane(paneID string) error  { return nil }
+func (f *FakeExecutor) SelectPane(paneID string) error     { return nil }
 func (f *FakeExecutor) SelectWindow(windowID string) error { return nil }
-func (f *FakeExecutor) KillPane(paneID string) error    { return nil }
-func (f *FakeExecutor) KillWindow(windowID string) error { return nil }
+func (f *FakeExecutor) KillPane(paneID string) error       { return nil }
+func (f *FakeExecutor) KillWindow(windowID string) error   { return nil }
 
 func (f *FakeExecutor) ListPanes(windowID string) ([]string, error) {
 	return f.ListPanesResult, nil

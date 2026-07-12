@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/llmore/tmux-ai/internal/tmuxutil"
 )
 
@@ -20,44 +19,18 @@ func (r *Runner) getTmuxState() (string, error) {
 		return "No tmux panes found.\n", nil
 	}
 
-	type winKey struct {
-		session string
-		winIdx  int
-	}
-	type winInfo struct {
-		name         string
-		sessionName  string
-		winIdx       int
-		windowActive bool
-		panes        []tmux.PaneInfo
-	}
-	winOrder := []winKey{}
-	winMap := map[winKey]*winInfo{}
-
-	for _, p := range panes {
-		k := winKey{p.SessionName, p.WindowIndex}
-		if _, ok := winMap[k]; !ok {
-			winOrder = append(winOrder, k)
-			winMap[k] = &winInfo{
-				name:         p.WindowName,
-				sessionName:  p.SessionName,
-				winIdx:       p.WindowIndex,
-				windowActive: p.WindowActive,
-			}
-		}
-		winMap[k].panes = append(winMap[k].panes, p)
-	}
+	order, winMap := tmuxutil.GroupPanesByWindow(panes)
 
 	var sb strings.Builder
-	for _, k := range winOrder {
+	for _, k := range order {
 		w := winMap[k]
 		active := ""
-		if w.windowActive {
+		if w.WindowActive {
 			active = " (active)"
 		}
-		target := fmt.Sprintf("%s:%d", w.sessionName, w.winIdx)
-		sb.WriteString(fmt.Sprintf("Session %s - Window %d [target: %s]: %s%s\n", w.sessionName, w.winIdx, target, w.name, active))
-		for _, p := range w.panes {
+		target := fmt.Sprintf("%s:%d", w.SessionName, w.WinIdx)
+		sb.WriteString(fmt.Sprintf("Session %s - Window %d [target: %s]: %s%s\n", w.SessionName, w.WinIdx, target, w.Name, active))
+		for _, p := range w.Panes {
 			pActive := ""
 			if p.PaneActive {
 				pActive = " *"

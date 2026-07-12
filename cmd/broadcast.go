@@ -1,10 +1,8 @@
 package cmd
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"strings"
 	"sync"
@@ -139,9 +137,7 @@ func runBroadcast(instruction string) error {
 	}
 
 	runForPane := func(p tmux.PaneInfo) result {
-		var buf bytes.Buffer
-		w := io.MultiWriter(os.Stdout, &buf)
-		fmt.Fprintf(w, "\033[33m=== %s (%s) ===\033[0m\n", p.PaneID, p.Command)
+		fmt.Fprintf(os.Stdout, "\033[33m=== %s (%s) ===\033[0m\n", p.PaneID, p.Command)
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSeconds)*time.Second)
 		defer cancel()
@@ -149,10 +145,8 @@ func runBroadcast(instruction string) error {
 		r := agent.NewRunner(ollamaHost, model, maxIterations, verbose)
 		r.TargetPane = p.PaneID
 
-		// Capture stdout from the runner by temporarily redirecting isn't easy,
-		// so we just run it normally — output will interleave in parallel mode.
 		err := r.Run(ctx, instruction)
-		return result{pane: p, output: buf.String(), err: err}
+		return result{pane: p, output: r.LastOutput, err: err}
 	}
 
 	if broadcastSequential {
@@ -181,6 +175,8 @@ func runBroadcast(instruction string) error {
 	for _, res := range results {
 		if res.err != nil {
 			fmt.Fprintf(os.Stderr, "  %s: \033[31merror: %v\033[0m\n", res.pane.PaneID, res.err)
+		} else if res.output != "" {
+			fmt.Printf("  %s: %s\n", res.pane.PaneID, res.output)
 		}
 	}
 	return nil

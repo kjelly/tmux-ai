@@ -2,14 +2,13 @@ package agent
 
 import (
 	"context"
-	cfg "github.com/llmore/tmux-ai/internal/config"
 	"fmt"
+	cfg "github.com/llmore/tmux-ai/internal/config"
 	"os/exec"
 
 	"github.com/llmore/tmux-ai/internal/ollama"
 	"github.com/llmore/tmux-ai/internal/tmux"
 )
-
 
 type Runner struct {
 	ollamaClient      ollama.Client
@@ -74,6 +73,9 @@ func (r *Runner) Run(ctx context.Context, instruction string) error {
 	}
 
 	for i := 0; i < r.maxIterations; i++ {
+		if ctx.Err() != nil {
+			return fmt.Errorf("cancelled: %w", ctx.Err())
+		}
 		if r.verbose {
 			fmt.Printf("[Iteration %d] Calling Ollama...\n", i+1)
 		}
@@ -93,12 +95,14 @@ func (r *Runner) Run(ctx context.Context, instruction string) error {
 			for _, tc := range resp.Message.ToolCalls {
 				result := r.tools.Execute(ctx, tc)
 				messages = append(messages, ollama.Message{
-					Role:      "tool",
+					Role:       "tool",
 					ToolCallID: tc.ID,
-					Content:   result,
+					Content:    result,
 				})
 			}
-			r.saveCheckpoint(messages)
+			if (i+1)%5 == 0 {
+				r.saveCheckpoint(messages)
+			}
 			continue
 		}
 
@@ -112,7 +116,6 @@ func (r *Runner) Run(ctx context.Context, instruction string) error {
 
 	return fmt.Errorf("max iterations (%d) reached", r.maxIterations)
 }
-
 
 // registerNotificationTool registers the send_notification tool which needs
 // access to the Runner's sendTerminalNotification method.

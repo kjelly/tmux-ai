@@ -94,6 +94,36 @@ func validateWorkflow(w *wf.Workflow) error {
 			}
 		}
 	}
+
+	// Detect cycles via DFS
+	visited := map[string]int{} // 0=unvisited, 1=in-progress, 2=done
+	var stepByName = map[string]wf.Step{}
+	for _, s := range w.Steps {
+		stepByName[s.Name] = s
+	}
+	var hasCycle func(name string) bool
+	hasCycle = func(name string) bool {
+		if visited[name] == 1 {
+			return true
+		}
+		if visited[name] == 2 {
+			return false
+		}
+		visited[name] = 1
+		s := stepByName[name]
+		for _, dep := range s.Depends {
+			if hasCycle(dep) {
+				return true
+			}
+		}
+		visited[name] = 2
+		return false
+	}
+	for _, s := range w.Steps {
+		if hasCycle(s.Name) {
+			return fmt.Errorf("circular dependency detected involving step %q", s.Name)
+		}
+	}
 	return nil
 }
 

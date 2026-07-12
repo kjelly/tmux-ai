@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 
 	"github.com/llmore/tmux-ai/internal/config"
 	"github.com/spf13/cobra"
@@ -42,7 +43,7 @@ var contextEditCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(pathDir(path), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
 		editor := os.Getenv("EDITOR")
@@ -66,7 +67,7 @@ var contextSetCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(pathDir(path), 0755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 			return err
 		}
 		if err := os.WriteFile(path, []byte(args[0]+"\n"), 0644); err != nil {
@@ -100,13 +101,4 @@ var contextClearCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(contextCmd)
 	contextCmd.AddCommand(contextShowCmd, contextEditCmd, contextSetCmd, contextClearCmd)
-}
-
-func pathDir(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' {
-			return p[:i]
-		}
-	}
-	return "."
 }

@@ -7,7 +7,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-
 )
 
 // Executor runs a Workflow as a DAG.
@@ -70,6 +69,7 @@ func (e *Executor) Run(ctx context.Context) error {
 		}
 
 		// Launch all newly-ready steps
+		progressed := false
 		for i := range steps {
 			s := &steps[i]
 			e.mu.RLock()
@@ -91,6 +91,7 @@ func (e *Executor) Run(ctx context.Context) error {
 				e.mu.Unlock()
 				fmt.Printf("\033[2m[skip]\033[0m  %s\n", s.Name)
 				resultCh <- &StepResult{Name: s.Name, Status: "skipped"}
+				progressed = true
 				continue
 			}
 
@@ -99,6 +100,7 @@ func (e *Executor) Run(ctx context.Context) error {
 			}
 
 			running[s.Name] = true
+			progressed = true
 			go func(step *Step) {
 				res := e.runStep(ctx, step)
 				e.mu.Lock()
@@ -106,6 +108,21 @@ func (e *Executor) Run(ctx context.Context) error {
 				e.mu.Unlock()
 				resultCh <- res
 			}(s)
+		}
+
+		// Deadlock detection: if nothing progressed and nothing is running,
+		// remaining steps have unsatisfiable deps.
+		if !progressed && len(running) == 0 {
+			// Identify stuck steps
+			e.mu.RLock()
+			var stuck []string
+			for _, s := range steps {
+				if _, ok := e.results[s.Name]; !ok {
+					stuck = append(stuck, s.Name)
+				}
+			}
+			e.mu.RUnlock()
+			return fmt.Errorf("workflow deadlocked: steps %v have unsatisfiable dependencies", stuck)
 		}
 
 		// Wait for any step to finish
@@ -261,4 +278,3 @@ func (e *Executor) runStep(ctx context.Context, s *Step) *StepResult {
 
 	return &StepResult{Name: s.Name, Status: status, Output: output, Err: err}
 }
-

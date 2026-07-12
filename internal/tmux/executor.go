@@ -4,12 +4,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"regexp"
 	"strconv"
 	"strings"
-)
 
-var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
+	"github.com/llmore/tmux-ai/internal/ansi"
+)
 
 type PaneInfo struct {
 	SessionName  string
@@ -57,7 +56,7 @@ func (e *executorImpl) CapturePaneClean(paneID string, lines int) (string, error
 	if err != nil {
 		return "", err
 	}
-	return ansiRegex.ReplaceAllString(raw, ""), nil
+	return ansi.Strip(raw), nil
 }
 
 func (e *executorImpl) SendKeys(paneID, keys string) error {

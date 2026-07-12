@@ -8,10 +8,10 @@ import (
 func TestParseSlice(t *testing.T) {
 	total := 100
 	cases := []struct {
-		expr       string
-		wantStart  int
-		wantEnd    int
-		wantErr    bool
+		expr      string
+		wantStart int
+		wantEnd   int
+		wantErr   bool
 	}{
 		{"[-5:]", 95, 100, false},
 		{"[:-5]", 0, 95, false},

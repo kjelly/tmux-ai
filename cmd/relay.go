@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/signal"
@@ -69,10 +68,6 @@ func init() {
 	relayCmd.Flags().IntVar(&relayLines, "lines", 80, "Lines of source pane content to capture as context")
 }
 
-func contentHash(s string) [32]byte {
-	return sha256.Sum256([]byte(s))
-}
-
 func runRelay(instruction, from, to string) error {
 	ex := tmux.NewExecutor()
 
@@ -121,7 +116,7 @@ func runRelay(instruction, from, to string) error {
 	ticker := time.NewTicker(time.Duration(relayInterval) * time.Millisecond)
 	defer ticker.Stop()
 
-	var lastHash [32]byte
+	var lastContent string
 	first := true
 
 	for {
@@ -138,26 +133,24 @@ func runRelay(instruction, from, to string) error {
 			continue
 		}
 
-		h := contentHash(content)
-
 		if relayTrigger != "" {
 			matched := strings.Contains(content, relayTrigger) || re.MatchString(content)
 			if !matched {
 				continue
 			}
 			// only trigger once per unique content
-			if h == lastHash && !first {
+			if content == lastContent && !first {
 				continue
 			}
 		} else {
 			// trigger on any content change
-			if h == lastHash && !first {
+			if content == lastContent && !first {
 				continue
 			}
 		}
 
 		first = false
-		lastHash = h
+		lastContent = content
 
 		if err := doRelay(content); err != nil {
 			fmt.Fprintf(os.Stderr, "relay error: %v\n", err)

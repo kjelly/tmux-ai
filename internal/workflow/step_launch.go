@@ -12,7 +12,6 @@ import (
 // runLaunchStep opens a new tmux window, runs a program, waits for a ready
 // pattern, then sends an initial input — all without an LLM agent.
 // Fields used: Window (name), Cwd, Command, Pattern (ready signal), Timeout, Input.
-// Fields used: Window (name), Cwd, Command, Pattern (ready signal), Timeout, Input.
 func (e *Executor) runLaunchStep(ctx context.Context, s *Step) (string, error) {
 	ex := tmux.NewExecutor()
 

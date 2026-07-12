@@ -4,11 +4,11 @@ import "testing"
 
 func TestFromChange(t *testing.T) {
 	cases := []struct {
-		name      string
-		prev      string
-		curr      string
-		wantIdx   int
-		wantText  string
+		name     string
+		prev     string
+		curr     string
+		wantIdx  int
+		wantText string
 	}{
 		{
 			name:    "no change",

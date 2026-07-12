@@ -52,4 +52,3 @@ func (e *Executor) runRelayStep(ctx context.Context, s *Step) (string, error) {
 	}
 	return r.LastOutput, nil
 }
-

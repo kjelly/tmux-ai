@@ -42,9 +42,9 @@ func TestParseAbsolute(t *testing.T) {
 	now := time.Date(2026, 6, 11, 14, 0, 0, 0, time.Local) // 14:00 today
 
 	cases := []struct {
-		expr string
-		wantH int
-		wantM int
+		expr    string
+		wantH   int
+		wantM   int
 		wantDay int // day of month
 	}{
 		{"今晚七點", 19, 0, 11},

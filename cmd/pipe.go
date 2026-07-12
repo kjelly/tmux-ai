@@ -1,8 +1,8 @@
 package cmd
 
 import (
-	"fmt"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"strings"

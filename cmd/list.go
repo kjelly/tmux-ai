@@ -32,46 +32,22 @@ func printTmuxState() error {
 		return nil
 	}
 
-	type winKey struct {
-		session string
-		winIdx  int
-	}
-	type sessionKey = string
-
-	sessionOrder := []sessionKey{}
-	sessionSeen := map[sessionKey]bool{}
-	winOrder := []winKey{}
-	winMap := map[winKey][]tmux.PaneInfo{}
-	winMeta := map[winKey]tmux.PaneInfo{}
-
-	for _, p := range panes {
-		if !sessionSeen[p.SessionName] {
-			sessionOrder = append(sessionOrder, p.SessionName)
-			sessionSeen[p.SessionName] = true
-		}
-		k := winKey{p.SessionName, p.WindowIndex}
-		if _, ok := winMap[k]; !ok {
-			winOrder = append(winOrder, k)
-			winMeta[k] = p
-		}
-		winMap[k] = append(winMap[k], p)
-	}
-
-	// shells map now comes from tmuxutil.ShellCommands
+	order, winMap := tmuxutil.GroupPanesByWindow(panes)
+	sessionOrder := tmuxutil.SessionOrder(panes)
 
 	for _, sess := range sessionOrder {
 		fmt.Printf("Session: %s\n", sess)
-		for _, k := range winOrder {
-			if k.session != sess {
+		for _, k := range order {
+			if k.Session != sess {
 				continue
 			}
-			meta := winMeta[k]
+			w := winMap[k]
 			activeMarker := ""
-			if meta.WindowActive {
+			if w.WindowActive {
 				activeMarker = " [active]"
 			}
-			fmt.Printf("  Window %d: %s%s\n", k.winIdx, meta.WindowName, activeMarker)
-			for _, p := range winMap[k] {
+			fmt.Printf("  Window %d: %s%s\n", w.WinIdx, w.Name, activeMarker)
+			for _, p := range w.Panes {
 				pActive := "  "
 				if p.PaneActive {
 					pActive = "* "

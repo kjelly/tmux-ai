@@ -112,4 +112,3 @@ func (e *Executor) runWatchStep(ctx context.Context, s *Step) (string, error) {
 		}
 	}
 }
-
