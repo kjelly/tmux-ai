@@ -90,7 +90,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 	}, func(ctx context.Context, args map[string]interface{}) string {
 		paneID := strArg(args, "pane_id")
 		keys := strArg(args, "keys")
-		if err := tmuxExec.SendKeys(paneID, keys); err != nil {
+		if err := tmuxExec.SendKeysContext(ctx, paneID, keys); err != nil {
 			return fmt.Sprintf("error: %v", err)
 		}
 		return "ok"
@@ -114,7 +114,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 	}, func(ctx context.Context, args map[string]interface{}) string {
 		paneID := strArg(args, "pane_id")
 		content := strArg(args, "content")
-		if err := tmuxExec.SendLines(paneID, content); err != nil {
+		if err := tmuxExec.SendLinesContext(ctx, paneID, content); err != nil {
 			return fmt.Sprintf("error: %v", err)
 		}
 		return "ok"
@@ -459,7 +459,7 @@ func registerAllTools(reg *ToolRegistry, tmuxExec tmux.Executor, verbose bool) {
 		keys := strArg(args, "keys")
 		pattern := strArg(args, "expected_pattern")
 		timeoutMs := intArg(args, "timeout_ms", 30000)
-		if err := tmuxExec.SendKeys(paneID, keys); err != nil {
+		if err := tmuxExec.SendKeysContext(ctx, paneID, keys); err != nil {
 			return fmt.Sprintf("error: failed to send keys: %v", err)
 		}
 		interval := 1000 * time.Millisecond

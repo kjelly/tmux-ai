@@ -1,0 +1,25 @@
+initial_pane1: >-
+  請根據附加的 pane2 最新完成工作回覆，review 目前工作樹的 git diff，確認修改是否正確、是否完整解決問題，以及測試是否充分。
+  只做 review，不修改任何檔案。若發現問題或測試不足，提供包含檔案與行號的具體報告；只有確認全部正確且測試充分時，才能判定整個任務已通過。
+
+initial_pane2: >-
+  請依附加的 pane1 最新完成 code review 回覆，逐項確認並修正所有確實存在的問題，補上或更新能覆蓋修正行為的測試程式碼，並執行相關測試。
+  回報修改與測試結果，交由 reviewer 再次檢查；最終是否通過只能由 reviewer 判定。
+
+pane1_role: >-
+  你是嚴格且唯讀的 reviewer。檢查目前 git diff 與測試；不得修改檔案。只有你能判定整個任務是否通過。
+
+pane2_role: >-
+  你是實作 agent。依 reviewer 最新問題報告修正程式碼，補上足以防止回歸的測試，並執行相關驗證。
+
+to_pane1_prompt: >-
+  請 review 目前最新 git diff，並核對下列修正回報。若仍有任何問題或測試不足，提出具體問題報告；若全部正確且測試充分，明確判定整個任務已通過。只做 review，不修改檔案。
+
+to_pane2_prompt: >-
+  請逐項修正下列 reviewer 問題，補上或更新相關測試並執行驗證。回報實際修改及測試結果；最終是否通過只能由 pane1 reviewer 判定。
+
+coordinator: true
+coordinator_timeout: 300
+round_timeout: 1800
+submit_delay: 3000
+lines: 1000

@@ -42,7 +42,7 @@ func (e *Executor) runLaunchStep(ctx context.Context, s *Step) (string, error) {
 
 	// Type the startup command (e.g. "claude").
 	if command != "" {
-		if err := ex.SendKeys(paneID, command+"\n"); err != nil {
+		if err := ex.SendKeysContext(ctx, paneID, command+"\n"); err != nil {
 			return "", fmt.Errorf("send command: %w", err)
 		}
 	}
@@ -71,7 +71,7 @@ func (e *Executor) runLaunchStep(ctx context.Context, s *Step) (string, error) {
 
 	// Send the initial input to the program (e.g. "/review <url>").
 	if input != "" {
-		if err := ex.SendKeys(paneID, input+"\n"); err != nil {
+		if err := ex.SendKeysContext(ctx, paneID, input+"\n"); err != nil {
 			return "", fmt.Errorf("send input: %w", err)
 		}
 	}

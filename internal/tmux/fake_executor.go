@@ -1,5 +1,7 @@
 package tmux
 
+import "context"
+
 // FakeExecutor is a test double for the Executor interface.
 // It records all calls and returns configurable responses.
 type FakeExecutor struct {
@@ -7,6 +9,7 @@ type FakeExecutor struct {
 	CaptureCalls      []captureCall
 	SendKeysCalls     []sendKeysCall
 	SendLinesCalls    []sendLinesCall
+	SendLinesCalled   chan struct{}
 	NewWindowCalls    []newWindowCall
 	NewWindowResult   string
 	ResolveResult     map[string]string // target → resolved pane ID
@@ -15,6 +18,8 @@ type FakeExecutor struct {
 	PanesDetailed     []PaneInfo
 	ExecResult        map[string]string // joined args → result
 	ExecError         error
+	CaptureError      error
+	ExecCalls         [][]string
 }
 
 type captureCall struct {
@@ -45,11 +50,17 @@ func NewFakeExecutor() *FakeExecutor {
 
 func (f *FakeExecutor) CapturePane(paneID string, lines int) (string, error) {
 	f.CaptureCalls = append(f.CaptureCalls, captureCall{paneID, lines})
+	if f.CaptureError != nil {
+		return "", f.CaptureError
+	}
 	return f.Captures[paneID], nil
 }
 
 func (f *FakeExecutor) CapturePaneClean(paneID string, lines int) (string, error) {
 	f.CaptureCalls = append(f.CaptureCalls, captureCall{paneID, lines})
+	if f.CaptureError != nil {
+		return "", f.CaptureError
+	}
 	return f.Captures[paneID], nil
 }
 
@@ -60,7 +71,34 @@ func (f *FakeExecutor) SendKeys(paneID, keys string) error {
 
 func (f *FakeExecutor) SendLines(paneID, content string) error {
 	f.SendLinesCalls = append(f.SendLinesCalls, sendLinesCall{paneID, content})
+	if f.SendLinesCalled != nil {
+		select {
+		case f.SendLinesCalled <- struct{}{}:
+		default:
+		}
+	}
 	return nil
+}
+
+func (f *FakeExecutor) SendKeysContext(ctx context.Context, paneID, keys string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.SendKeys(paneID, keys)
+}
+
+func (f *FakeExecutor) SendLinesContext(ctx context.Context, paneID, content string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.SendLines(paneID, content)
+}
+
+func (f *FakeExecutor) SendTextContext(ctx context.Context, paneID, content string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return f.SendLines(paneID, content)
 }
 
 func (f *FakeExecutor) NewWindow(name, command, cwd string) (string, error) {
@@ -100,6 +138,7 @@ func (f *FakeExecutor) ResolveTarget(target string) (string, error) {
 }
 
 func (f *FakeExecutor) Exec(args ...string) (string, error) {
+	f.ExecCalls = append(f.ExecCalls, append([]string(nil), args...))
 	key := joinArgs(args)
 	if f.ExecError != nil {
 		return "", f.ExecError

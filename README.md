@@ -26,6 +26,7 @@
   - [ask](#ask--直接問-pane-裡的-agent)
   - [template](#template--儲存常用指令範本)
   - [follow](#follow--即時串流-pane-輸出)
+  - [pingpong](#pingpong--兩個-agent-交替執行)
 - [Target 語法](#target-語法)
 - [tmux.conf 快捷鍵設定](#tmuxconf-快捷鍵設定)
 - [工作流程範例](#工作流程範例)
@@ -1018,6 +1019,194 @@ tmux-ai follow %25 --from-start | tee build-$(date +%s).log
 
 > `follow` 與 `watch` 的差異：`follow` 輸出新增的行（streaming），`watch` 只在 pattern 出現時觸發動作（event-driven）。
 
+### `pingpong` — 兩個 Agent 交替執行
+
+```
+tmux-ai pingpong [flags]
+```
+
+協調兩個 pane 裡的 AI agent（例如 Codex 和 Claude Code）：送初始指令到起始 pane，等待完成後捕捉輸出，再 relay 到下一個 pane，循環直到偵測到停止關鍵字。預設採固定交替；加上 `--coordinator` 後，每輪由 LLM 根據最新結果決定下一個 pane 與交接指令。
+
+**由誰開始？** 預設 `--start auto`，由本地 LLM 根據 `--initial` 指令和兩個 pane 的 role 描述自動判斷。也可用 `--start pane1` 或 `--start pane2` 手動指定。
+
+> 直接透過 tmux `send-keys` / `capture-pane` 與 pane 互動，適合任何互動式 CLI agent。`--start auto`、`--coordinator` 和 `--summarize` 會使用設定的 Ollama LLM。
+
+#### 完成與停止偵測
+
+pingpong 靠兩個標記運作：
+
+| 標記 | Flag | 用途 |
+|------|------|------|
+| Done marker | `--done`（預設 `DONE`） | agent 完成單回合時輸出的字串，偵測到就切換到下一個 pane |
+| Stop keyword | `--stop`（預設 `ALL_DONE`） | 偵測到則結束整個循環 |
+
+> **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
+
+#### 起始 Pane 選擇
+
+`--start` 決定哪個 pane 先執行初始指令：
+
+| 值 | 行為 |
+|------|------|
+| `auto`（預設） | LLM 根據 `--initial` + `--pane1-role` / `--pane2-role` 判斷最適合的起始 pane |
+| `pane1` | 固定由 pane1 開始 |
+| `pane2` | 固定由 pane2 開始 |
+
+`auto` 模式下，LLM 會收到初始指令和兩個角色描述，回傳 JSON `{"start": 1 或 2, "reason": "理由"}`。若未設定任何 role 或 LLM 無法判斷，預設由 pane1 開始。
+
+> 例如 `--initial "修復 main.go 的 bug"` 搭配 pane2 角色「工程師，負責修改程式碼」，LLM 可能判斷直接由 pane2 開始，跳過 pane1 的規劃階段。
+
+#### 分工模式
+
+透過四個 flag 實現角色分工：
+
+| Flag | 說明 |
+|------|------|
+| `--pane1-role` | 每次傳給 pane1 的訊息前面加上這段角色設定 |
+| `--pane2-role` | 每次傳給 pane2 的訊息前面加上這段角色設定 |
+| `--to-pane1-prompt` | relay **到 pane1** 時的指令（例如 review / 規劃） |
+| `--to-pane2-prompt` | relay **到 pane2** 時的指令（例如實作 / 修改） |
+
+未指定 prompt 時使用預設值「請根據以下上一步的結果繼續執行。」。
+
+#### LLM Coordinator
+
+啟用 `--coordinator` 後，每一輪完成時，LLM 會收到原始目標、目前輪次、兩個 pane 的角色與預設方向，以及剛完成的完整輸出，並回傳：
+
+```json
+{"next":2,"instruction":"依 review 報告修正競態並執行 go test ./...","reason":"最新輸出是待修正的 review 結果"}
+```
+
+`next` 可以是任一 pane，也可以再次選擇剛完成工作的 pane。Coordinator 只負責路由和撰寫指令，不會取得 tmux 工具權限。若模型逾時、呼叫失敗或 JSON 無法解析，會回退成原本的固定交替及方向 prompt。
+
+#### 從既有 Pane 回覆開始
+
+若 pane1 在啟動 `pingpong` 前已完成規劃、分析、review、測試或其他工作，可用 `--initial-from pane1` 將它的最新完成回覆作為初始 context：
+
+```bash
+tmux-ai pingpong \
+  --pane1 trec:1 \
+  --pane2 trec:2 \
+  --start pane2 \
+  --initial-from pane1 \
+  --initial-from-lines 500 \
+  --initial "依 reviewer 最新回覆修正問題並補測試" \
+  --coordinator \
+  --model minimax-m3:cloud
+```
+
+`pingpong` 會精確保留最後 N 行，加入由舊到新的行號，讓 LLM 只選擇最新完成回覆的起訖行號；它不假設回覆具有特定標題、格式或任務類型。實際交接內容由程式從原始終端文字逐字切片，因此不會由 LLM 重寫或遺失項目。若選擇結果無效，流程會停止，不會把整段舊對話交給下一個 pane。
+
+#### Flags
+
+| Flag | 預設 | 說明 |
+|------|------|------|
+| `--pane1` | — | 第一個 pane（alias / `%ID` / `session:window`） |
+| `--pane2` | — | 第二個 pane（alias / `%ID` / `session:window`） |
+| `--initial` | — | 初始指令（必填） |
+| `--start` | `auto` | 起始 pane：`auto`（LLM 判斷）、`pane1`、`pane2` |
+| `--stop` | `ALL_DONE` | 偵測到此關鍵字時結束整個循環 |
+| `--done` | `DONE` | agent 完成單回合時輸出的標記 |
+| `--max-rounds` | `20` | 最大交替輪數（安全上限） |
+| `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
+| `--interval` | `2000` | 輪詢間隔（毫秒） |
+| `--lines` | `80` | 每次捕捉的 pane 行數 |
+| `--summarize` | `false` | relay 前先用 Ollama 摘要內容，減少 context |
+| `--coordinator` | `false` | 每輪由 LLM 決定下一個 pane 與交接指令 |
+| `--coordinator-timeout` | `60` | 每次 coordinator 決策的 timeout 秒數；`0` 使用全域 timeout |
+| `--initial-from` | — | 從 `pane1` 或 `pane2` 的最新完成回覆 bootstrap |
+| `--initial-from-lines` | `500` | bootstrap 時供 LLM 選擇的精確尾端行數 |
+| `--submit-delay` | `500` | 貼上訊息後等待多少毫秒再送出 Enter；大型 prompt 可提高 |
+| `--max-relay-bytes` | `32768` | 任一送出訊息的 UTF-8 byte 上限；超限時停止且不送出 |
+| `--max-total-relay-bytes` | `131072` | 整個 workflow 累積送出 byte 上限 |
+| `--max-llm-calls` | `40` | selector、coordinator 與 summarizer 的呼叫總上限 |
+| `--max-same-pane-rounds` | `3` | coordinator 可連續交給同一 pane 的次數上限 |
+| `--max-duplicate-handoffs` | `2` | 相同目標、指令與實質內容可重送的次數上限 |
+| `--min-response-lines` | `1` | 可交接回覆的最少實質行數 |
+| `--max-response-lines` | `200` | 可交接回覆的最多實質行數 |
+| `--min-coordinator-confidence` | `0.7` | coordinator 核准 `send` 所需的最低信心 |
+| `--approval-threshold-bytes` | `16384` | 超過此大小需明確加上 `--allow-large-relay`；`0` 停用 |
+| `--allow-large-relay` | `false` | 人工檢查後允許超過 approval threshold 的訊息 |
+| `--dry-run` | `false` | 顯示初始交接內容與大小後停止，不操作 pane |
+| `--pane1-role` | — | pane1 的角色描述，附加在每則訊息前 |
+| `--pane2-role` | — | pane2 的角色描述，附加在每則訊息前 |
+| `--to-pane1-prompt` | — | relay 到 pane1 時的指令 |
+| `--to-pane2-prompt` | — | relay 到 pane2 時的指令 |
+
+啟用 `--coordinator` 時，LLM 是送出前的安全閘門。它會先看到 selector 選出的實際候選內容、bytes、行數及目前 workflow 使用量，並回傳 `send`、`retry_selection`、`stop` 或 `needs_human`。只有 `send` 且 confidence 達標才會操作 tmux；解析失敗或其他 action 都不會 fallback 到自動交替。
+
+`a.py`、`b.py` 可用同名大寫環境變數調整主要保護，例如 `MAX_TOTAL_RELAY_BYTES`、`MAX_LLM_CALLS`、`MAX_SAME_PANE_ROUNDS`、`MAX_DUPLICATE_HANDOFFS`、`MIN_RESPONSE_LINES`、`MAX_RESPONSE_LINES`、`MIN_COORDINATOR_CONFIDENCE` 與 `APPROVAL_THRESHOLD_BYTES`。人工確認大訊息後可設 `ALLOW_LARGE_RELAY=1`；只預覽可設 `DRY_RUN=1`。
+
+收到 Ctrl-C 或 SIGTERM 時，pending handoff 會立即取消。若尚未貼上，tmux 不會收到任何文字；若正在貼上後的 submit delay，計時器會取消且不會再送 Enter，避免停止後才延遲提交 agent 任務。
+
+#### 訊息結構
+
+每次 relay 時，目標 pane 收到的完整訊息：
+
+```
+[pane-role]               ← --pane1-role 或 --pane2-role
+
+[relay instruction]       ← --to-pane1-prompt 或 --to-pane2-prompt
+
+=== 上一步輸出 ===
+[captured content]
+=== 輸出結束 ===
+
+完成時請在最後一行輸出 DONE。如果所有任務已全部完成，請輸出 ALL_DONE。
+```
+
+#### 範例
+
+```bash
+# auto 模式：LLM 根據 role 自動判斷誰先開始
+tmux-ai pingpong \
+  --pane1 codex --pane2 claude \
+  --initial "修復 main.go 裡的 memory leak" \
+  --pane1-role "你是架構師，負責分析問題和擬定修復計畫。" \
+  --pane2-role "你是工程師，負責根據計畫修改程式碼。"
+# → LLM 可能判斷由 pane2 (工程師) 直接開始
+
+# 基本交替：兩個 agent 互相 review（無 role，預設 pane1 先）
+tmux-ai pingpong \
+  --pane1 codex-pane --pane2 claude-pane \
+  --initial "分析 main.go 並提出重構建議" \
+  --stop "ALL_DONE" --done "DONE"
+
+# 指定 pane2 先開始
+tmux-ai pingpong \
+  --pane1 %5 --pane2 %7 \
+  --initial "直接修復 bug" --start pane2
+
+# Codex 負責規劃，Claude Code 負責實作
+tmux-ai pingpong \
+  --pane1 codex --pane2 claude \
+  --initial "分析專案結構，擬定第一階段重構計畫" \
+  \
+  --pane1-role "你是架構師，負責擬定計畫和 review 結果。不要直接修改程式碼。" \
+  --pane2-role "你是工程師，負責根據計畫實際修改程式碼。修改後請執行測試確認。" \
+  \
+  --to-pane1-prompt "請 review 以下修改結果，確認是否正確，並擬定下一步計畫。如果所有工作已完成，請輸出 ALL_DONE。" \
+  --to-pane2-prompt "請根據以下計畫執行程式碼修改，完成後執行測試。" \
+  \
+  --coordinator \
+  --max-rounds 10 \
+  --round-timeout 600 \
+  --summarize
+
+# 用 pane ID，每輪最多 5 分鐘
+tmux-ai pingpong \
+  --pane1 %5 --pane2 %7 \
+  --initial "review the codebase architecture" \
+  --round-timeout 300
+```
+
+> **運作流程（`--start auto --coordinator`）：**
+> 1. LLM 分析 `--initial` + role → 決定起始 pane
+> 2. 初始指令 → 起始 pane（例如 codex 規劃）
+> 3. 等待 `DONE` → 捕捉輸出 → coordinator 決定下一個 pane 與具體指令
+> 4. 目標 pane 完成後，coordinator 根據新結果再次決策
+> 5. 重複直到任一 pane 輸出 `ALL_DONE` 或達到 `--max-rounds` 上限
+
 ---
 
 ## Target 語法
@@ -1109,6 +1298,25 @@ tmux-ai watch opencode-hufu "task complete" \
   --then "review 這個結果並告知是否可以 merge" \
   --pane claude-sport
 ```
+### Ping-Pong 分工協作
+
+```bash
+# Codex 負責規劃，Claude Code 負責實作，交替直到完成
+# --start auto 讓 LLM 根據任務和角色自動決定誰先開始
+tmux-ai pingpong \
+  --pane1 codex --pane2 claude \
+  --initial "分析專案結構，擬定第一階段重構計畫" \
+  --start auto \
+  --pane1-role "你是架構師，負責擬定計畫和 review 結果。不要直接修改程式碼。" \
+  --pane2-role "你是工程師，負責根據計畫實際修改程式碼。修改後請執行測試確認。" \
+  --to-pane1-prompt "請 review 以下修改結果，確認是否正確，並擬定下一步計畫。如果所有工作已完成，請輸出 ALL_DONE。" \
+  --to-pane2-prompt "請根據以下計畫執行程式碼修改，完成後執行測試。" \
+  --coordinator \
+  --max-rounds 10 --round-timeout 600 --summarize
+```
+
+> 運作流程：LLM 判斷起始 pane；之後 coordinator 每輪根據最新結果選擇下一個 pane 並生成交接指令，直到輸出 `ALL_DONE`。
+
 
 ### 跨 Session 協作
 
@@ -1219,6 +1427,8 @@ tmux-ai 提供以下工具給 LLM 使用（透過 Ollama function calling）：
 | `send_keys` | 輸入按鍵到 pane（自動加 Enter） |
 | `send_lines` | 傳送多行內容（不加 Enter） |
 | `send_keys_and_wait` | 輸入按鍵並等待 pattern 出現 |
+
+所有功能送往 tmux pane 的文字（包含 `ask`、workflow launch、watch、agent tools 與 `pingpong`）都使用相同節流器：依 Unicode 字元切割，每批最多 500 個字元，每批送出後等待 1 秒才繼續下一批或送 Enter。允許文字混合 Ctrl-C 等控制碼；程式會保持原始順序，控制碼立即送出，前後的文字仍各自節流。收到取消訊號時，等待會立刻結束，尚未送出的批次不會再傳送。
 | `wait_for_pattern` | 等待 pane 出現特定 pattern |
 | `abort_command` | 送出 Ctrl+C 中斷指令 |
 | `list_panes` | 列出所有 pane |

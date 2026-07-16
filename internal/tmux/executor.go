@@ -1,11 +1,13 @@
 package tmux
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/llmore/tmux-ai/internal/ansi"
 )
@@ -22,6 +24,10 @@ type PaneInfo struct {
 }
 
 type executorImpl struct{}
+
+const sendTextChunkSize = 500
+
+var sendTextChunkDelay = time.Second
 
 func NewExecutor() Executor {
 	return &executorImpl{}
@@ -60,11 +66,98 @@ func (e *executorImpl) CapturePaneClean(paneID string, lines int) (string, error
 }
 
 func (e *executorImpl) SendKeys(paneID, keys string) error {
-	_, err := e.exec("send-keys", "-t", paneID, keys, "Enter")
-	return err
+	return e.SendKeysContext(context.Background(), paneID, keys)
 }
 
 func (e *executorImpl) SendLines(paneID, content string) error {
+	return e.SendLinesContext(context.Background(), paneID, content)
+}
+
+func (e *executorImpl) SendKeysContext(ctx context.Context, paneID, keys string) error {
+	if err := e.sendTextChunks(ctx, paneID, keys); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	_, err := e.exec("send-keys", "-t", paneID, "Enter")
+	return err
+}
+
+func (e *executorImpl) SendLinesContext(ctx context.Context, paneID, content string) error {
+	return e.sendTextChunks(ctx, paneID, content)
+}
+
+func (e *executorImpl) SendTextContext(ctx context.Context, paneID, content string) error {
+	return e.sendTextChunks(ctx, paneID, content)
+}
+
+func (e *executorImpl) sendTextChunks(ctx context.Context, paneID, content string) error {
+	return sendMixedTextWith(
+		ctx, content, sendTextChunkSize, sendTextChunkDelay,
+		func(chunk string) error { return e.pasteTextChunk(paneID, chunk) },
+		func(control rune) error {
+			_, err := e.exec("send-keys", "-t", paneID, string(control))
+			return err
+		},
+	)
+}
+
+func sendTextChunksWith(ctx context.Context, content string, size int, delay time.Duration, send func(string) error) error {
+	for _, chunk := range splitTextChunks(content, size) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := send(chunk); err != nil {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil
+}
+
+func sendMixedTextWith(
+	ctx context.Context,
+	content string,
+	size int,
+	delay time.Duration,
+	sendText func(string) error,
+	sendControl func(rune) error,
+) error {
+	var text []rune
+	flush := func() error {
+		if len(text) == 0 {
+			return nil
+		}
+		err := sendTextChunksWith(ctx, string(text), size, delay, sendText)
+		text = text[:0]
+		return err
+	}
+	for _, r := range content {
+		if !isControlRune(r) {
+			text = append(text, r)
+			continue
+		}
+		if err := flush(); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := sendControl(r); err != nil {
+			return err
+		}
+	}
+	return flush()
+}
+
+func (e *executorImpl) pasteTextChunk(paneID, content string) error {
 	tmpfile, err := os.CreateTemp("", "tmux-ai-*")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
@@ -80,10 +173,33 @@ func (e *executorImpl) SendLines(paneID, content string) error {
 	if _, err := e.exec("load-buffer", "-t", paneID, tmpfile.Name()); err != nil {
 		return fmt.Errorf("load buffer: %w", err)
 	}
-	if _, err := e.exec("paste-buffer", "-t", paneID, "-r"); err != nil {
+	// Preserve newlines and use bracketed-paste mode when the destination TUI
+	// requests it. Agent editors can otherwise treat a large multi-line relay as
+	// individually typed lines and swallow the subsequent submit key.
+	if _, err := e.exec("paste-buffer", "-t", paneID, "-p", "-r"); err != nil {
 		return fmt.Errorf("paste buffer: %w", err)
 	}
 	return nil
+}
+
+func splitTextChunks(content string, size int) []string {
+	if content == "" || size <= 0 {
+		return nil
+	}
+	runes := []rune(content)
+	chunks := make([]string, 0, (len(runes)+size-1)/size)
+	for start := 0; start < len(runes); start += size {
+		end := start + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
+}
+
+func isControlRune(r rune) bool {
+	return r < 0x20 && r != '\n' && r != '\r' && r != '\t'
 }
 
 func (e *executorImpl) NewWindow(name, command, cwd string) (string, error) {

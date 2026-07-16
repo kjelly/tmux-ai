@@ -198,7 +198,7 @@ func runWatch(paneID, pattern, thenPane string, absent bool, rangeExpr string) e
 
 		if watchKeys != "" {
 			keys := strings.ReplaceAll(watchKeys, `\n`, "\n")
-			if err := ex.SendKeys(thenPane, keys); err != nil {
+			if err := ex.SendKeysContext(ctx, thenPane, keys); err != nil {
 				fmt.Fprintf(os.Stderr, "error sending keys: %v\n", err)
 			}
 		}

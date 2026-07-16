@@ -69,6 +69,8 @@ func init() {
 
 func runAsk(paneID, question string) error {
 	ex := tmux.NewExecutor()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// Capture baseline so we can extract just the new response
 	baseline, err := ex.CapturePaneClean(paneID, askLines)
@@ -78,17 +80,14 @@ func runAsk(paneID, question string) error {
 
 	// Send the question
 	if askNoEnter {
-		if _, err := ex.Exec("send-keys", "-t", paneID, question); err != nil {
+		if err := ex.SendTextContext(ctx, paneID, question); err != nil {
 			return fmt.Errorf("send to pane: %w", err)
 		}
 	} else {
-		if err := ex.SendKeys(paneID, question); err != nil {
+		if err := ex.SendKeysContext(ctx, paneID, question); err != nil {
 			return fmt.Errorf("send to pane: %w", err)
 		}
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	timeoutCtx, cancel := context.WithTimeout(ctx, time.Duration(askTimeout)*time.Second)
 	defer cancel()
 
