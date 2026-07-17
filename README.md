@@ -27,6 +27,7 @@
   - [template](#template--儲存常用指令範本)
   - [follow](#follow--即時串流-pane-輸出)
   - [pingpong](#pingpong--兩個-agent-交替執行)
+  - [coordinate](#coordinate--多-window-角色路由)
 - [Target 語法](#target-語法)
 - [tmux.conf 快捷鍵設定](#tmuxconf-快捷鍵設定)
 - [工作流程範例](#工作流程範例)
@@ -42,7 +43,7 @@
 **推薦模型**（支援 function calling）：
 
 ```bash
-ollama pull llama3.2        # 預設，輕量快速
+ollama pull gemma4:31b      # 預設
 ollama pull qwen2.5:14b     # 較強，繁中理解佳
 ollama pull gemma3:27b
 ```
@@ -97,11 +98,26 @@ tmux-ai repl
 
 | Flag | 環境變數 | 預設值 | 說明 |
 |------|----------|--------|------|
-| `--model` | `OLLAMA_MODEL` | `llama3.2` | Ollama 模型名稱 |
+| `--config` | `TMUX_AI_CONFIG` | `$XDG_CONFIG_HOME/tmux-ai/config.yaml` | 使用者全域設定檔路徑 |
+| `--model` | `OLLAMA_MODEL` | `gemma4:31b` | Ollama 模型名稱 |
 | `--host` | `OLLAMA_HOST` | `http://localhost:11434` | Ollama 伺服器 URL |
 | `--max-iterations` | — | `50` | Agent loop 最大迭代次數 |
 | `--timeout` | — | `300` | 全域 timeout（秒） |
 | `--verbose` | — | `false` | 顯示詳細 log |
+
+在 Linux 上，tmux-ai 依 [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/)
+慣例讀取 `$XDG_CONFIG_HOME/tmux-ai/config.yaml`；未設定 `XDG_CONFIG_HOME` 時就是
+`~/.config/tmux-ai/config.yaml`。可從 [`examples/config.yaml`](examples/config.yaml)
+建立設定檔：
+
+```bash
+mkdir -p ~/.config/tmux-ai
+cp examples/config.yaml ~/.config/tmux-ai/config.yaml
+```
+
+可設定 `model`、`host`、`max_iterations`、`timeout`、`verbose`。優先序為：
+`CLI flag` > `環境變數`（模型與 host）> `使用者設定檔` > `內建預設`。工作流的
+角色、prompt 與 handoff 設定仍應放在各自的 preset。
 
 建議在 shell profile 設定常用值：
 
@@ -1038,9 +1054,11 @@ pingpong 靠兩個標記運作：
 | 標記 | Flag | 用途 |
 |------|------|------|
 | Done marker | `--done`（預設 `DONE`） | agent 完成單回合時輸出的字串，偵測到就切換到下一個 pane |
-| Stop keyword | `--stop`（預設 `ALL_DONE`） | 偵測到則結束整個循環 |
+| Stop keyword | `--stop`（預設 `ALL_DONE`） | 無 coordinator 時直接停止；啟用 coordinator 時視為停止請求，須通過 policy |
 
 > **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
+
+> 啟用 `--coordinator` 時，任何 member 的 stop marker 都只是候選停止訊號。Coordinator 會連同 `--coordinator-policy`、目前 member 與最新結果一起判斷；因此可以規定「只有 reviewer 驗證通過才能停止」，並用 `--stop-members pane1` 做程式層的核准者限制。
 
 #### 起始 Pane 選擇
 
@@ -1055,6 +1073,8 @@ pingpong 靠兩個標記運作：
 `auto` 模式下，LLM 會收到初始指令和兩個角色描述，回傳 JSON `{"start": 1 或 2, "reason": "理由"}`。若未設定任何 role 或 LLM 無法判斷，預設由 pane1 開始。
 
 > 例如 `--initial "修復 main.go 的 bug"` 搭配 pane2 角色「工程師，負責修改程式碼」，LLM 可能判斷直接由 pane2 開始，跳過 pane1 的規劃階段。
+
+使用 YAML preset 且採 `--start auto` 時，應提供中性的 `initial` 欄位。`initial_pane1` / `initial_pane2` 只用於明確指定起始 pane；若兩者不同又缺少 `initial`，程式會停止並要求補上，不再誤用 pane2 指令。
 
 #### 分工模式
 
@@ -1074,10 +1094,10 @@ pingpong 靠兩個標記運作：
 啟用 `--coordinator` 後，每一輪完成時，LLM 會收到原始目標、目前輪次、兩個 pane 的角色與預設方向，以及剛完成的完整輸出，並回傳：
 
 ```json
-{"next":2,"instruction":"依 review 報告修正競態並執行 go test ./...","reason":"最新輸出是待修正的 review 結果"}
+{"action":"send","target":"pane2","instruction":"依 review 報告修正競態並執行 go test ./...","reason":"最新輸出是待修正的 review 結果","confidence":0.92}
 ```
 
-`next` 可以是任一 pane，也可以再次選擇剛完成工作的 pane。Coordinator 只負責路由和撰寫指令，不會取得 tmux 工具權限。若模型逾時、呼叫失敗或 JSON 無法解析，會回退成原本的固定交替及方向 prompt。
+`target` 必須是 `pane1` 或 `pane2`，也可以再次選擇剛完成工作的 pane。Coordinator 只負責控制層：依可信的 workflow policy 判斷路由、具體指令、停止或人工介入，不會取得 tmux 或檔案工具權限。可用 `--coordinator-policy` 或 preset 的 `coordinator_policy` 定義 reviewer-only approval 等規則；模型逾時、解析失敗或低信心時會安全停止，不會回退成未審核的固定交替。
 
 #### 從既有 Pane 回覆開始
 
@@ -1109,11 +1129,15 @@ tmux-ai pingpong \
 | `--done` | `DONE` | agent 完成單回合時輸出的標記 |
 | `--max-rounds` | `20` | 最大交替輪數（安全上限） |
 | `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
+| `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。適用於不會渲染控制標記的 agent。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
 | `--lines` | `80` | 每次捕捉的 pane 行數 |
 | `--summarize` | `false` | relay 前先用 Ollama 摘要內容，減少 context |
 | `--coordinator` | `false` | 每輪由 LLM 決定下一個 pane 與交接指令 |
+| `--coordinator-policy` | — | 可信的 workflow 控制規則；決定角色路由與停止條件 |
+| `--stop-members` | — | 可核准 coordinator stop 的 member ID allowlist，例如 `pane1` |
 | `--coordinator-timeout` | `60` | 每次 coordinator 決策的 timeout 秒數；`0` 使用全域 timeout |
+| `--max-selection-retries` | `2` | 每輪允許 coordinator 要求重新擷取及選擇回覆的次數 |
 | `--initial-from` | — | 從 `pane1` 或 `pane2` 的最新完成回覆 bootstrap |
 | `--initial-from-lines` | `500` | bootstrap 時供 LLM 選擇的精確尾端行數 |
 | `--submit-delay` | `500` | 貼上訊息後等待多少毫秒再送出 Enter；大型 prompt 可提高 |
@@ -1135,6 +1159,8 @@ tmux-ai pingpong \
 
 啟用 `--coordinator` 時，LLM 是送出前的安全閘門。它會先看到 selector 選出的實際候選內容、bytes、行數及目前 workflow 使用量，並回傳 `send`、`retry_selection`、`stop` 或 `needs_human`。只有 `send` 且 confidence 達標才會操作 tmux；解析失敗或其他 action 都不會 fallback 到自動交替。
 
+`retry_selection` 會立即重新擷取目前 pane，將 coordinator 的理由交給 response selector 後再做一次 coordinator 決策；超過 `--max-selection-retries` 才停止。`needs_human` 會清楚中止並輸出需要人工處理的原因。`stop` 只有在 workflow policy 允許時才應由 coordinator 回傳。
+
 `a.py`、`b.py` 可用同名大寫環境變數調整主要保護，例如 `MAX_TOTAL_RELAY_BYTES`、`MAX_LLM_CALLS`、`MAX_SAME_PANE_ROUNDS`、`MAX_DUPLICATE_HANDOFFS`、`MIN_RESPONSE_LINES`、`MAX_RESPONSE_LINES`、`MIN_COORDINATOR_CONFIDENCE` 與 `APPROVAL_THRESHOLD_BYTES`。人工確認大訊息後可設 `ALLOW_LARGE_RELAY=1`；只預覽可設 `DRY_RUN=1`。
 
 收到 Ctrl-C 或 SIGTERM 時，pending handoff 會立即取消。若尚未貼上，tmux 不會收到任何文字；若正在貼上後的 submit delay，計時器會取消且不會再送 Enter，避免停止後才延遲提交 agent 任務。
@@ -1154,6 +1180,26 @@ tmux-ai pingpong \
 
 完成時請在最後一行輸出 DONE。如果所有任務已全部完成，請輸出 ALL_DONE。
 ```
+
+#### `review.md` review/fix preset
+
+`presets/review-md-fix.yaml` 將 reviewer/fixer 角色、prompt、text handoff、
+coordinator policy、停止權限與 timeout 集中管理。以下指令固定從 `trec:1`
+開始 review；有問題時交給 `trec:2` 依 `./review.md` 修正，再回到 reviewer
+複查，只有 reviewer 能核准完成：
+
+```bash
+tmux-ai pingpong \
+  --preset ./presets/review-md-fix.yaml \
+  --pane1 trec:1 \
+  --pane2 trec:2 \
+  --start pane1
+```
+
+此 preset 也啟用 45 秒的 `screen_idle_timeout`：完成標記仍是優先、零 LLM
+成本的路徑；若某個 coding agent 完全不顯示標記，畫面穩定後 selector 才會
+從原始畫面挑選已完成回覆。selector 無法可靠確認完成時不會交接；即使 fallback
+成功，runner 也一律標為 `needs_followup`，不能直接觸發 stop。
 
 #### 範例
 
@@ -1205,7 +1251,46 @@ tmux-ai pingpong \
 > 2. 初始指令 → 起始 pane（例如 codex 規劃）
 > 3. 等待 `DONE` → 捕捉輸出 → coordinator 決定下一個 pane 與具體指令
 > 4. 目標 pane 完成後，coordinator 根據新結果再次決策
-> 5. 重複直到任一 pane 輸出 `ALL_DONE` 或達到 `--max-rounds` 上限
+> 5. 重複直到 coordinator 依 policy 核准停止、無 coordinator 時任一 pane 輸出 `ALL_DONE`，或達到 `--max-rounds` 上限
+
+### `coordinate` — 多 Window 角色路由
+
+`coordinate` 將 `pingpong` 的交接流程擴充到任意數量的 tmux window/pane。每個成員在 YAML preset 中預先定義名稱、target、角色與預設交接方向；coordinator 會先選擇最適合處理初始目標的成員，之後依每輪最新結果選擇下一個成員並產生具體指令。
+
+```bash
+tmux-ai coordinate \
+  --preset presets/multi-window-team.yaml \
+  --initial "修正目前最重要的 correctness 問題並完成獨立驗證" \
+  --model qwen2.5:14b
+```
+
+Preset 格式：
+
+```yaml
+initial: 檢查目前工作樹，完成修正與驗證
+coordinator_policy: |-
+  implementer 完成後必須交給 tester；只有驗證證據充分時才能 stop。
+stop_members:
+  - architect
+max_selection_retries: 2
+members:
+  - name: architect
+    target: dev:architecture
+    role: 你是架構師，只負責分析與 review，不修改檔案。
+    handoff_prompt: 分析最新結果並決定下一階段。
+  - name: implementer
+    target: dev:implementation
+    role: 你是實作工程師，負責修改程式碼與補測試。
+  - name: tester
+    target: dev:verification
+    role: 你是獨立驗證工程師，不修改產品程式碼。
+```
+
+`target` 支援 alias、`%pane_id`、`session:window` 與 `session:window.pane`。`name`、`target`、`role` 必填且必須唯一；`handoff_prompt` 選填。角色會附加到每次送往該成員的訊息，coordinator 的 `target` 只能從 preset 的 member name 中選擇。
+
+`coordinator_policy` 是送給 coordinator 的可信控制規則，可限制必經驗證順序與何時應 `needs_human`；`stop_members` 則是程式硬性執行的最終核准者 allowlist，未授權 member 的 `stop` 會以 policy violation 中止。`max_selection_retries` 預設為 2。完整工作內容仍可透過共享檔案交換，但 coordinator 只根據 terminal status 與 policy 做控制判斷。
+
+`coordinate` 與 `pingpong` 共用同一個 handoff engine、coordinator prompt/JSON schema 與 action mapping，因此完成標記、policy stop gate、response reselection、bytes/LLM call 限制、重複交接防護、送出確認及 Ctrl-C 取消行為一致。主要安全 flags 與 `pingpong` 相同；可先加 `--dry-run` 檢查第一個 coordinator 決策與實際 prompt，而不操作 tmux。
 
 ---
 
@@ -1315,7 +1400,7 @@ tmux-ai pingpong \
   --max-rounds 10 --round-timeout 600 --summarize
 ```
 
-> 運作流程：LLM 判斷起始 pane；之後 coordinator 每輪根據最新結果選擇下一個 pane 並生成交接指令，直到輸出 `ALL_DONE`。
+> 運作流程：LLM 判斷起始 pane；之後 coordinator 每輪根據最新結果與 policy 選擇下一個 pane，member 的 `ALL_DONE` 也必須經 coordinator 核准才會停止。
 
 
 ### 跨 Session 協作
@@ -1453,3 +1538,33 @@ tmux-ai 提供以下工具給 LLM 使用（透過 Ollama function calling）：
 | `send_notification` | 送出系統通知 |
 | `sleep` | 等待指定毫秒 |
 | `finish` | 標記任務完成 |
+
+
+---
+
+## Handoff transport
+
+`pingpong` 與 `coordinate` 以 runner 管理 agent 間資料交接。預設為 `text`，適合不同主機、SSH 或 container 中的 panes；runner 會要求每輪輸出 tokenized text frame，並將其中內容原文送入下一個 pane。text payload 受 `--max-text-handoff-bytes`（預設 32768）與 `--max-text-handoff-lines`（預設 200）限制，且 `--lines` 必須保留足夠 capture history。
+
+同一台主機或共享 filesystem 可使用 `--handoff-transport file`。runner 為每輪建立私有 outbox，完成後只封存 regular files、配置 immutable artifact ID 與 SHA-256，再把經驗證的唯讀路徑提供下一位 member。不要在 preset 或 prompt 中指定共同檔名；producer 將檔案放入 runner-provided outbox，consumer 只讀 runner-provided incoming artifacts。
+
+Preset 可指定：
+
+```yaml
+handoff_transport: file
+artifacts:
+  forward: produced_or_incoming
+  max_files_per_turn: 8
+  max_file_bytes: 1048576
+  max_turn_bytes: 4194304
+  max_run_files: 64
+  max_run_bytes: 33554432
+  keep: false
+text_handoff:
+  max_payload_bytes: 32768
+  max_payload_lines: 200
+```
+
+CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。
+
+Coordinator mode 會自動要求每輪輸出 `HANDOFF_STATUS` JSON（`success`、`needs_followup` 或 `blocked`）。這是 runner control protocol，不應寫進 role、initial 或 handoff prompt。file coordinator 只可選 runner artifact IDs；text coordinator 只看到 payload metadata，不會取得或改寫 payload 原文。

@@ -1,0 +1,32 @@
+initial: >-
+  檢查目前工作樹，找出最重要的 correctness 問題，完成修正並獨立驗證。
+
+stop_members:
+  - architect
+coordinator_policy: |-
+  architect 負責分析與 review，implementer 負責修改，tester 負責獨立驗證。
+  implementer 完成後必須交給 tester；只有 tester 提供通過證據，且 architect 確認沒有
+  剩餘 correctness 問題時才能 stop。結果不完整時先 retry_selection，阻塞時 needs_human。
+max_selection_retries: 2
+
+members:
+  - name: architect
+    target: dev:architecture
+    role: >-
+      你是架構師與 reviewer。負責分析、拆解工作與 review；不要直接修改檔案。
+    handoff_prompt: >-
+      分析最新結果，指出具體問題或確認是否能進入下一階段。
+
+  - name: implementer
+    target: dev:implementation
+    role: >-
+      你是實作工程師。依明確需求修改程式碼、補回歸測試並執行相關測試。
+    handoff_prompt: >-
+      根據最新分析或 review 實作修改，並回報檔案與測試結果。
+
+  - name: tester
+    target: dev:verification
+    role: >-
+      你是獨立驗證工程師。不要修改產品程式碼；執行測試並檢查修改是否完整。
+    handoff_prompt: >-
+      獨立驗證最新實作，提供可重現的測試結果與剩餘風險。

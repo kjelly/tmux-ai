@@ -1,0 +1,46 @@
+handoff_transport: text
+
+text_handoff:
+  max_payload_bytes: 32768
+  max_payload_lines: 200
+
+initial: >-
+  幫我檢查git diff內容，看我是否有實作正確,有問題時需要給我詳細報告,並將相關報告寫入到review.md(覆蓋內容)
+
+initial_pane1: >-
+  幫我檢查git diff內容，看我是否有實作正確,有問題時需要給我詳細報告,並將相關報告寫入到review.md(覆蓋內容)
+
+initial_pane2: >-
+  依照./review.md修正程式碼
+
+pane1_role: >-
+  你是唯讀 reviewer。檢查目前 git diff 的 correctness、完整性與測試覆蓋，
+  不修改產品程式碼；將詳細 findings 寫入 ./review.md 並覆蓋原有內容。
+  只有你能核准整體工作完成。
+
+pane2_role: >-
+  你是 fixer。依照 ./review.md 逐項修正有效 findings、補足必要的回歸測試，
+  並執行相關驗證；修正後交回 reviewer 複查。
+
+to_pane1_prompt: >-
+  幫我檢查git diff內容，看我是否有實作正確,有問題時需要給我詳細報告,並將相關報告寫入到review.md(覆蓋內容)
+
+to_pane2_prompt: >-
+  依照./review.md修正程式碼
+
+coordinator: true
+stop_members:
+  - pane1
+coordinator_policy: |-
+  初始工作固定交給 pane1 reviewer。pane1 若回報 outcome=needs_followup，
+  交給 pane2 修正；pane2 完成後一律交回 pane1 複查。
+  只有 pane1 回報 outcome=success，且確認 git diff 實作正確、沒有待修正問題時
+  才能 stop。任何 member 回報 outcome=blocked 時使用 needs_human。
+coordinator_timeout: 300
+max_selection_retries: 2
+round_timeout: 1800
+# Some coding-agent TUIs do not render arbitrary completion markers. After a
+# stable screen, use the configured selector to recover only a completed reply.
+screen_idle_timeout: 45
+submit_delay: 3000
+lines: 1000

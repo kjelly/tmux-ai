@@ -1,0 +1,7 @@
+# User-wide defaults. Install as ~/.config/tmux-ai/config.yaml, or set
+# XDG_CONFIG_HOME / TMUX_AI_CONFIG to use a different location.
+model: gemma4:31b
+host: http://localhost:11434
+max_iterations: 50
+timeout: 300
+verbose: false
