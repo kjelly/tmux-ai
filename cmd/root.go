@@ -69,13 +69,13 @@ func loadUserConfig(path string) (userConfig, bool, error) {
 	decoder := yaml.NewDecoder(strings.NewReader(string(data)))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&config); err != nil {
-		return userConfig{}, false, fmt.Errorf("parse config %q: %w", path, err)
+		return userConfig{}, false, appendYAMLCommandHint(fmt.Errorf("parse config %q: %w", path, err), data, "global config")
 	}
 	if config.MaxIterations != nil && *config.MaxIterations <= 0 {
-		return userConfig{}, false, fmt.Errorf("config %q: max_iterations must be positive", path)
+		return userConfig{}, false, appendYAMLCommandHint(fmt.Errorf("config %q: max_iterations must be positive", path), data, "global config")
 	}
 	if config.Timeout != nil && *config.Timeout < 0 {
-		return userConfig{}, false, fmt.Errorf("config %q: timeout must not be negative", path)
+		return userConfig{}, false, appendYAMLCommandHint(fmt.Errorf("config %q: timeout must not be negative", path), data, "global config")
 	}
 	return config, true, nil
 }

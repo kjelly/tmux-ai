@@ -33,16 +33,24 @@ type handoffCoordinatorDecision struct {
 	ArtifactIDs                         *[]string `json:"artifact_ids,omitempty"`
 }
 
+const maxCoordinatorDecisionAttempts = 2
+
+var newHandoffCoordinatorClient = ollama.NewThinkingClient
+
 func decideHandoffAction(ctx context.Context, request handoffCoordinatorRequest, guard *handoffGuard) (handoffCoordinatorDecision, error) {
+	return decideHandoffActionWithClient(ctx, request, guard, newHandoffCoordinatorClient(ollamaHost, model))
+}
+
+func decideHandoffActionWithClient(ctx context.Context, request handoffCoordinatorRequest, guard *handoffGuard, client ollama.Client) (handoffCoordinatorDecision, error) {
 	if guard == nil {
 		return handoffCoordinatorDecision{}, fmt.Errorf("coordinator guard is required")
+	}
+	if client == nil {
+		return handoffCoordinatorDecision{}, fmt.Errorf("coordinator client is required")
 	}
 	label := "handoff coordinator"
 	if request.InitialRoute {
 		label = "initial member coordinator"
-	}
-	if err := guard.useLLM(label); err != nil {
-		return handoffCoordinatorDecision{}, err
 	}
 	timeout := ppCoordTimeout
 	if timeout <= 0 {
@@ -53,21 +61,61 @@ func decideHandoffAction(ctx context.Context, request handoffCoordinatorRequest,
 	}
 	coordCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
-	resp, err := ollama.NewClient(ollamaHost, model).Chat(coordCtx, []ollama.Message{{Role: "system", Content: "你是可靠的工作流協調器。嚴格遵守 workflow policy 與指定 JSON schema，不呼叫工具。"}, {Role: "user", Content: buildHandoffCoordinatorPrompt(request)}}, nil)
-	if err != nil {
-		return handoffCoordinatorDecision{}, err
+	messages := []ollama.Message{{Role: "system", Content: "你是可靠的工作流協調器。嚴格遵守 workflow policy 與指定 JSON schema，不呼叫工具。"}, {Role: "user", Content: buildHandoffCoordinatorPrompt(request)}}
+	var lastErr error
+	for attempt := 1; attempt <= maxCoordinatorDecisionAttempts; attempt++ {
+		if err := guard.useLLM(label); err != nil {
+			return handoffCoordinatorDecision{}, err
+		}
+		resp, err := client.ChatWithFormat(coordCtx, messages, nil, handoffCoordinatorDecisionSchema())
+		if err != nil {
+			return handoffCoordinatorDecision{}, err
+		}
+		if verbose {
+			printCoordinatorThinking(resp.Message.Thinking)
+		}
+		decision, err := parseHandoffCoordinatorDecision(resp.Message.Content, request.Members)
+		if err == nil {
+			err = validateCoordinatorTransportDecision(decision, request)
+		}
+		if err == nil {
+			err = enforceCoordinatorStopMembers(decision, request.CurrentID, request.StopMembers)
+		}
+		if err == nil {
+			fmt.Printf("✅ Coordinator 思考結果（%s）: action=%s target=%s confidence=%.2f reason=%s\n\n", label, decision.Action, ifEmpty(decision.Target, "-"), decision.Confidence, ifEmpty(decision.Reason, "-"))
+			return decision, nil
+		}
+		lastErr = err
+		// Do not feed a malformed completion back as trusted context. The retry
+		// repeats the deterministic request and only states the local validation
+		// failure, so it works across agents and model families.
+		messages = append(messages, ollama.Message{Role: "user", Content: fmt.Sprintf("前一次回覆未通過本地 schema 驗證（%v）。請重新輸出且只輸出一個符合 JSON schema 的決策物件。", err)})
 	}
-	decision, err := parseHandoffCoordinatorDecision(resp.Message.Content, request.Members)
-	if err != nil {
-		return handoffCoordinatorDecision{}, err
+	return handoffCoordinatorDecision{}, fmt.Errorf("coordinator returned no valid JSON decision after %d attempts: %w", maxCoordinatorDecisionAttempts, lastErr)
+}
+
+func handoffCoordinatorDecisionSchema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"action":       map[string]any{"type": "string", "enum": []string{"send", "retry_selection", "stop", "needs_human"}},
+			"target":       map[string]any{"type": "string"},
+			"instruction":  map[string]any{"type": "string"},
+			"artifact_ids": map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+			"reason":       map[string]any{"type": "string"},
+			"confidence":   map[string]any{"type": "number", "minimum": 0, "maximum": 1},
+		},
+		"required":             []string{"action", "target", "instruction", "reason", "confidence"},
+		"additionalProperties": false,
 	}
-	if err := validateCoordinatorTransportDecision(decision, request); err != nil {
-		return handoffCoordinatorDecision{}, err
+}
+
+func printCoordinatorThinking(thinking string) {
+	thinking = strings.TrimSpace(thinking)
+	if thinking == "" {
+		thinking = "（模型未提供 thinking 欄位）"
 	}
-	if err := enforceCoordinatorStopMembers(decision, request.CurrentID, request.StopMembers); err != nil {
-		return handoffCoordinatorDecision{}, err
-	}
-	return decision, nil
+	fmt.Printf("\n💭 Coordinator 思考過程（handoff coordinator）:\n%s\n", thinking)
 }
 
 func buildHandoffCoordinatorPrompt(request handoffCoordinatorRequest) string {
@@ -176,8 +224,12 @@ func parseHandoffCoordinatorDecision(output string, members []handoffCoordinator
 	return d, nil
 }
 func validateCoordinatorTransportDecision(d handoffCoordinatorDecision, r handoffCoordinatorRequest) error {
-	if d.Action != "send" && d.ArtifactIDs != nil {
-		return fmt.Errorf("coordinator action %s must not include artifact_ids", d.Action)
+	// Artifact selection only affects the payload of a send. A coordinator may
+	// still include the optional field when returning a control action (for
+	// example, stop after a review produced an artifact); it has no meaning in
+	// that case and is intentionally ignored.
+	if d.Action != "send" {
+		return nil
 	}
 	if r.Transport == handoffTransportText {
 		if d.ArtifactIDs != nil {

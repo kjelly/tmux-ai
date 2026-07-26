@@ -1,0 +1,52 @@
+---
+name: review-and-fix
+description: 先由 reviewer window 進行 Review，若發現問題則由 fixer window 修正
+
+params:
+  reviewer_session: review-session
+  reviewer_window: review-window
+  fixer_session: fixer-session
+  fixer_window: fixer-window
+  # 可透過 --param spec_file=./SPEC.md 傳入原始規格。
+  # 留空時 reviewer/fixer 仍可依目前程式碼與 git diff 進行 review。
+  spec_file: ""
+
+steps:
+  - name: start-review
+    type: shell
+    command: "echo 'Starting code review...'"
+
+  - name: run-review
+    type: run
+    session: "{{params.reviewer_session}}"
+    window: "{{params.reviewer_window}}"
+    instruction: >-
+      請先閱讀原始規格檔案「{{params.spec_file}}」（若路徑為空則跳過），
+      再依照該規格檢查目前 git diff 的變更；如有問題請列出詳細報告
+      （需包含 'error:' 或 'issue:'）。請區分規格要求、程式碼證據與推論。
+    depends: [start-review]
+
+  - name: watch-review-result
+    type: watch
+    session: "{{params.reviewer_session}}"
+    window: "{{params.reviewer_window}}"
+    pattern: "error:|issue:|ALL_DONE|DONE"
+    timeout: 180
+    depends: [run-review]
+
+  - name: fix-issues
+    type: run
+    session: "{{params.fixer_session}}"
+    window: "{{params.fixer_window}}"
+    instruction: >-
+      請先閱讀原始規格檔案「{{params.spec_file}}」（若路徑為空則跳過），
+      再根據上方 Reviewer 發現且符合規格的問題進行修復，並執行驗證。
+    context_from: watch-review-result
+    when: "contains(steps.watch-review-result.output, 'error:') or contains(steps.watch-review-result.output, 'issue:')"
+    depends: [watch-review-result]
+
+  - name: notify-done
+    type: shell
+    command: "echo 'Review and Fix workflow finished.'"
+    depends: [fix-issues]
+    on_failure: continue

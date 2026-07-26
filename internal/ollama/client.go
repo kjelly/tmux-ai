@@ -12,12 +12,14 @@ import (
 type clientImpl struct {
 	host   string
 	model  string
+	think  bool
 	client *http.Client
 }
 
 type Message struct {
 	Role       string     `json:"role"`
 	Content    string     `json:"content"`
+	Thinking   string     `json:"thinking,omitempty"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }
@@ -42,6 +44,8 @@ type ChatRequest struct {
 	Model    string    `json:"model"`
 	Messages []Message `json:"messages"`
 	Tools    []Tool    `json:"tools,omitempty"`
+	Format   any       `json:"format,omitempty"`
+	Think    bool      `json:"think,omitempty"`
 	Stream   bool      `json:"stream"`
 }
 
@@ -62,9 +66,20 @@ type ChatResponse struct {
 }
 
 func NewClient(host, model string) Client {
+	return newClient(host, model, false)
+}
+
+// NewThinkingClient enables Ollama's separate thinking field for callers that
+// want to display the model's reasoning trace.
+func NewThinkingClient(host, model string) Client {
+	return newClient(host, model, true)
+}
+
+func newClient(host, model string, think bool) Client {
 	return &clientImpl{
 		host:  host,
 		model: model,
+		think: think,
 		client: &http.Client{
 			Timeout: 600 * time.Second,
 		},
@@ -72,10 +87,22 @@ func NewClient(host, model string) Client {
 }
 
 func (c *clientImpl) Chat(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
+	return c.chat(ctx, messages, tools, nil)
+}
+
+// ChatWithFormat asks Ollama to constrain message.content to a JSON format or
+// JSON schema. Callers must still validate the response locally.
+func (c *clientImpl) ChatWithFormat(ctx context.Context, messages []Message, tools []Tool, format any) (*ChatResponse, error) {
+	return c.chat(ctx, messages, tools, format)
+}
+
+func (c *clientImpl) chat(ctx context.Context, messages []Message, tools []Tool, format any) (*ChatResponse, error) {
 	reqBody := ChatRequest{
 		Model:    c.model,
 		Messages: messages,
 		Tools:    tools,
+		Format:   format,
+		Think:    c.think,
 		Stream:   false,
 	}
 

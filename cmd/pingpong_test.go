@@ -105,6 +105,27 @@ func TestParseHandoffCoordinatorDecision(t *testing.T) {
 	}
 }
 
+func TestDecideHandoffActionRetriesMalformedCoordinatorResponse(t *testing.T) {
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{
+		{Message: ollama.Message{Content: "I approve this handoff."}, Done: true},
+		{Message: ollama.Message{Content: `{"action":"send","target":"pane2","instruction":"apply the review findings","reason":"findings remain","confidence":0.9}`}, Done: true},
+	}
+	guard := newHandoffGuard()
+	decision, err := decideHandoffActionWithClient(context.Background(), handoffCoordinatorRequest{
+		Round: 1, CurrentID: "pane1", Members: testPingPongCoordinatorMembers(),
+	}, guard, client)
+	if err != nil {
+		t.Fatalf("decideHandoffActionWithClient() error = %v", err)
+	}
+	if decision.Action != "send" || decision.Target != "pane2" || len(client.Calls) != 2 {
+		t.Fatalf("decision=%#v calls=%d, want successful second attempt", decision, len(client.Calls))
+	}
+	if client.Calls[0].Format == nil {
+		t.Fatal("coordinator request did not use a JSON schema format")
+	}
+}
+
 func TestParseHandoffCoordinatorDecisionRejectsInvalidDecision(t *testing.T) {
 	tests := []struct {
 		name   string

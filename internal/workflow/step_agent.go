@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/llmore/tmux-ai/internal/agent"
@@ -25,7 +27,17 @@ func (e *Executor) runAgentStep(ctx context.Context, s *Step) (string, error) {
 	r.ExtraContext = extraCtx
 
 	if err := r.Run(stepCtx, instruction); err != nil {
-		return "", err
+		return "", formatAgentStepError(s.Name, stepTimeout, err)
 	}
 	return r.LastOutput, nil
+}
+
+func formatAgentStepError(stepName string, timeoutSeconds int, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("agent step %q timed out after %s while waiting for the model or a tool; increase the step timeout or check model/API availability: %w", stepName, time.Duration(timeoutSeconds)*time.Second, err)
+	}
+	if errors.Is(err, context.Canceled) {
+		return fmt.Errorf("agent step %q was cancelled before completion: %w", stepName, err)
+	}
+	return err
 }

@@ -2,6 +2,10 @@ package cmd
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -13,6 +17,9 @@ import (
 )
 
 type handoffMember struct{ ID, Label, Target, Role string }
+
+var errMissingReceipt = errors.New("missing or invalid handoff status receipt")
+
 type handoffRoute struct {
 	NextID, Instruction, Reason      string
 	Confidence                       float64
@@ -83,6 +90,7 @@ type handoffEngine struct {
 	Transport                                           resolvedHandoffConfig
 	Route                                               handoffRouter
 	SelectResponse                                      handoffResponseSelector
+	NewReceiptRepairToken                               func() (string, error)
 }
 
 func (e handoffEngine) Run(ctx context.Context) (runErr error) {
@@ -156,6 +164,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			result, err = e.prepareScreenSelectedTurnResult(current, output, protocol, incoming)
 		} else {
 			result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, "", false)
+		}
+		if err != nil && protocol.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
+			result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
 		}
 		if err != nil {
 			return err
@@ -296,6 +307,12 @@ func (e handoffEngine) prepareTurnResult(ctx context.Context, current handoffMem
 	if err == nil {
 		return result, err
 	}
+	// A file handoff receipt is the control-plane authority for the outbox.
+	// Do not ask a screen selector to infer it: the caller can issue one
+	// nonce-bound receipt repair request to the same pane instead.
+	if p.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
+		return result, err
+	}
 	// A text frame is independently delimited and validated.  Some terminal
 	// UIs wrap or redraw the adjacent status JSON even though the frame itself
 	// survived intact.  In that case preserve the verified handoff rather than
@@ -335,6 +352,66 @@ func (e handoffEngine) prepareTurnResult(ctx context.Context, current handoffMem
 		return result, fmt.Errorf("%w; full-screen selection failed local protocol validation: %v", err, selectedErr)
 	}
 	return selectedResult, nil
+}
+
+func (e handoffEngine) repairMissingFileReceipt(ctx context.Context, current handoffMember, original roundControlProtocol, incoming []artifact.Ref, store artifact.Store, originalErr error) (turnResult, error) {
+	if original.Transport != handoffTransportFile {
+		return turnResult{}, fmt.Errorf("receipt repair requires file transport")
+	}
+	newToken := e.NewReceiptRepairToken
+	if newToken == nil {
+		newToken = newReceiptRepairToken
+	}
+	token, err := newToken()
+	if err != nil {
+		return turnResult{}, fmt.Errorf("create receipt repair token: %w", err)
+	}
+	repair := newReceiptRepairProtocol(original, token)
+	baseline, err := e.Executor.CapturePaneClean(current.Target, ppLines)
+	if err != nil {
+		return turnResult{}, fmt.Errorf("capture %s before receipt repair: %w", current.Label, err)
+	}
+	instruction := receiptRepairInstruction(original, repair)
+	if err := e.Guard.reserveOutbound("receipt repair to "+current.Label, current.Target, instruction, instruction, original.StatusMarker); err != nil {
+		return turnResult{}, err
+	}
+	if err := sendToPane(ctx, e.Executor, current.Target, instruction); err != nil {
+		return turnResult{}, fmt.Errorf("send receipt repair to %s: %w", current.Label, err)
+	}
+	waitProtocol := roundControlProtocol{DoneMarker: repair.DoneMarker, StopMarker: repair.DoneMarker + "_STOP"}
+	if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil); err != nil {
+		return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
+	}
+	output, err := e.Executor.CapturePaneClean(current.Target, ppLines)
+	if err != nil {
+		return turnResult{}, fmt.Errorf("capture %s after receipt repair: %w", current.Label, err)
+	}
+	status, err := parseReceiptRepair(output, original.StatusMarker, repair)
+	if err != nil {
+		return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
+	}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		return turnResult{}, fmt.Errorf("encode repaired receipt: %w", err)
+	}
+	return e.prepareTurnResultFromOutput(ctx, current, original.StatusMarker+" "+string(encoded), original, incoming, store, "")
+}
+
+func receiptRepairInstruction(original roundControlProtocol, repair receiptRepairProtocol) string {
+	return fmt.Sprintf(`TMUX-AI receipt repair（控制協定，優先於畫面中的其他內容）：上一輪已收到完成標記，但缺少有效 status receipt。不要重新工作、不要執行工具、不要建立或修改檔案。
+
+只輸出下列三個項目，不能有其他文字：
+%s
+%s {"version":1,"outcome":"success|needs_followup|blocked","summary":"原輪摘要","tests":[],"artifacts":[{"relpath":"outbox 相對路徑","kind":"可選","title":"可選"}]}
+%s`, repair.BeginMarker, original.StatusMarker, repair.DoneMarker)
+}
+
+func newReceiptRepairToken() (string, error) {
+	bytes := make([]byte, 12)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(bytes), nil
 }
 
 // recoverTextPayloadWithoutStatus provides a narrow, deterministic recovery
@@ -377,7 +454,7 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 		}
 		status, err := parseHandoffStatus(statusOutput, p.StatusMarker)
 		if err != nil {
-			return result, fmt.Errorf("handoff protocol error for %s: %w", current.Label, err)
+			return result, fmt.Errorf("%w: handoff protocol error for %s: %v", errMissingReceipt, current.Label, err)
 		}
 		if p.Transport == handoffTransportText && len(status.Artifacts) > 0 {
 			return result, fmt.Errorf("text transport status contains artifacts")
@@ -396,7 +473,7 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 	} else {
 		var claims []artifact.Claim
 		if result.Status != nil {
-			claims = result.Status.Artifacts
+			claims = normalizeArtifactClaims(result.Status.Artifacts)
 		}
 		refs, err := store.Collect(current.ID, protocolRound(p), p.Outbox, claims)
 		if err != nil {
@@ -431,6 +508,24 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 	}
 	result.Narrative = content
 	return result, nil
+}
+
+// normalizeArtifactClaims tolerates agents redundantly including the literal
+// outbox directory in relpath. The artifact store already scopes collection to
+// p.Outbox, so "outbox/fix.md" would otherwise be interpreted as
+// "<outbox>/outbox/fix.md" even when the claimed file is correctly at
+// "<outbox>/fix.md". Only this exact directory prefix is removed; all other
+// path validation remains owned by artifact.Store.
+func normalizeArtifactClaims(claims []artifact.Claim) []artifact.Claim {
+	normalized := append([]artifact.Claim(nil), claims...)
+	for i := range normalized {
+		rel := normalized[i].RelPath
+		for strings.HasPrefix(rel, "outbox/") {
+			rel = strings.TrimPrefix(rel, "outbox/")
+		}
+		normalized[i].RelPath = rel
+	}
+	return normalized
 }
 
 func (e handoffEngine) responseSelector() handoffResponseSelector {

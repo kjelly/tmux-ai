@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/llmore/tmux-ai/internal/artifact"
 )
 
 // Executor runs a Workflow as a DAG.
@@ -18,6 +20,7 @@ type Executor struct {
 	maxIterations int
 	timeout       int
 	verbose       bool
+	artifactStore artifact.Store
 
 	mu      sync.RWMutex
 	results map[string]*StepResult
@@ -44,6 +47,21 @@ func NewExecutor(wf *Workflow, params map[string]string, host, model string, max
 }
 
 func (e *Executor) Run(ctx context.Context) error {
+	transport := strings.ToLower(strings.TrimSpace(e.wf.HandoffTransport))
+	if transport != "" && transport != "file" {
+		return fmt.Errorf("unsupported workflow handoff_transport %q", e.wf.HandoffTransport)
+	}
+	if transport == "file" {
+		store, err := artifact.New(e.wf.Artifacts.Root, e.wf.Artifacts.Keep, artifact.DefaultLimits())
+		if err != nil {
+			return fmt.Errorf("create workflow artifact store: %w", err)
+		}
+		e.artifactStore = store
+		defer func() { _ = store.Close() }()
+		if e.wf.Artifacts.Keep {
+			fmt.Printf("📁 Workflow artifact root: %s\n", store.Root())
+		}
+	}
 	steps := e.wf.Steps
 	total := len(steps)
 	if total == 0 {
@@ -248,6 +266,8 @@ func (e *Executor) runStep(ctx context.Context, s *Step) *StepResult {
 	switch strings.ToLower(s.Type) {
 	case "run", "":
 		output, err = e.runAgentStep(ctx, s)
+	case "send":
+		output, err = e.runSendStep(ctx, s)
 	case "watch":
 		output, err = e.runWatchStep(ctx, s)
 	case "shell":

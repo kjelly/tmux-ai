@@ -38,7 +38,7 @@ var workflowValidateCmd = &cobra.Command{
 			return err
 		}
 		if err := validateWorkflow(w); err != nil {
-			return err
+			return workflowValidationError(args[0], err)
 		}
 		fmt.Printf("OK: workflow %q has %d steps\n", w.Name, len(w.Steps))
 		for i, s := range w.Steps {
@@ -65,7 +65,7 @@ func loadWorkflow(path string) (*wf.Workflow, error) {
 	}
 	var w wf.Workflow
 	if err := yaml.Unmarshal(data, &w); err != nil {
-		return nil, fmt.Errorf("parse workflow YAML: %w", err)
+		return nil, appendYAMLCommandHint(fmt.Errorf("parse workflow YAML: %w", err), data, "workflow")
 	}
 	return &w, nil
 }
@@ -133,7 +133,7 @@ func runWorkflow(path string) error {
 		return err
 	}
 	if err := validateWorkflow(w); err != nil {
-		return fmt.Errorf("invalid workflow: %w", err)
+		return workflowValidationError(path, err)
 	}
 
 	// Parse --param key=value overrides
@@ -152,6 +152,14 @@ func runWorkflow(path string) error {
 	defer cancel()
 
 	return ex.Run(ctx)
+}
+
+func workflowValidationError(path string, err error) error {
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		return fmt.Errorf("invalid workflow: %w", err)
+	}
+	return appendYAMLCommandHint(fmt.Errorf("invalid workflow: %w", err), data, "workflow")
 }
 
 func stepType(s wf.Step) string {

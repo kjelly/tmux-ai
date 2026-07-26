@@ -7,4 +7,5 @@ import "context"
 // Tests can provide a fake implementation to avoid requiring a running Ollama.
 type Client interface {
 	Chat(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error)
+	ChatWithFormat(ctx context.Context, messages []Message, tools []Tool, format any) (*ChatResponse, error)
 }

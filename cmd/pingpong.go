@@ -452,7 +452,7 @@ func applyPingPongPreset() error {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&preset); err != nil {
-		return fmt.Errorf("parse pingpong preset %q: %w", path, err)
+		return appendYAMLCommandHint(fmt.Errorf("parse pingpong preset %q: %w", path, err), data, "pingpong preset")
 	}
 	ppPresetHandoff = preset.handoffPresetConfig
 

@@ -2,9 +2,12 @@ package cmd
 
 import (
 	"context"
+	"errors"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/llmore/tmux-ai/internal/artifact"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -83,6 +86,130 @@ func TestProtocolMarkerInNarrativeIsNotControlData(t *testing.T) {
 	output := "the response must eventually include " + marker + ` {"version":1,"outcome":"success","summary":"not real"}`
 	if _, err := parseHandoffStatus(output, marker); err == nil || !strings.Contains(err.Error(), "missing") {
 		t.Fatalf("parseHandoffStatus() error = %v, want missing marker", err)
+	}
+}
+
+func TestProtocolMarkersAcceptGenericPresentationOnlyPrefix(t *testing.T) {
+	marker := statusMarker("run", 2)
+	for _, prefix := range []string{"● ", "✻ ", "🤖️ ", "│  ", "--- ", "  "} {
+		line := prefix + marker + ` {"version":1,"outcome":"success","summary":"done"}`
+		status, err := parseHandoffStatus(line, marker)
+		if err != nil || status.Outcome != "success" {
+			t.Errorf("prefix %q: status=%#v, err=%v", prefix, status, err)
+		}
+	}
+	for _, prefix := range []string{"agent: ", "status ", "\x1b[31m"} {
+		line := prefix + marker + ` {"version":1,"outcome":"success","summary":"done"}`
+		if _, err := parseHandoffStatus(line, marker); err == nil {
+			t.Errorf("semantic/control prefix %q unexpectedly accepted", prefix)
+		}
+	}
+}
+
+func TestReceiptRepairExtractsOnlyFreshBoundedReceipt(t *testing.T) {
+	original := newRoundControlProtocol(handoffTransportFile, "run", 7, t.TempDir(), true)
+	repair := newReceiptRepairProtocol(original, "repair")
+	output := strings.Join([]string{
+		"old prompt mentions " + repair.BeginMarker + " and " + original.StatusMarker,
+		repair.BeginMarker,
+		"● " + original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review findings recorded","artifacts":[{"relpath":"review.md","kind":"review"}]}`,
+		repair.DoneMarker,
+	}, "\n")
+
+	status, err := parseReceiptRepair(output, original.StatusMarker, repair)
+	if err != nil {
+		t.Fatalf("parseReceiptRepair() error = %v", err)
+	}
+	if status.Outcome != "needs_followup" || len(status.Artifacts) != 1 || status.Artifacts[0].RelPath != "review.md" {
+		t.Fatalf("repaired status = %#v", status)
+	}
+
+	stale := strings.Join([]string{
+		repair.BeginMarker,
+		statusMarker("other-run", 7) + ` {"version":1,"outcome":"success","summary":"stale"}`,
+		repair.DoneMarker,
+	}, "\n")
+	if _, err := parseReceiptRepair(stale, original.StatusMarker, repair); err == nil {
+		t.Fatal("stale receipt marker was accepted")
+	}
+}
+
+type receiptRepairExecutor struct {
+	*tmux.FakeExecutor
+	afterRepair string
+}
+
+func (e *receiptRepairExecutor) SendLinesContext(ctx context.Context, paneID, content string) error {
+	if err := e.FakeExecutor.SendLinesContext(ctx, paneID, content); err != nil {
+		return err
+	}
+	e.Captures[paneID] = e.afterRepair
+	return nil
+}
+
+func TestFileTurnRepairsMissingStatusFromSamePane(t *testing.T) {
+	oldInterval, oldConfirm := ppInterval, ppSubmitConfirmTimeout
+	defer func() { ppInterval, ppSubmitConfirmTimeout = oldInterval, oldConfirm }()
+	ppInterval, ppSubmitConfirmTimeout = 1, 0
+
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outbox+"/review.md", []byte("review findings"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	original := newRoundControlProtocol(handoffTransportFile, "run", 7, outbox, true)
+	repair := newReceiptRepairProtocol(original, "repair")
+	executor := &receiptRepairExecutor{FakeExecutor: tmux.NewFakeExecutor()}
+	executor.Captures["pane:2"] = "review complete\n" + original.DoneMarker
+	executor.afterRepair = strings.Join([]string{
+		executor.Captures["pane:2"],
+		repair.BeginMarker,
+		original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review findings recorded","artifacts":[{"relpath":"review.md","kind":"review"}]}`,
+		repair.DoneMarker,
+	}, "\n")
+	engine := handoffEngine{
+		Executor: executor,
+		Guard:    newHandoffGuard(),
+		Transport: resolvedHandoffConfig{
+			Transport: handoffTransportFile,
+		},
+		NewReceiptRepairToken: func() (string, error) { return "repair", nil },
+	}
+
+	result, err := engine.repairMissingFileReceipt(context.Background(), handoffMember{ID: "pane2", Label: "reviewer", Target: "pane:2"}, original, nil, store, errMissingReceipt)
+	if err != nil {
+		t.Fatalf("repairMissingFileReceipt() error = %v", err)
+	}
+	if result.Status == nil || result.Status.Outcome != "needs_followup" || len(result.Produced) != 1 {
+		t.Fatalf("repaired result = %#v", result)
+	}
+	if len(executor.SendLinesCalls) != 1 || !strings.Contains(executor.SendLinesCalls[0].Content, repair.BeginMarker) {
+		t.Fatalf("repair prompt = %#v", executor.SendLinesCalls)
+	}
+}
+
+func TestFileTurnMissingReceiptDoesNotUseScreenSelector(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, t.TempDir(), true)
+	engine := handoffEngine{
+		Guard:           newHandoffGuard(),
+		SelectResponses: true,
+		Transport:       resolvedHandoffConfig{Transport: handoffTransportFile},
+		SelectResponse: func(context.Context, []string, string) (string, int, int, error) {
+			t.Fatal("file receipt failure invoked screen selector")
+			return "", 0, 0, nil
+		},
+	}
+	_, err := engine.prepareTurnResult(context.Background(), handoffMember{ID: "pane2", Label: "reviewer"}, protocol.DoneMarker, protocol, nil, nil, "", false)
+	if !errors.Is(err, errMissingReceipt) {
+		t.Fatalf("prepareTurnResult() error = %v, want receipt error", err)
 	}
 }
 
@@ -264,5 +391,31 @@ func TestCoordinatorDecisionRejectsArtifactIDsForText(t *testing.T) {
 	err := validateCoordinatorTransportDecision(handoffCoordinatorDecision{Action: "send", ArtifactIDs: &ids}, handoffCoordinatorRequest{Transport: handoffTransportText})
 	if err == nil || !strings.Contains(err.Error(), "omit") {
 		t.Fatalf("text decision error = %v", err)
+	}
+}
+
+func TestCoordinatorControlDecisionIgnoresArtifactIDs(t *testing.T) {
+	ids := []string{"review-summary"}
+	for _, action := range []string{"stop", "retry_selection", "needs_human"} {
+		err := validateCoordinatorTransportDecision(
+			handoffCoordinatorDecision{Action: action, ArtifactIDs: &ids},
+			handoffCoordinatorRequest{Transport: handoffTransportFile},
+		)
+		if err != nil {
+			t.Errorf("%s decision should ignore artifact_ids: %v", action, err)
+		}
+	}
+}
+
+func TestNormalizeArtifactClaimsRemovesOutboxPrefix(t *testing.T) {
+	claims := normalizeArtifactClaims([]artifact.Claim{
+		{RelPath: "outbox/fix-summary.md"},
+		{RelPath: "nested/review.md"},
+	})
+	if claims[0].RelPath != "fix-summary.md" {
+		t.Fatalf("normalized relpath = %q, want fix-summary.md", claims[0].RelPath)
+	}
+	if claims[1].RelPath != "nested/review.md" {
+		t.Fatalf("unprefixed relpath changed to %q", claims[1].RelPath)
 	}
 }

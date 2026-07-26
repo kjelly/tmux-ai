@@ -1,0 +1,53 @@
+---
+name: implement-and-review
+description: 先由 fixer 依照規格實作並驗證，再由 reviewer 依照同一份規格檢查變更
+
+handoff_transport: file
+artifacts:
+  keep: false
+
+params:
+  implementer_pane: ""
+  reviewer_pane: ""
+  # 可透過 --param spec_file=./SPEC.md 傳入原始規格。
+  spec_file: ""
+
+steps:
+  - name: start-implementation
+    type: shell
+    command: "echo 'Starting implementation from specification...'"
+
+  - name: implement
+    type: send
+    pane: "{{params.implementer_pane}}"
+    instruction: >-
+      你是本 workflow 的 implementer。請在目前 pane 中先閱讀原始規格檔案
+      「{{params.spec_file}}」（若路徑為空則停止並要求提供規格），依照規格完成實作，
+      補足必要的回歸測試並執行相關驗證。請不要只提出建議；必須實際修改檔案。
+      完成後在 runner 指定的 outbox 建立 implementation-summary.md，記錄已完成的項目、
+      修改檔案與測試結果，再回報完成。
+    timeout: 1800
+    interval: 2000
+    lines: 200
+    depends: [start-implementation]
+
+  - name: review
+    type: send
+    pane: "{{params.reviewer_pane}}"
+    instruction: >-
+      你是本 workflow 的 reviewer。請先閱讀原始規格檔案「{{params.spec_file}}」，
+      再 review implementer 依規格完成的目前 git diff。檢查 correctness、完整性、
+      邊界情況與測試覆蓋；如有問題請列出詳細 findings，並區分規格要求、程式碼證據
+      與推論。請把 review 結果寫入 runner 指定的 outbox/review-summary.md。
+      這一步只做 review，不要直接修改產品檔案。
+    context_from: implement
+    timeout: 1800
+    interval: 2000
+    lines: 200
+    depends: [implement]
+
+  - name: notify-done
+    type: shell
+    command: "echo 'Implementation and review workflow finished.'"
+    depends: [review]
+    on_failure: continue

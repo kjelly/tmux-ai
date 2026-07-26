@@ -31,6 +31,10 @@ func (f *fakeRunnerOllama) Chat(ctx context.Context, messages []ollama.Message, 
 	return f.responses[idx], nil
 }
 
+func (f *fakeRunnerOllama) ChatWithFormat(ctx context.Context, messages []ollama.Message, tools []ollama.Tool, format any) (*ollama.ChatResponse, error) {
+	return f.Chat(ctx, messages, tools)
+}
+
 func newTestRunner(client ollama.Client, tmuxExec tmux.Executor) *Runner {
 	r := &Runner{
 		ollamaClient:  client,

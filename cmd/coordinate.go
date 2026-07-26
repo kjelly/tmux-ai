@@ -95,10 +95,10 @@ func loadCoordinatePreset(path string) (coordinatePreset, error) {
 	decoder := yaml.NewDecoder(bytes.NewReader(data))
 	decoder.KnownFields(true)
 	if err := decoder.Decode(&preset); err != nil {
-		return coordinatePreset{}, fmt.Errorf("parse coordinate preset %q: %w", path, err)
+		return coordinatePreset{}, appendYAMLCommandHint(fmt.Errorf("parse coordinate preset %q: %w", path, err), data, "coordinate preset")
 	}
 	if err := validateCoordinateMembers(preset.Members); err != nil {
-		return coordinatePreset{}, err
+		return coordinatePreset{}, appendYAMLCommandHint(err, data, "coordinate preset")
 	}
 	return preset, nil
 }

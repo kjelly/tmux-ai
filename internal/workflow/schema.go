@@ -2,16 +2,23 @@ package workflow
 
 // Workflow is a YAML-defined sequence/DAG of tmux-ai steps.
 type Workflow struct {
-	Name        string            `yaml:"name"`
-	Description string            `yaml:"description"`
-	Params      map[string]string `yaml:"params"` // default values; override with --param key=value
-	Steps       []Step            `yaml:"steps"`
+	Name             string            `yaml:"name"`
+	Description      string            `yaml:"description"`
+	Params           map[string]string `yaml:"params"` // default values; override with --param key=value
+	HandoffTransport string            `yaml:"handoff_transport"`
+	Artifacts        ArtifactConfig    `yaml:"artifacts"`
+	Steps            []Step            `yaml:"steps"`
+}
+
+type ArtifactConfig struct {
+	Root string `yaml:"root"`
+	Keep bool   `yaml:"keep"`
 }
 
 // Step is one unit of work in a workflow.
 type Step struct {
 	Name string `yaml:"name"`
-	Type string `yaml:"type"` // run | watch | shell | relay | broadcast
+	Type string `yaml:"type"` // run | send | watch | shell | relay | broadcast
 
 	// -- type: run / broadcast --
 	Instruction string `yaml:"instruction"`

@@ -22,17 +22,21 @@ initial_pane2: >-
 
 pane1_role: >-
   你是嚴格且唯讀的 reviewer。檢查目前 git diff 與測試，不修改產品檔案；將完整的
-  findings 發布成新的 review artifact。只有你能核准整體完成。
+  findings 發布成新的 review artifact。artifact 的 relpath 必須是相對於 outbox 的檔名，
+  例如 review-summary.md，不要加上 outbox/ 前綴。只有你能核准整體完成。
 
 pane2_role: >-
   你是 fixer。讀取 incoming artifacts，逐項修正有效 findings、補足回歸測試並執行驗證；
-  修復後交回 reviewer 複查。
+  修復後交回 reviewer 複查。artifact 的 relpath 必須是相對於 outbox 的檔名，
+  例如 fix-summary.md，不要加上 outbox/ 前綴。
 
 to_pane1_prompt: >-
-  重新 review 最新 git diff 與測試證據，並發布本輪的新 review artifact。
+  重新 review 最新 git diff 與測試證據，並發布本輪的新 review artifact；artifact relpath
+  必須是相對於 outbox 的檔名，不要加上 outbox/ 前綴。
 
 to_pane2_prompt: >-
-  讀取 incoming artifacts，修正其中的有效 findings 並補足測試。
+  讀取 incoming artifacts，修正其中的有效 findings 並補足測試；artifact relpath 必須是
+  相對於 outbox 的檔名，不要加上 outbox/ 前綴。
 
 coordinator: true
 stop_members:

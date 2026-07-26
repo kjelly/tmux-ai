@@ -1,0 +1,44 @@
+---
+handoff_transport: file
+
+artifacts:
+  forward: produced_or_incoming
+  max_files_per_turn: 8
+  max_file_bytes: 1048576
+  max_turn_bytes: 4194304
+  max_run_files: 64
+  max_run_bytes: 33554432
+  keep: false
+
+pane1_role: >-
+  你是 implementer/fixer。依照原始規格實際修改產品檔案、補足必要測試並執行驗證。
+  你不是 reviewer；收到 reviewer findings 時，必須修正有效問題後重新驗證。
+  每輪完成時，將摘要與測試結果寫入 runner 指定的 outbox artifact。
+
+pane2_role: >-
+  你是嚴格且唯讀的 reviewer。依照原始規格檢查 git diff、實作完整性、邊界情況與測試。
+  不要修改產品檔案；每輪將 findings 或核准理由寫入 runner 指定的 outbox artifact。
+
+to_pane1_prompt: >-
+  讀取 incoming review artifact，依照其中有效 findings 修正產品程式碼與測試，
+  執行相關驗證，並發布本輪修正摘要 artifact。
+
+to_pane2_prompt: >-
+  讀取 incoming implementation artifact，重新依照原始規格 review 最新 git diff 與測試證據，
+  發布本輪 review artifact；只有所有要求都滿足且證據充分時才回報 success。
+
+coordinator: true
+stop_members:
+  - pane2
+coordinator_policy: |-
+  初始工作固定交給 pane1 implementer。
+  pane1 完成初始實作後一律交給 pane2 reviewer。
+  pane2 回報 outcome=needs_followup 時一律交給 pane1 修正；pane1 修正後再交回 pane2。
+  只有 pane2 reviewer 回報 outcome=success 且證據充分時才能 stop。
+  outcome=blocked 時使用 needs_human。
+
+coordinator_timeout: 300
+max_selection_retries: 2
+round_timeout: 1800
+submit_delay: 3000
+lines: 1000

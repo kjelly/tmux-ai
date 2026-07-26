@@ -13,6 +13,7 @@ type FakeClient struct {
 type ChatCall struct {
 	Messages []Message
 	Tools    []Tool
+	Format   any
 }
 
 func NewFakeClient() *FakeClient {
@@ -20,7 +21,15 @@ func NewFakeClient() *FakeClient {
 }
 
 func (f *FakeClient) Chat(ctx context.Context, messages []Message, tools []Tool) (*ChatResponse, error) {
-	f.Calls = append(f.Calls, ChatCall{messages, tools})
+	return f.chat(messages, tools, nil)
+}
+
+func (f *FakeClient) ChatWithFormat(ctx context.Context, messages []Message, tools []Tool, format any) (*ChatResponse, error) {
+	return f.chat(messages, tools, format)
+}
+
+func (f *FakeClient) chat(messages []Message, tools []Tool, format any) (*ChatResponse, error) {
+	f.Calls = append(f.Calls, ChatCall{Messages: messages, Tools: tools, Format: format})
 	idx := f.CallIdx
 	f.CallIdx++
 	if idx >= len(f.Responses) {

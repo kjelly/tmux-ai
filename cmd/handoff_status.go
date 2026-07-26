@@ -76,6 +76,53 @@ type handoffStatusBlock struct {
 	Start, End int
 }
 
+// receiptRepairProtocol bounds a replacement receipt after a completed file
+// handoff. Its token is fresh, so a repair cannot accidentally consume an
+// earlier prompt or completion rendered in the pane scrollback.
+type receiptRepairProtocol struct {
+	BeginMarker string
+	DoneMarker  string
+}
+
+func newReceiptRepairProtocol(original roundControlProtocol, token string) receiptRepairProtocol {
+	return receiptRepairProtocol{
+		BeginMarker: roundControlMarker("HANDOFF_RECEIPT_BEGIN", token, protocolRound(original)),
+		DoneMarker:  roundControlMarker("HANDOFF_RECEIPT_DONE", token, protocolRound(original)),
+	}
+}
+
+// parseReceiptRepair accepts a status only when it is inside the fresh repair
+// frame. The receipt retains the original round's status marker: that marker
+// remains the binding between the repaired control plane and its artifact
+// outbox.
+func parseReceiptRepair(output, originalStatusMarker string, repair receiptRepairProtocol) (*handoffStatus, error) {
+	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	doneAt := -1
+	for i, line := range lines {
+		if !protocolMarkerLine(line, repair.DoneMarker) {
+			continue
+		}
+		if doneAt >= 0 {
+			return nil, fmt.Errorf("duplicate receipt repair completion marker %s", repair.DoneMarker)
+		}
+		doneAt = i
+	}
+	if doneAt < 0 {
+		return nil, fmt.Errorf("missing receipt repair completion marker %s", repair.DoneMarker)
+	}
+	beginAt := -1
+	for i := doneAt - 1; i >= 0; i-- {
+		if protocolMarkerLine(lines[i], repair.BeginMarker) {
+			beginAt = i
+			break
+		}
+	}
+	if beginAt < 0 {
+		return nil, fmt.Errorf("missing receipt repair begin marker %s", repair.BeginMarker)
+	}
+	return parseHandoffStatus(strings.Join(lines[beginAt+1:doneAt], "\n"), originalStatusMarker)
+}
+
 func extractHandoffStatusBlock(output, marker string) (handoffStatusBlock, error) {
 	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
 	var matches []int
@@ -162,7 +209,17 @@ func matchProtocolMarker(line, marker string, allowRemainder bool) (prefix, rema
 
 func isProtocolPresentationPrefix(value string) bool {
 	for _, r := range value {
-		if unicode.IsSpace(r) || strings.ContainsRune("•◦▪▫‣⁃-+*>│┃▏`~_", r) {
+		// Terminal UIs commonly add a leading glyph to assistant output (for
+		// example a bullet, tree edge, prompt chevron, or emoji).  This must
+		// not be a per-client allowlist: terminals and agents choose those
+		// glyphs independently.  A prefix is presentation-only when it has no
+		// letters or numbers; accept Unicode whitespace and graphical
+		// decoration, but reject semantic text and control characters.
+		//
+		// The per-round marker remains the authority.  This predicate merely
+		// removes the visual framing applied by a terminal, rather than making
+		// a marker embedded in a sentence into protocol data.
+		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) || unicode.IsMark(r) {
 			continue
 		}
 		return false
