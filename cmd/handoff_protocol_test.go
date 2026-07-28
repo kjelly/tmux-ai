@@ -136,15 +136,78 @@ func TestReceiptRepairExtractsOnlyFreshBoundedReceipt(t *testing.T) {
 
 type receiptRepairExecutor struct {
 	*tmux.FakeExecutor
-	afterRepair string
+	afterRepair  string
+	afterRepairs []string
+	repairCount  int
 }
 
 func (e *receiptRepairExecutor) SendLinesContext(ctx context.Context, paneID, content string) error {
 	if err := e.FakeExecutor.SendLinesContext(ctx, paneID, content); err != nil {
 		return err
 	}
-	e.Captures[paneID] = e.afterRepair
+	if e.repairCount < len(e.afterRepairs) {
+		e.Captures[paneID] = e.afterRepairs[e.repairCount]
+	} else {
+		e.Captures[paneID] = e.afterRepair
+	}
+	e.repairCount++
 	return nil
+}
+
+func TestFileTurnCorrectsInvalidOutcomeReceiptOnce(t *testing.T) {
+	oldInterval, oldConfirm := ppInterval, ppSubmitConfirmTimeout
+	defer func() { ppInterval, ppSubmitConfirmTimeout = oldInterval, oldConfirm }()
+	ppInterval, ppSubmitConfirmTimeout = 1, 0
+
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := newRoundControlProtocol(handoffTransportFile, "run", 7, outbox, true)
+	first, second := newReceiptRepairProtocol(original, "repair-one"), newReceiptRepairProtocol(original, "repair-two")
+	executor := &receiptRepairExecutor{FakeExecutor: tmux.NewFakeExecutor()}
+	executor.Captures["pane:2"] = "review complete\n" + original.DoneMarker
+	executor.afterRepairs = []string{
+		strings.Join([]string{executor.Captures["pane:2"], first.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"success|needs_followup|blocked","summary":"copied enum"}`, first.DoneMarker}, "\n"),
+		strings.Join([]string{executor.Captures["pane:2"], second.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"corrected"}`, second.DoneMarker}, "\n"),
+	}
+	tokens := []string{"repair-one", "repair-two"}
+	engine := handoffEngine{
+		Executor: executor, Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile},
+		NewReceiptRepairToken: func() (string, error) {
+			token := tokens[0]
+			tokens = tokens[1:]
+			return token, nil
+		},
+	}
+
+	result, err := engine.repairMissingFileReceipt(context.Background(), handoffMember{ID: "pane2", Label: "reviewer", Target: "pane:2"}, original, nil, store, errMissingReceipt)
+	if err != nil {
+		t.Fatalf("repairMissingFileReceipt() error = %v", err)
+	}
+	if result.Status == nil || result.Status.Outcome != "needs_followup" || len(executor.SendLinesCalls) != 2 {
+		t.Fatalf("result=%#v repair sends=%d", result, len(executor.SendLinesCalls))
+	}
+	if !strings.Contains(executor.SendLinesCalls[1].Content, `must be exactly one of "success", "needs_followup", or "blocked"`) {
+		t.Fatalf("corrective prompt did not name valid values: %q", executor.SendLinesCalls[1].Content)
+	}
+}
+
+func TestStatusInstructionsUseConcreteEnumExample(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, t.TempDir(), true)
+	for _, instruction := range []string{controlProtocolInstruction(protocol), receiptRepairInstruction(protocol, newReceiptRepairProtocol(protocol, "repair"), "")} {
+		if strings.Contains(instruction, `"outcome":"success|needs_followup|blocked"`) {
+			t.Fatalf("instruction contains a pipe-delimited outcome placeholder: %q", instruction)
+		}
+		if !strings.Contains(instruction, `must be exactly one of "success", "needs_followup", or "blocked"`) {
+			t.Fatalf("instruction does not state the enum constraint: %q", instruction)
+		}
+	}
 }
 
 func TestFileTurnRepairsMissingStatusFromSamePane(t *testing.T) {
@@ -210,6 +273,53 @@ func TestFileTurnMissingReceiptDoesNotUseScreenSelector(t *testing.T) {
 	_, err := engine.prepareTurnResult(context.Background(), handoffMember{ID: "pane2", Label: "reviewer"}, protocol.DoneMarker, protocol, nil, nil, "", false)
 	if !errors.Is(err, errMissingReceipt) {
 		t.Fatalf("prepareTurnResult() error = %v, want receipt error", err)
+	}
+}
+
+func TestProtocolInstructionsCannotBeParsedAsControlOutput(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, t.TempDir(), true)
+	if _, err := parseHandoffStatus(controlProtocolInstruction(protocol), protocol.StatusMarker); err == nil {
+		t.Fatal("normal protocol instruction was accepted as a status receipt")
+	}
+	if done, _ := completionMarkers(controlProtocolInstruction(protocol), protocol.DoneMarker, protocol.StopMarker); done {
+		t.Fatal("normal protocol instruction was accepted as completion")
+	}
+
+	repair := newReceiptRepairProtocol(protocol, "repair")
+	prompt := receiptRepairInstruction(protocol, repair, "")
+	if _, err := parseReceiptRepair(prompt, protocol.StatusMarker, repair); err == nil {
+		t.Fatal("repair instruction was accepted as a repair receipt")
+	}
+	if done, _ := completionMarkers(prompt, repair.DoneMarker, repair.DoneMarker+"_STOP"); done {
+		t.Fatal("repair instruction was accepted as repair completion")
+	}
+	if strings.Contains(prompt, `"artifacts"`) || strings.Contains(prompt, "outbox 相對路徑") {
+		t.Fatalf("artifact claim placeholder leaked into prompt: %q", prompt)
+	}
+}
+
+func TestFileHandoffCollectsOutboxWithoutAgentClaims(t *testing.T) {
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outbox+"/actual-review.md", []byte("review"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, outbox, true)
+	output := protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review complete","artifacts":[{"relpath":"outbox 相對路徑"}]}`
+	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	result, err := engine.prepareTurnResultFromOutput(context.Background(), handoffMember{ID: "pane2", Label: "reviewer"}, output, protocol, nil, store, "")
+	if err != nil {
+		t.Fatalf("prepareTurnResultFromOutput() error = %v", err)
+	}
+	if len(result.Produced) != 1 || result.Produced[0].OriginalName != "actual-review.md" {
+		t.Fatalf("produced artifacts = %#v", result.Produced)
 	}
 }
 

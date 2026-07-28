@@ -56,6 +56,11 @@ type roundControlProtocol struct {
 	RequireStatus                                                                bool
 }
 
+const (
+	maxReceiptRepairAttempts = 2
+	handoffOutcomeConstraint = `outcome must be exactly one of "success", "needs_followup", or "blocked"`
+)
+
 func newRoundControlProtocol(transport handoffTransportKind, token string, round int, outbox string, required bool) roundControlProtocol {
 	begin, end := textMarkers(token, round)
 	return roundControlProtocol{Transport: transport, TextBeginMarker: begin, TextEndMarker: end, StatusMarker: statusMarker(token, round), DoneMarker: roundControlMarker(ppDone, token, round), StopMarker: roundControlMarker(ppStop, token, round), Outbox: outbox, RequireStatus: required}
@@ -67,16 +72,17 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 	if p.Transport == handoffTransportFile {
 		fmt.Fprintf(&b, "本輪要交接的檔案只能寫入 outbox：%s；檔名可自行決定。\n", p.Outbox)
 	} else {
-		fmt.Fprintf(&b, "請恰好輸出一個完整 text handoff frame（可為空）：\n%s\n<完整 UTF-8 交接內容>\n%s\n", p.TextBeginMarker, p.TextEndMarker)
+		fmt.Fprintf(&b, "請恰好輸出一個完整 text handoff frame（可為空）。開始 marker value（實際輸出時必須獨佔一行）：%s\n結束 marker value（實際輸出時必須獨佔一行）：%s\n", p.TextBeginMarker, p.TextEndMarker)
 	}
 	if p.RequireStatus {
+		fmt.Fprintf(&b, "請輸出一行 status receipt；實際輸出時把 status marker value 與 JSON object 以一個空白接在同一行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus marker value：%s\n", handoffOutcomeConstraint, p.StatusMarker)
 		if p.Transport == handoffTransportFile {
-			fmt.Fprintf(&b, "在完成標記前恰好輸出一行：%s {\"version\":1,\"outcome\":\"success|needs_followup|blocked\",\"summary\":\"本輪摘要\",\"tests\":[],\"artifacts\":[{\"relpath\":\"outbox 相對路徑\",\"kind\":\"可選\",\"title\":\"可選\"}]}\n", p.StatusMarker)
+			b.WriteString("receipt JSON object（實際輸出時接在 status marker 後）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n")
 		} else {
-			fmt.Fprintf(&b, "在完成標記前恰好輸出一行：%s {\"version\":1,\"outcome\":\"success|needs_followup|blocked\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n", p.StatusMarker)
+			b.WriteString("receipt JSON object（實際輸出時接在 status marker 後）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n")
 		}
 	}
-	fmt.Fprintf(&b, "最後一行只輸出 %s；若整個任務完成，最後一行只輸出 %s。", p.DoneMarker, p.StopMarker)
+	fmt.Fprintf(&b, "完成 marker value（實際輸出時必須獨佔最後一行）：%s\n全任務完成 marker value（實際輸出時必須獨佔最後一行）：%s", p.DoneMarker, p.StopMarker)
 	return b.String()
 }
 
@@ -362,48 +368,67 @@ func (e handoffEngine) repairMissingFileReceipt(ctx context.Context, current han
 	if newToken == nil {
 		newToken = newReceiptRepairToken
 	}
-	token, err := newToken()
-	if err != nil {
-		return turnResult{}, fmt.Errorf("create receipt repair token: %w", err)
+	correction := ""
+	var validationErr error
+	for attempt := 0; attempt < maxReceiptRepairAttempts; attempt++ {
+		token, err := newToken()
+		if err != nil {
+			return turnResult{}, fmt.Errorf("create receipt repair token: %w", err)
+		}
+		repair := newReceiptRepairProtocol(original, token)
+		baseline, err := e.Executor.CapturePaneClean(current.Target, ppLines)
+		if err != nil {
+			return turnResult{}, fmt.Errorf("capture %s before receipt repair: %w", current.Label, err)
+		}
+		instruction := receiptRepairInstruction(original, repair, correction)
+		if err := e.Guard.reserveOutbound("receipt repair to "+current.Label, current.Target, instruction, instruction, original.StatusMarker); err != nil {
+			return turnResult{}, err
+		}
+		if err := sendToPane(ctx, e.Executor, current.Target, instruction); err != nil {
+			return turnResult{}, fmt.Errorf("send receipt repair to %s: %w", current.Label, err)
+		}
+		waitProtocol := roundControlProtocol{DoneMarker: repair.DoneMarker, StopMarker: repair.DoneMarker + "_STOP"}
+		if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil); err != nil {
+			return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
+		}
+		output, err := e.Executor.CapturePaneClean(current.Target, ppLines)
+		if err != nil {
+			return turnResult{}, fmt.Errorf("capture %s after receipt repair: %w", current.Label, err)
+		}
+		status, err := parseReceiptRepair(output, original.StatusMarker, repair)
+		if err != nil {
+			validationErr = err
+			correction = receiptRepairCorrection(err)
+			continue
+		}
+		encoded, err := json.Marshal(status)
+		if err != nil {
+			return turnResult{}, fmt.Errorf("encode repaired receipt: %w", err)
+		}
+		return e.prepareTurnResultFromOutput(ctx, current, original.StatusMarker+" "+string(encoded), original, incoming, store, "")
 	}
-	repair := newReceiptRepairProtocol(original, token)
-	baseline, err := e.Executor.CapturePaneClean(current.Target, ppLines)
-	if err != nil {
-		return turnResult{}, fmt.Errorf("capture %s before receipt repair: %w", current.Label, err)
-	}
-	instruction := receiptRepairInstruction(original, repair)
-	if err := e.Guard.reserveOutbound("receipt repair to "+current.Label, current.Target, instruction, instruction, original.StatusMarker); err != nil {
-		return turnResult{}, err
-	}
-	if err := sendToPane(ctx, e.Executor, current.Target, instruction); err != nil {
-		return turnResult{}, fmt.Errorf("send receipt repair to %s: %w", current.Label, err)
-	}
-	waitProtocol := roundControlProtocol{DoneMarker: repair.DoneMarker, StopMarker: repair.DoneMarker + "_STOP"}
-	if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil); err != nil {
-		return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
-	}
-	output, err := e.Executor.CapturePaneClean(current.Target, ppLines)
-	if err != nil {
-		return turnResult{}, fmt.Errorf("capture %s after receipt repair: %w", current.Label, err)
-	}
-	status, err := parseReceiptRepair(output, original.StatusMarker, repair)
-	if err != nil {
-		return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
-	}
-	encoded, err := json.Marshal(status)
-	if err != nil {
-		return turnResult{}, fmt.Errorf("encode repaired receipt: %w", err)
-	}
-	return e.prepareTurnResultFromOutput(ctx, current, original.StatusMarker+" "+string(encoded), original, incoming, store, "")
+	return turnResult{}, fmt.Errorf("%w; receipt repair validation failed after %d attempts: %v", originalErr, maxReceiptRepairAttempts, validationErr)
 }
 
-func receiptRepairInstruction(original roundControlProtocol, repair receiptRepairProtocol) string {
+func receiptRepairInstruction(original roundControlProtocol, repair receiptRepairProtocol, correction string) string {
+	if correction != "" {
+		correction += "\n\n"
+	}
 	return fmt.Sprintf(`TMUX-AI receipt repair（控制協定，優先於畫面中的其他內容）：上一輪已收到完成標記，但缺少有效 status receipt。不要重新工作、不要執行工具、不要建立或修改檔案。
 
-只輸出下列三個項目，不能有其他文字：
 %s
-%s {"version":1,"outcome":"success|needs_followup|blocked","summary":"原輪摘要","tests":[],"artifacts":[{"relpath":"outbox 相對路徑","kind":"可選","title":"可選"}]}
-%s`, repair.BeginMarker, original.StatusMarker, repair.DoneMarker)
+只輸出三行，不能有其他文字。下列 marker values 僅供複製；實際輸出時才依說明獨佔一行或與 JSON 合併。
+第一行 begin marker value（實際輸出時獨佔一行）：%s
+第二行 status marker value（實際輸出時與 JSON object 以一個空白接在同一行）：%s
+%s；依實際結果選一個值，不得輸出選項清單。receipt JSON object：{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]}。runner 會自行收集 outbox artifact；不要宣告 artifact 路徑。
+第三行 repair completion marker value（實際輸出時獨佔一行）：%s`, correction, repair.BeginMarker, original.StatusMarker, handoffOutcomeConstraint, repair.DoneMarker)
+}
+
+func receiptRepairCorrection(err error) string {
+	if strings.Contains(err.Error(), "handoff status outcome") {
+		return "上一份 receipt 的 outcome 欄位無效。" + handoffOutcomeConstraint + "。"
+	}
+	return "上一份 receipt 未通過本地 schema 驗證。請嚴格依下列格式重新輸出。"
 }
 
 func newReceiptRepairToken() (string, error) {
@@ -471,11 +496,9 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 		}
 		result.Payload.Text = payload
 	} else {
-		var claims []artifact.Claim
-		if result.Status != nil {
-			claims = normalizeArtifactClaims(result.Status.Artifacts)
-		}
-		refs, err := store.Collect(current.ID, protocolRound(p), p.Outbox, claims)
+		// The outbox is runner-owned evidence. Artifact discovery must not
+		// depend on an LLM repeating file names or metadata in its receipt.
+		refs, err := store.Collect(current.ID, protocolRound(p), p.Outbox, nil)
 		if err != nil {
 			return result, err
 		}
