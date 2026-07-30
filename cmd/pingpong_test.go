@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -197,6 +198,29 @@ func TestDecideHandoffActionReroutesUnauthorizedStopWithoutRetry(t *testing.T) {
 	}
 	if decision.Action != "send" || decision.Target != "pane2" || len(client.Calls) != 1 {
 		t.Fatalf("decision=%#v calls=%d, want one rerouted send", decision, len(client.Calls))
+	}
+}
+
+func TestDecideHandoffActionReroutesSuccessfulImplementerSelfHandoff(t *testing.T) {
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"action":"send","target":"pane1","instruction":"recheck the implementation","reason":"no reviewer artifact","confidence":0.9}`}, Done: true}}
+	decision, err := decideHandoffActionWithClient(context.Background(), handoffCoordinatorRequest{
+		Round: 1, CurrentID: "pane1", Members: testPingPongCoordinatorMembers(), StopMembers: []string{"pane2"},
+		CurrentStatus: &handoffStatus{Version: 1, Outcome: "success", Summary: "implementation complete"},
+	}, newHandoffGuard(), client)
+	if err != nil {
+		t.Fatalf("decideHandoffActionWithClient() error = %v", err)
+	}
+	if decision.Action != "send" || decision.Target != "pane2" || !strings.Contains(decision.Instruction, "最終複查") || len(client.Calls) != 1 {
+		t.Fatalf("decision=%#v calls=%d, want one rerouted reviewer send", decision, len(client.Calls))
+	}
+}
+
+func TestSuccessfulAuthorizedReviewerMayReceiveSelfHandoff(t *testing.T) {
+	decision := handoffCoordinatorDecision{Action: "send", Target: "pane2", Instruction: "continue", Reason: "more evidence", Confidence: 0.9}
+	got, err := rerouteSelfHandoffAfterUnauthorizedSuccess(decision, "pane2", &handoffStatus{Outcome: "success"}, []string{"pane2"})
+	if err != nil || got != decision {
+		t.Fatalf("rerouteSelfHandoffAfterUnauthorizedSuccess() = %#v, %v; want unchanged", got, err)
 	}
 }
 
@@ -560,6 +584,21 @@ func TestCompletionSettleResetsAfterRedraw(t *testing.T) {
 	}
 }
 
+func TestCompletionSettleCanUseEnvelopeAsGoalModeStabilityKey(t *testing.T) {
+	var state completionSettleState
+	start := time.Unix(100, 0)
+	settle := time.Second
+
+	// Goal-mode callers use the validated envelope as the screen key, so
+	// unrelated terminal redraws cannot postpone the handoff.
+	if state.observe("envelope", "envelope", false, start, settle) {
+		t.Fatal("first validated capture must not commit the handoff")
+	}
+	if !state.observe("envelope", "envelope", false, start.Add(time.Second), settle) {
+		t.Fatal("stable envelope did not commit the goal-mode handoff")
+	}
+}
+
 func TestCompletedEnvelopeRequiresValidReceipt(t *testing.T) {
 	protocol := newRoundControlProtocol(handoffTransportText, "missing-receipt", 1, "", true)
 	output := strings.Join([]string{
@@ -570,6 +609,16 @@ func TestCompletedEnvelopeRequiresValidReceipt(t *testing.T) {
 	}, "\n")
 	if _, ok := extractCompletedProtocolEnvelope(output, protocol); ok {
 		t.Fatal("completion envelope without a valid receipt was accepted")
+	}
+}
+
+func TestCompletedEnvelopeUsesNewestReceiptAfterTerminalRedraw(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "repeated", 1, "/tmp/outbox", true)
+	first := protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"first","tests":[]}` + "\n" + protocol.DoneMarker
+	second := protocol.StatusMarker + ` {"version":1,"outcome":"success","summary":"latest","tests":[]}` + "\n" + protocol.DoneMarker
+	envelope, ok := extractCompletedProtocolEnvelope(first+"\nterminal redraw\n"+second, protocol)
+	if !ok || !strings.Contains(envelope, `"summary":"latest"`) || strings.Contains(envelope, `"summary":"first"`) {
+		t.Fatalf("envelope = %q, ok=%t; want only newest completed receipt", envelope, ok)
 	}
 }
 
@@ -636,16 +685,19 @@ func TestWaitForCompletionUsesIdleValidReceiptWithoutDone(t *testing.T) {
 	}
 }
 
-func TestGoalModeWaitsForIdleAfterDone(t *testing.T) {
+func TestGoalModeClearsThenWaitsForIdleBeforeHandoff(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	protocol := newRoundControlProtocol(handoffTransportFile, "goal-idle", 1, "/tmp/outbox", true)
 	protocol.GoalMode = true
 	ex.Captures["tgoal:1"] = protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"done","tests":[]}` + "\n" + protocol.DoneMarker
 
-	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
-	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 3, 1
+	oldInterval, oldTimeout, oldSettle := ppInterval, ppRoundTimeout, ppCompletionSettleTimeout
+	oldReceiptIdle, oldDelay, oldConfirm := ppReceiptIdleTimeout, ppSubmitDelay, ppSubmitConfirmTimeout
+	ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = 1, 3, 0
+	ppReceiptIdleTimeout, ppSubmitDelay, ppSubmitConfirmTimeout = 1, 0, 0
 	defer func() {
-		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
+		ppReceiptIdleTimeout, ppSubmitDelay, ppSubmitConfirmTimeout = oldReceiptIdle, oldDelay, oldConfirm
 	}()
 
 	started := time.Now()
@@ -654,10 +706,75 @@ func TestGoalModeWaitsForIdleAfterDone(t *testing.T) {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
 	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
-		t.Fatalf("goal-mode DONE returned after %s, want about one second of idle time", elapsed)
+		t.Fatalf("goal-mode DONE returned after %s, want idle wait after /goal clear", elapsed)
 	}
 	if stopped || selected || output != ex.Captures["tgoal:1"] {
 		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
+	}
+	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal clear" {
+		t.Fatalf("goal clear calls = %#v", ex.SendLinesCalls)
+	}
+}
+
+func TestGoalModeDoesNotRepeatClearWhileScreenIsStillChanging(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "goal-no-repeat", 1, "/tmp/outbox", true)
+	protocol.GoalMode = true
+
+	var captures int
+	ex.CaptureHook = func(_ string, _ int) (string, error) {
+		captures++
+		return protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"done","tests":[]}` + "\n" + protocol.DoneMarker + "\nredraw=" + strconv.Itoa(captures), nil
+	}
+
+	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 0, 1
+	defer func() {
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, _, _, err := waitForCompletionWithFallback(ctx, ex, "tgoal:changing", "old prompt", protocol, nil)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitForCompletionWithFallback() error = %v, want context deadline", err)
+	}
+	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal clear" {
+		t.Fatalf("goal clear calls = %#v, want exactly one clear despite redraws", ex.SendLinesCalls)
+	}
+}
+
+func TestGoalModeHandsOffAfterReceiptAndNativeGoalCompletionWithoutDone(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "goal-native-complete", 1, "/tmp/outbox", true)
+	protocol.GoalMode = true
+	ex.Captures["tgoal:native"] = protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"done","tests":[]}` + "\nGoal completed"
+
+	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
+	oldDelay, oldConfirm := ppSubmitDelay, ppSubmitConfirmTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 3, 1
+	ppSubmitDelay, ppSubmitConfirmTimeout = 0, 0
+	defer func() {
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+		ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm
+	}()
+
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:native", "old prompt", protocol, nil)
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	if stopped || selected || output != ex.Captures["tgoal:native"] {
+		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
+	}
+	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal clear" {
+		t.Fatalf("goal clear calls = %#v, want one clear", ex.SendLinesCalls)
+	}
+}
+
+func TestGoalModeNativeCompletionRequiresReceiptToPrecedeIt(t *testing.T) {
+	marker := "STATUS__TMUXAI_round"
+	if goalModeNativeCompletionAfterReceipt("Goal completed\n"+marker+` {"version":1}`, marker) {
+		t.Fatal("old goal completion before receipt must not complete the current round")
 	}
 }
 

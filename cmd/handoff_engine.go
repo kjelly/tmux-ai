@@ -67,14 +67,14 @@ const (
 	handoffOutcomeConstraint = `outcome must be exactly one of "success", "needs_followup", or "blocked"`
 )
 
-// Codex accepts /goal reset asynchronously.  Do not paste the next /goal
-// packet until its reset turn has actually returned to an idle prompt.
-var codexGoalResetTimeout = 30 * time.Second
+// Codex accepts /goal clear asynchronously.  Do not paste the next /goal
+// packet until its clear turn has actually returned to an idle prompt.
+var codexGoalClearTimeout = 30 * time.Second
 
-// codexGoalResetNoopGrace avoids holding a handoff for the full reset timeout
-// when Codex has no active native goal and acknowledges `/goal reset` without
+// codexGoalClearNoopGrace avoids holding a handoff for the full clear timeout
+// when Codex has no active native goal and acknowledges `/goal clear` without
 // changing the captured screen.
-const codexGoalResetNoopGrace = 2 * time.Second
+const codexGoalClearNoopGrace = 2 * time.Second
 
 func newRoundControlProtocol(transport handoffTransportKind, token string, round int, outbox string, required bool) roundControlProtocol {
 	begin, end := textMarkers(token, round)
@@ -187,17 +187,18 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		fmt.Printf("🔎 Dry run: would send %d bytes to %s\n%s\n", len([]byte(initial)), current.Label, truncate(initial, 1000))
 		return nil
 	}
-	if err := resetCodexGoalIfNeeded(ctx, e.Executor, current); err != nil {
-		return fmt.Errorf("reset goal in %s: %w", current.Label, err)
-	}
 	if err := sendToPane(ctx, e.Executor, current.Target, initial); err != nil {
 		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
 	}
 	fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
 	for round := 1; round <= ppMaxRounds; round++ {
+	roundRetry:
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
 		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback())
 		if err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return err
 		}
 		if stopped && !e.CoordinatorControlsStop {
@@ -213,6 +214,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
 		}
 		if err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return err
 		}
 		fmt.Printf("🧠 正在判斷 %s 的第 %d 輪結果與下一步\n", handoffMemberDisplayName(current), round)
@@ -220,6 +224,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		for retries := 0; ; retries++ {
 			route, err = e.Route(ctx, round, current, result, stopped)
 			if err != nil {
+				if askRetry(ctx, err) {
+					goto roundRetry
+				}
 				return err
 			}
 			if route.NeedsHuman {
@@ -234,6 +241,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			fmt.Printf("🔁 Coordinator 要求重新選取 %s 的回覆：%s\n", handoffMemberDisplayName(current), truncate(route.Reason, 120))
 			result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, route.Reason, true)
 			if err != nil {
+				if askRetry(ctx, err) {
+					goto roundRetry
+				}
 				return err
 			}
 		}
@@ -258,6 +268,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		fmt.Printf("➡️ 下一步交給 %s (%s)：%s\n", handoffMemberDisplayName(next), next.Target, displayHandoffRouteReason(route.Reason))
 		payload, nextIncoming, err := e.routePayload(result, route, store)
 		if err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return err
 		}
 		relay := result.Narrative
@@ -274,20 +287,29 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		}
 		nextBaseline, err := e.Executor.CapturePaneClean(next.Target, ppLines)
 		if err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return fmt.Errorf("capture state of %s before relay: %w", next.Label, err)
 		}
 		nextProtocol, err := e.protocolFor(store, next, token, round+1)
 		if err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return err
 		}
 		message := buildMemberTurnMessage(next, route.Instruction, relay, payload, nextIncoming, nextProtocol)
 		if err := e.Guard.reserveOutbound("relay to "+next.Label, next.Target, route.Instruction, message, relay+payload.Text); err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return err
 		}
-		if err := resetCodexGoalIfNeeded(ctx, e.Executor, next); err != nil {
-			return fmt.Errorf("reset goal in %s: %w", next.Label, err)
-		}
 		if err := sendToPane(ctx, e.Executor, next.Target, message); err != nil {
+			if askRetry(ctx, err) {
+				goto roundRetry
+			}
 			return fmt.Errorf("relay to %s: %w", next.Label, err)
 		}
 		fmt.Printf("📨 已送出第 %d 輪交接給 %s\n", round+1, handoffMemberDisplayName(next))
@@ -304,10 +326,10 @@ func displayHandoffRouteReason(reason string) string {
 	return "依既定交接順序繼續"
 }
 
-// resetCodexGoalIfNeeded clears Codex's current native goal immediately
+// clearCodexGoalIfNeeded clears Codex's current native goal immediately
 // before a new /goal task is submitted. Other agents, and non-goal members,
 // are left untouched.
-func resetCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handoffMember) error {
+func clearCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handoffMember) error {
 	if !member.GoalMode {
 		return nil
 	}
@@ -328,71 +350,83 @@ func resetCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handof
 		if !strings.Contains(strings.ToLower(pane.Command), "codex") {
 			return nil
 		}
-		fmt.Printf("🔄 Resetting Codex goal in %s (%s)\n", member.Label, member.Target)
+		fmt.Printf("🔄 Clearing Codex goal in %s (%s)\n", member.Label, member.Target)
 		before, captureErr := ex.CapturePaneClean(member.Target, ppLines)
-		if err := sendToPane(ctx, ex, member.Target, "/goal reset"); err != nil {
+		if err := sendToPane(ctx, ex, member.Target, "/goal clear"); err != nil {
 			return err
 		}
-		if captureErr != nil || codexGoalResetTimeout <= 0 {
+		if captureErr != nil || codexGoalClearTimeout <= 0 {
 			return nil
 		}
-		return waitForCodexGoalReset(ctx, ex, member.Target, before)
+		cleared, err := waitForCodexGoalClear(ctx, ex, member.Target, before)
+		if err != nil || cleared {
+			return err
+		}
+		// A visible goal that refuses to clear will otherwise resume when this
+		// pane is selected in a later round, causing it to emit the previous
+		// run's receipt. A fresh Codex conversation is the safe fallback before
+		// the pane can receive another managed /goal task.
+		fmt.Fprintf(os.Stderr, "warn: Codex /goal clear was not confirmed in %s; starting a fresh session before its next handoff\n", member.Target)
+		if err := sendToPane(ctx, ex, member.Target, "/new"); err != nil {
+			return fmt.Errorf("start fresh Codex session after goal clear timeout: %w", err)
+		}
+		return nil
 	}
 	return nil
 }
 
-func waitForCodexGoalReset(ctx context.Context, ex tmux.Executor, paneID, before string) error {
-	deadline := time.NewTimer(codexGoalResetTimeout)
+func waitForCodexGoalClear(ctx context.Context, ex tmux.Executor, paneID, before string) (bool, error) {
+	deadline := time.NewTimer(codexGoalClearTimeout)
 	defer deadline.Stop()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	startedAt := time.Now()
-	seenResetActive := false
+	seenClearActive := false
 	for {
 		current, err := ex.CapturePaneClean(paneID, ppLines)
 		if err != nil {
-			// Reset is best effort; inability to observe the pane must not block
+			// Clear is best effort; inability to observe the pane must not block
 			// a normal handoff.
-			return nil
+			return true, nil
 		}
-		if codexGoalResetComplete(current) {
-			return nil
+		if codexGoalClearComplete(current) {
+			return true, nil
 		}
-		active := codexGoalResetActive(current)
-		seenResetActive = seenResetActive || active
-		if seenResetActive && !active && current != before {
-			return nil
+		active := codexGoalClearActive(current)
+		seenClearActive = seenClearActive || active
+		if seenClearActive && !active && current != before {
+			return true, nil
 		}
-		// Codex emits no visible reset state when there is no active goal. Do
+		// Codex emits no visible clear state when there is no active goal. Do
 		// not delay the next task for 30 seconds in that normal no-op case.
-		if !seenResetActive && current == before && time.Since(startedAt) >= codexGoalResetNoopGrace {
-			return nil
+		if !seenClearActive && current == before && time.Since(startedAt) >= codexGoalClearNoopGrace {
+			return true, nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-deadline.C:
-			// Reset is a best-effort guard against stale native goals. Codex can
+			// Clear is a best-effort guard against stale native goals. Codex can
 			// finish it without a detectable screen message, so keep the workflow
 			// alive and submit the already-prepared task.
-			fmt.Fprintf(os.Stderr, "warn: timed out waiting for Codex /goal reset in %s; continuing handoff\n", paneID)
-			return nil
+			fmt.Fprintf(os.Stderr, "warn: timed out waiting for Codex /goal clear in %s; continuing handoff\n", paneID)
+			return false, nil
 		case <-ticker.C:
 		}
 	}
 }
 
-func codexGoalResetActive(screen string) bool {
+func codexGoalClearActive(screen string) bool {
 	screen = strings.ToLower(screen)
-	return strings.Contains(screen, "goal active") && strings.Contains(screen, "objective: reset")
+	return strings.Contains(screen, "goal active") && strings.Contains(screen, "objective: clear")
 }
 
-func codexGoalResetComplete(screen string) bool {
+func codexGoalClearComplete(screen string) bool {
 	screen = strings.ToLower(screen)
 	return strings.Contains(screen, "goal complete") ||
 		strings.Contains(screen, "goal completed") ||
-		strings.Contains(screen, "已完成 reset") ||
-		strings.Contains(screen, "完成 reset")
+		strings.Contains(screen, "已完成 clear") ||
+		strings.Contains(screen, "完成 clear")
 }
 
 func handoffMemberDisplayName(member handoffMember) string {

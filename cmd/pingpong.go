@@ -173,7 +173,9 @@ Examples:
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ppHandoffFlagSet = cmd.Flags()
-		return runPingPong()
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runWithInteractiveRetry(ctx, runPingPong)
 	},
 }
 
@@ -1022,12 +1024,13 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		if screenChangedAt.IsZero() || content != lastScreen {
 			lastScreen, screenChangedAt = content, time.Now()
 		}
-		// Once a /goal turn has emitted DONE, retain that observation even if a
-		// later TUI redraw removes it from the capture.  Only the post-DONE
-		// screen-idle period matters from this point onward.
+		// A managed Codex goal must be cleared immediately after its verified
+		// receipt, then remain idle before the runner may hand it off. This keeps
+		// Codex's native goal lifecycle ahead of the next pane's task.
 		if protocol.GoalMode && goalDoneSeen {
-			if time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
-				fmt.Printf("✅ Pane %s 已連續穩定 %s，開始處理本輪結果\n", paneID, completionIdleDuration())
+			idle := time.Duration(ppReceiptIdleTimeout) * time.Second
+			if time.Since(screenChangedAt) >= idle {
+				fmt.Printf("✅ Pane %s 已在 /goal clear 後連續穩定 %s，開始處理本輪結果\n", paneID, completionIdleDuration())
 				return goalDoneOutput, goalDoneStopped, false, nil
 			}
 			continue
@@ -1048,14 +1051,24 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				continue
 			}
 			if protocol.GoalMode {
+				if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+					return "", false, false, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
+				}
 				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
-				fmt.Printf("✅ Pane %s 已偵測到 %s；goal mode 需等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
+				fmt.Printf("✅ Pane %s 已驗證 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
 				continue
 			}
-			if completionSettle.captures == 0 || completionSettle.screen != content {
+			settleScreen := content
+			if protocol.GoalMode {
+				// A Codex goal may continue repainting explanatory UI after it has
+				// emitted its nonce-bound receipt. For a goal handoff the validated
+				// envelope, not unrelated terminal redraws, is the stable value.
+				settleScreen = envelope
+			}
+			if completionSettle.captures == 0 || completionSettle.screen != settleScreen {
 				fmt.Printf("✅ Pane %s 已驗證 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
 			}
-			if completionSettle.observe(content, envelope, stopped, time.Now(), completionSettleDuration()) {
+			if completionSettle.observe(settleScreen, envelope, stopped, time.Now(), completionSettleDuration()) {
 				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
 				return envelope, stopped, false, nil
 			}
@@ -1072,18 +1085,6 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if !protocol.RequireStatus {
 				return newContent, stopped, false, nil
 			}
-			if protocol.GoalMode {
-				baseProtocol := protocol
-				baseProtocol.DoneMarker = ppDone
-				baseProtocol.StopMarker = ppStop
-				envelope, valid := extractCompletedProtocolEnvelope(content, baseProtocol)
-				if !valid {
-					continue
-				}
-				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
-				fmt.Printf("✅ Pane %s 已偵測到相容的 %s；goal mode 需等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
-				continue
-			}
 			baseProtocol := protocol
 			baseProtocol.DoneMarker = ppDone
 			baseProtocol.StopMarker = ppStop
@@ -1091,19 +1092,45 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if !valid {
 				continue
 			}
-			if completionSettle.captures == 0 || completionSettle.screen != content {
+			if protocol.GoalMode {
+				if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+					return "", false, false, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
+				}
+				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
+				fmt.Printf("✅ Pane %s 已驗證相容的 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
+				continue
+			}
+			settleScreen := content
+			if protocol.GoalMode {
+				settleScreen = envelope
+			}
+			if completionSettle.captures == 0 || completionSettle.screen != settleScreen {
 				fmt.Printf("✅ Pane %s 已驗證相容的 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
 			}
-			if completionSettle.observe(content, envelope, stopped, time.Now(), completionSettleDuration()) {
+			if completionSettle.observe(settleScreen, envelope, stopped, time.Now(), completionSettleDuration()) {
 				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
 				return envelope, stopped, false, nil
 			}
 			continue
 		}
 		// A valid, nonce-bound receipt is stronger evidence than an arbitrary
-		// terminal screen. If an agent omits DONE, permit the configured idle
-		// fallback after a schema-valid receipt, including for /goal members.
-		if ppReceiptIdleTimeout > 0 && hasValidStatusReceipt(controlContent, protocol) {
+		// terminal screen. A non-strict goal turn may also finish without the
+		// synthetic DONE marker when its native goal UI explicitly reports
+		// completion. Require both signals, then clear exactly once and use the
+		// same idle handoff path as a normal DONE completion.
+		receiptValid := hasValidStatusReceipt(controlContent, protocol)
+		if protocol.GoalMode && protocol.GoalDoneMarker == "" && receiptValid && goalModeNativeCompletionAfterReceipt(content, protocol.StatusMarker) {
+			if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+				return "", false, false, fmt.Errorf("clear receipt-completed goal in %s: %w", paneID, err)
+			}
+			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, false, content
+			fmt.Printf("✅ Pane %s 已驗證有效 status receipt 與 native goal 完成狀態；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, completionIdleDuration())
+			continue
+		}
+		// If an agent omits DONE, normal members can use the configured idle
+		// fallback after a schema-valid receipt. Goal members additionally need
+		// the explicit native completion state checked above.
+		if ppReceiptIdleTimeout > 0 && receiptValid {
 			if !receiptWaitAnnounced {
 				fmt.Printf("🧾 Pane %s 已偵測到有效 status receipt，但尚未偵測到完成標記；等待畫面連續穩定 %s\n", paneID, completionIdleDuration())
 				receiptWaitAnnounced = true
@@ -1135,6 +1162,27 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			}
 		}
 	}
+}
+
+// goalModeNativeCompletionAfterReceipt accepts only an explicit native-goal
+// completion state rendered after this round's nonce-bound receipt. Looking
+// after the receipt avoids treating an old goal's UI chrome as evidence that
+// the current task is complete.
+func goalModeNativeCompletionAfterReceipt(screen, receiptMarker string) bool {
+	start := strings.LastIndex(screen, receiptMarker)
+	if start < 0 {
+		return false
+	}
+	for _, line := range strings.Split(screen[start+len(receiptMarker):], "\n") {
+		state := strings.ToLower(strings.TrimSpace(line))
+		if strings.Contains(state, "goal completed") ||
+			strings.Contains(state, "goal complete") ||
+			strings.Contains(state, "goal 已完成") ||
+			strings.Contains(state, "目標已完成") {
+			return true
+		}
+	}
+	return false
 }
 
 func completionIdleDuration() time.Duration {
@@ -1198,10 +1246,19 @@ func extractCompletedProtocolEnvelope(content string, protocol roundControlProto
 	if completionAt < 0 {
 		return "", false
 	}
+	// Terminal agents can redraw an already-completed turn. Bind the receipt
+	// to the newest completion delimiter, so older identical receipts in the
+	// scrollback do not make the current handoff permanently unparsable.
+	segmentStart := 0
+	for i := 0; i < completionAt; i++ {
+		if protocolMarkerLine(lines[i], protocol.DoneMarker) || protocolMarkerLine(lines[i], protocol.StopMarker) {
+			segmentStart = i + 1
+		}
+	}
 
 	start := -1
 	if protocol.Transport == handoffTransportText {
-		for i := completionAt - 1; i >= 0; i-- {
+		for i := completionAt - 1; i >= segmentStart; i-- {
 			if protocolMarkerLine(lines[i], protocol.TextBeginMarker) {
 				start = i
 				break
@@ -1221,11 +1278,11 @@ func extractCompletedProtocolEnvelope(content string, protocol roundControlProto
 			return "", false
 		}
 	} else if protocol.RequireStatus {
-		block, err := extractHandoffStatusBlock(strings.Join(lines[:completionAt], "\n"), protocol.StatusMarker)
+		block, err := extractHandoffStatusBlock(strings.Join(lines[segmentStart:completionAt], "\n"), protocol.StatusMarker)
 		if err != nil {
 			return "", false
 		}
-		start = block.Start
+		start = segmentStart + block.Start
 	} else {
 		return "", false
 	}

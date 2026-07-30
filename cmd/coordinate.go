@@ -53,7 +53,9 @@ best member for the initial task and after every completed turn.`,
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ppHandoffFlagSet = cmd.Flags()
-		return runCoordinate()
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runWithInteractiveRetry(ctx, runCoordinate)
 	},
 }
 

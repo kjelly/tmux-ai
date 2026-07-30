@@ -137,51 +137,52 @@ func TestBuildMemberTurnMessageLeavesNormalMembersUnchanged(t *testing.T) {
 	}
 }
 
-func TestResetCodexGoalIfNeeded(t *testing.T) {
-	oldDelay, oldConfirm, oldResetTimeout := ppSubmitDelay, ppSubmitConfirmTimeout, codexGoalResetTimeout
+func TestClearCodexGoalIfNeeded(t *testing.T) {
+	oldDelay, oldConfirm, oldClearTimeout := ppSubmitDelay, ppSubmitConfirmTimeout, codexGoalClearTimeout
 	ppSubmitDelay, ppSubmitConfirmTimeout = 0, 0
-	codexGoalResetTimeout = 0
+	codexGoalClearTimeout = 0
 	defer func() {
-		ppSubmitDelay, ppSubmitConfirmTimeout, codexGoalResetTimeout = oldDelay, oldConfirm, oldResetTimeout
+		ppSubmitDelay, ppSubmitConfirmTimeout, codexGoalClearTimeout = oldDelay, oldConfirm, oldClearTimeout
 	}()
 
 	ex := tmux.NewFakeExecutor()
 	ex.PanesDetailed = []tmux.PaneInfo{{PaneID: "%42", Command: "codex"}}
 	member := handoffMember{Label: "worker", Target: "%42", GoalMode: true}
-	if err := resetCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
-		t.Fatalf("resetCodexGoalIfNeeded() error = %v", err)
+	if err := clearCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
+		t.Fatalf("clearCodexGoalIfNeeded() error = %v", err)
 	}
-	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal reset" {
-		t.Fatalf("SendLinesCalls = %#v, want one /goal reset", ex.SendLinesCalls)
+	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal clear" {
+		t.Fatalf("SendLinesCalls = %#v, want one /goal clear", ex.SendLinesCalls)
 	}
 	if len(ex.ExecCalls) != 1 || ex.ExecCalls[0][0] != "send-keys" {
 		t.Fatalf("ExecCalls = %#v, want one Enter submission", ex.ExecCalls)
 	}
 }
 
-func TestCodexGoalResetScreenStates(t *testing.T) {
-	if !codexGoalResetActive("Goal active Objective: reset") {
-		t.Fatal("reset active screen was not recognized")
+func TestCodexGoalClearScreenStates(t *testing.T) {
+	if !codexGoalClearActive("Goal active Objective: clear") {
+		t.Fatal("clear active screen was not recognized")
 	}
-	for _, screen := range []string{"Goal completed", "已完成 reset；未修改工作樹。"} {
-		if !codexGoalResetComplete(screen) {
-			t.Fatalf("reset completion screen %q was not recognized", screen)
+	for _, screen := range []string{"Goal completed", "已完成 clear；未修改工作樹。"} {
+		if !codexGoalClearComplete(screen) {
+			t.Fatalf("clear completion screen %q was not recognized", screen)
 		}
 	}
-	if codexGoalResetComplete("Goal active Objective: reset") {
-		t.Fatal("active reset screen was incorrectly considered complete")
+	if codexGoalClearComplete("Goal active Objective: clear") {
+		t.Fatal("active clear screen was incorrectly considered complete")
 	}
 }
 
-func TestWaitForCodexGoalResetTimeoutDoesNotAbortHandoff(t *testing.T) {
-	oldTimeout := codexGoalResetTimeout
-	codexGoalResetTimeout = time.Millisecond
-	defer func() { codexGoalResetTimeout = oldTimeout }()
+func TestWaitForCodexGoalClearTimeoutDoesNotAbortHandoff(t *testing.T) {
+	oldTimeout := codexGoalClearTimeout
+	codexGoalClearTimeout = time.Millisecond
+	defer func() { codexGoalClearTimeout = oldTimeout }()
 
 	ex := tmux.NewFakeExecutor()
 	ex.Captures["%42"] = "unchanged Codex screen"
-	if err := waitForCodexGoalReset(context.Background(), ex, "%42", "different initial screen"); err != nil {
-		t.Fatalf("waitForCodexGoalReset() error = %v, want nil so handoff continues", err)
+	cleared, err := waitForCodexGoalClear(context.Background(), ex, "%42", "different initial screen")
+	if err != nil || cleared {
+		t.Fatalf("waitForCodexGoalClear() = (%t, %v), want (false, nil) so caller can start a fresh session", cleared, err)
 	}
 }
 
@@ -189,8 +190,8 @@ func TestResetCodexGoalIfNeededSkipsOtherProcesses(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	ex.PanesDetailed = []tmux.PaneInfo{{PaneID: "%42", Command: "claude"}}
 	member := handoffMember{Label: "worker", Target: "%42", GoalMode: true}
-	if err := resetCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
-		t.Fatalf("resetCodexGoalIfNeeded() error = %v", err)
+	if err := clearCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
+		t.Fatalf("clearCodexGoalIfNeeded() error = %v", err)
 	}
 	if len(ex.SendLinesCalls) != 0 {
 		t.Fatalf("SendLinesCalls = %#v, want no reset", ex.SendLinesCalls)
@@ -201,8 +202,8 @@ func TestResetCodexGoalIfNeededSkipsCodexWithoutGoalMode(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	ex.PanesDetailed = []tmux.PaneInfo{{PaneID: "%42", Command: "codex"}}
 	member := handoffMember{Label: "worker", Target: "%42"}
-	if err := resetCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
-		t.Fatalf("resetCodexGoalIfNeeded() error = %v", err)
+	if err := clearCodexGoalIfNeeded(context.Background(), ex, member); err != nil {
+		t.Fatalf("clearCodexGoalIfNeeded() error = %v", err)
 	}
 	if len(ex.SendLinesCalls) != 0 {
 		t.Fatalf("SendLinesCalls = %#v, want no reset", ex.SendLinesCalls)

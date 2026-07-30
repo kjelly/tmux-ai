@@ -82,6 +82,9 @@ func decideHandoffActionWithClient(ctx context.Context, request handoffCoordinat
 			decision, err = rerouteUnauthorizedCoordinatorStop(decision, request.CurrentID, request.StopMembers)
 		}
 		if err == nil {
+			decision, err = rerouteSelfHandoffAfterUnauthorizedSuccess(decision, request.CurrentID, request.CurrentStatus, request.StopMembers)
+		}
+		if err == nil {
 			err = validateCoordinatorTransportDecision(decision, request)
 		}
 		if err == nil {
@@ -301,6 +304,34 @@ func rerouteUnauthorizedCoordinatorStop(d handoffCoordinatorDecision, currentID 
 		Target:      reviewer,
 		Instruction: "執行最終複查：檢查最新結果與可用證據；只有確認 workflow policy 已滿足且沒有待修正問題時，才回報 outcome=success 並核准停止。",
 		Reason:      fmt.Sprintf("%s 請求停止，但只有 %s 可核准；已交由授權 reviewer 最終確認。", currentID, reviewer),
+		Confidence:  d.Confidence,
+	}, nil
+}
+
+// rerouteSelfHandoffAfterUnauthorizedSuccess prevents a coordinator from
+// assigning a member that has just completed its implementation straight back
+// to itself when a designated reviewer still has to approve the workflow.
+// Natural-language policies commonly say "implementer success -> reviewer";
+// this narrow local guard makes that transition reliable without imposing an
+// ordering on workflows that deliberately route a member to a different peer.
+func rerouteSelfHandoffAfterUnauthorizedSuccess(d handoffCoordinatorDecision, currentID string, status *handoffStatus, stopMembers []string) (handoffCoordinatorDecision, error) {
+	if d.Action != "send" || !strings.EqualFold(d.Target, currentID) || status == nil || status.Outcome != "success" || len(stopMembers) == 0 {
+		return d, nil
+	}
+	for _, id := range stopMembers {
+		if strings.EqualFold(currentID, id) {
+			return d, nil
+		}
+	}
+	reviewer := strings.TrimSpace(stopMembers[0])
+	if reviewer == "" {
+		return handoffCoordinatorDecision{}, fmt.Errorf("coordinator stop policy has no usable stop member")
+	}
+	return handoffCoordinatorDecision{
+		Action:      "send",
+		Target:      reviewer,
+		Instruction: "執行最終複查：檢查最新結果與可用證據；只有確認 workflow policy 已滿足且沒有待修正問題時，才回報 outcome=success 並核准停止。",
+		Reason:      fmt.Sprintf("%s 已回報 success，且只有 %s 可核准完成；避免重複交辦，已交由授權 reviewer 最終確認。", currentID, reviewer),
 		Confidence:  d.Confidence,
 	}, nil
 }

@@ -6,6 +6,7 @@ import "context"
 // It records all calls and returns configurable responses.
 type FakeExecutor struct {
 	Captures          map[string]string // paneID → captured content
+	CaptureHook       func(string, int) (string, error)
 	CaptureCalls      []captureCall
 	SendKeysCalls     []sendKeysCall
 	SendLinesCalls    []sendLinesCall
@@ -50,6 +51,9 @@ func NewFakeExecutor() *FakeExecutor {
 
 func (f *FakeExecutor) CapturePane(paneID string, lines int) (string, error) {
 	f.CaptureCalls = append(f.CaptureCalls, captureCall{paneID, lines})
+	if f.CaptureHook != nil {
+		return f.CaptureHook(paneID, lines)
+	}
 	if f.CaptureError != nil {
 		return "", f.CaptureError
 	}
@@ -58,6 +62,9 @@ func (f *FakeExecutor) CapturePane(paneID string, lines int) (string, error) {
 
 func (f *FakeExecutor) CapturePaneClean(paneID string, lines int) (string, error) {
 	f.CaptureCalls = append(f.CaptureCalls, captureCall{paneID, lines})
+	if f.CaptureHook != nil {
+		return f.CaptureHook(paneID, lines)
+	}
 	if f.CaptureError != nil {
 		return "", f.CaptureError
 	}
