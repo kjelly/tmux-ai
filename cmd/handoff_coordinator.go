@@ -79,7 +79,10 @@ func decideHandoffActionWithClient(ctx context.Context, request handoffCoordinat
 			err = validateCoordinatorTransportDecision(decision, request)
 		}
 		if err == nil {
-			err = enforceCoordinatorStopMembers(decision, request.CurrentID, request.StopMembers)
+			decision, err = rerouteUnauthorizedCoordinatorStop(decision, request.CurrentID, request.StopMembers)
+		}
+		if err == nil {
+			err = validateCoordinatorTransportDecision(decision, request)
 		}
 		if err == nil {
 			fmt.Printf("✅ Coordinator 思考結果（%s）: action=%s target=%s confidence=%.2f reason=%s\n\n", label, decision.Action, ifEmpty(decision.Target, "-"), decision.Confidence, ifEmpty(decision.Reason, "-"))
@@ -275,16 +278,31 @@ func normalizeCoordinatorStopMembers(values []string, members []handoffCoordinat
 	}
 	return result, nil
 }
-func enforceCoordinatorStopMembers(d handoffCoordinatorDecision, currentID string, stopMembers []string) error {
+func rerouteUnauthorizedCoordinatorStop(d handoffCoordinatorDecision, currentID string, stopMembers []string) (handoffCoordinatorDecision, error) {
 	if d.Action != "stop" || len(stopMembers) == 0 {
-		return nil
+		return d, nil
 	}
 	for _, id := range stopMembers {
 		if strings.EqualFold(currentID, id) {
-			return nil
+			return d, nil
 		}
 	}
-	return fmt.Errorf("coordinator stop policy violation: member %q is not in stop_members [%s]", currentID, strings.Join(stopMembers, ", "))
+
+	// A completion claim from an implementer is useful evidence, but the
+	// configured reviewer must still make the final approval.  Convert the
+	// unsafe stop into a deterministic final-review handoff instead of aborting
+	// the entire workflow because the coordinator selected the wrong action.
+	reviewer := strings.TrimSpace(stopMembers[0])
+	if reviewer == "" {
+		return handoffCoordinatorDecision{}, fmt.Errorf("coordinator stop policy has no usable stop member")
+	}
+	return handoffCoordinatorDecision{
+		Action:      "send",
+		Target:      reviewer,
+		Instruction: "執行最終複查：檢查最新結果與可用證據；只有確認 workflow policy 已滿足且沒有待修正問題時，才回報 outcome=success 並核准停止。",
+		Reason:      fmt.Sprintf("%s 請求停止，但只有 %s 可核准；已交由授權 reviewer 最終確認。", currentID, reviewer),
+		Confidence:  d.Confidence,
+	}, nil
 }
 func routeFromCoordinatorDecision(d handoffCoordinatorDecision) (handoffRoute, error) {
 	switch d.Action {

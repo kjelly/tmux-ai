@@ -56,6 +56,7 @@ var (
 	ppLines                  int
 	ppRoundTimeout           int
 	ppScreenIdleTimeout      int
+	ppReceiptIdleTimeout     int
 	ppSummarize              bool
 	ppCoordinator            bool
 	ppCoordinatorPolicy      string
@@ -78,13 +79,17 @@ var (
 	ppApprovalThresholdBytes int
 	ppAllowLargeRelay        bool
 	ppDryRun                 bool
+	ppNewSession             bool
 	ppPresetHandoff          handoffPresetConfig
 
 	// Role-based division of labour
-	ppPane1Role     string // prepended to every message sent to pane1
-	ppPane2Role     string // prepended to every message sent to pane2
-	ppToPane1Prompt string // relay instruction when sending TO pane1
-	ppToPane2Prompt string // relay instruction when sending TO pane2
+	ppPane1Role                  string // prepended to every message sent to pane1
+	ppPane2Role                  string // prepended to every message sent to pane2
+	ppPane1GoalMode              bool   // submit every task to pane1 through /goal
+	ppPane2GoalMode              bool   // submit every task to pane2 through /goal
+	ppStrictGoalCompletionMarker bool   // require a runner-specific goal-completion marker before handoff
+	ppToPane1Prompt              string // relay instruction when sending TO pane1
+	ppToPane2Prompt              string // relay instruction when sending TO pane2
 )
 
 // defaultRelayPrompt is used when no direction-specific prompt is provided.
@@ -109,15 +114,18 @@ Division of labour
 Use --pane1-role / --pane2-role to give each agent a persistent identity
 that is prepended to every message it receives.  Use --to-pane1-prompt /
 --to-pane2-prompt to customise the relay instruction for each direction.
+For an agent that supports /goal, use --pane1-goal-mode or
+--pane2-goal-mode to prefix only that pane's normal task packets.
 
 For example, let Codex (pane1) plan and Claude Code (pane2) implement:
 
   tmux-ai pingpong \
     --pane1 codex --pane2 claude \
-    --initial "分析 main.go，擬定重構計畫" \
-    --pane1-role "你是架構師，負責擬定計畫和 review 結果。" \
-    --pane2-role "你是工程師，負責根據計畫修改程式碼。" \
-    --to-pane1-prompt "請 review 以下修改結果，確認是否正確，並擬定下一步計畫。" \
+	--initial "分析 main.go，擬定重構計畫" \
+	--pane1-role "你是架構師，負責擬定計畫和 review 結果。" \
+	--pane2-role "你是工程師，負責根據計畫修改程式碼。" \
+	--pane2-goal-mode \
+	--to-pane1-prompt "請 review 以下修改結果，確認是否正確，並擬定下一步計畫。" \
     --to-pane2-prompt "請根據以下計畫修改程式碼。"
 
 The --done marker should be a short string that each agent prints when it
@@ -190,6 +198,7 @@ func init() {
 	pingpongCmd.Flags().IntVar(&ppLines, "lines", 256, "Lines of pane content to capture per relay")
 	pingpongCmd.Flags().IntVar(&ppRoundTimeout, "round-timeout", 600, "Per-round timeout in seconds (0 = no timeout)")
 	pingpongCmd.Flags().IntVar(&ppScreenIdleTimeout, "screen-idle-timeout", 0, "After this many unchanged-screen seconds, use the LLM to detect a completed response (0 disables)")
+	pingpongCmd.Flags().IntVar(&ppReceiptIdleTimeout, "receipt-idle-timeout", 30, "After a valid status receipt and this many unchanged-screen seconds, hand off without DONE (0 disables)")
 	pingpongCmd.Flags().BoolVar(&ppSummarize, "summarize", false, "Run relayed content through Ollama for summarization before sending")
 	pingpongCmd.Flags().BoolVar(&ppCoordinator, "coordinator", false, "Use the LLM each round to choose the next pane and relay instruction")
 	pingpongCmd.Flags().StringVar(&ppCoordinatorPolicy, "coordinator-policy", "", "Trusted workflow policy used for routing and stop decisions")
@@ -212,12 +221,16 @@ func init() {
 	pingpongCmd.Flags().IntVar(&ppApprovalThresholdBytes, "approval-threshold-bytes", 16*1024, "Prompt size requiring explicit --allow-large-relay (0 disables)")
 	pingpongCmd.Flags().BoolVar(&ppAllowLargeRelay, "allow-large-relay", false, "Explicitly allow prompts above --approval-threshold-bytes")
 	pingpongCmd.Flags().BoolVar(&ppDryRun, "dry-run", false, "Prepare and print the initial handoff without sending to tmux")
+	pingpongCmd.Flags().BoolVar(&ppNewSession, "new", false, "Send /new to every participating pane before starting the workflow")
 
 	addHandoffFlags(pingpongCmd)
 
 	// Division of labour
 	pingpongCmd.Flags().StringVar(&ppPane1Role, "pane1-role", "", "Role description prepended to every message sent to pane1")
 	pingpongCmd.Flags().StringVar(&ppPane2Role, "pane2-role", "", "Role description prepended to every message sent to pane2")
+	pingpongCmd.Flags().BoolVar(&ppPane1GoalMode, "pane1-goal-mode", false, "Prefix every normal task sent to pane1 with /goal")
+	pingpongCmd.Flags().BoolVar(&ppPane2GoalMode, "pane2-goal-mode", false, "Prefix every normal task sent to pane2 with /goal")
+	pingpongCmd.Flags().BoolVar(&ppStrictGoalCompletionMarker, "strict-goal-completion-marker", false, "Require goal-mode panes to print the runner-specific GOAL_DONE marker before handoff")
 	pingpongCmd.Flags().StringVar(&ppToPane1Prompt, "to-pane1-prompt", "", "Relay instruction when sending TO pane1 (default: generic \"繼續執行\")")
 	pingpongCmd.Flags().StringVar(&ppToPane2Prompt, "to-pane2-prompt", "", "Relay instruction when sending TO pane2 (default: generic \"繼續執行\")")
 }
@@ -356,8 +369,8 @@ func runPingPong() error {
 		startID = "pane2"
 	}
 	members := map[string]handoffMember{
-		"pane1": {ID: "pane1", Label: ppPane1, Target: pane1, Role: ppPane1Role},
-		"pane2": {ID: "pane2", Label: ppPane2, Target: pane2, Role: ppPane2Role},
+		"pane1": {ID: "pane1", Label: ppPane1, Target: pane1, Role: ppPane1Role, GoalMode: ppPane1GoalMode},
+		"pane2": {ID: "pane2", Label: ppPane2, Target: pane2, Role: ppPane2Role, GoalMode: ppPane2GoalMode},
 	}
 	coordinatorMembers := []handoffCoordinatorMember{
 		{ID: "pane1", Label: ppPane1, Role: ppPane1Role, DefaultInstruction: toPane1Prompt},
@@ -394,7 +407,8 @@ func runPingPong() error {
 	return handoffEngine{
 		Executor: ex, Guard: guard, Members: members, StartID: startID,
 		InitialInstruction: initialInstruction, InitialFingerprint: initialInstruction,
-		SelectResponses: ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator, Transport: transport, Route: router,
+		ResetBeforeStart: []handoffMember{members["pane1"], members["pane2"]},
+		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator, Transport: transport, Route: router,
 	}.Run(ctx)
 }
 
@@ -405,6 +419,8 @@ type pingPongPreset struct {
 	InitialPane2        string   `yaml:"initial_pane2"`
 	Pane1Role           string   `yaml:"pane1_role"`
 	Pane2Role           string   `yaml:"pane2_role"`
+	Pane1GoalMode       bool     `yaml:"pane1_goal_mode"`
+	Pane2GoalMode       bool     `yaml:"pane2_goal_mode"`
 	ToPane1Prompt       string   `yaml:"to_pane1_prompt"`
 	ToPane2Prompt       string   `yaml:"to_pane2_prompt"`
 	Coordinator         bool     `yaml:"coordinator"`
@@ -416,6 +432,7 @@ type pingPongPreset struct {
 	ScreenIdleTimeout   int      `yaml:"screen_idle_timeout"`
 	SubmitDelay         int      `yaml:"submit_delay"`
 	Lines               int      `yaml:"lines"`
+	NewSession          bool     `yaml:"new_session"`
 }
 
 func resolvePingPongPresetInitial(preset pingPongPreset, start string) (string, error) {
@@ -469,6 +486,12 @@ func applyPingPongPreset() error {
 	if strings.TrimSpace(ppPane2Role) == "" {
 		ppPane2Role = preset.Pane2Role
 	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("pane1-goal-mode") {
+		ppPane1GoalMode = preset.Pane1GoalMode
+	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("pane2-goal-mode") {
+		ppPane2GoalMode = preset.Pane2GoalMode
+	}
 	if strings.TrimSpace(ppToPane1Prompt) == "" {
 		ppToPane1Prompt = preset.ToPane1Prompt
 	}
@@ -501,6 +524,9 @@ func applyPingPongPreset() error {
 	}
 	if preset.Lines > 0 {
 		ppLines = preset.Lines
+	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
+		ppNewSession = preset.NewSession
 	}
 	return nil
 }
@@ -918,6 +944,9 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 	var lastScreen string
 	var screenChangedAt time.Time
 	var fallbackAttemptedFor string
+	var goalDoneSeen bool
+	var goalDoneStopped bool
+	var goalDoneOutput string
 
 	for {
 		select {
@@ -927,6 +956,9 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		}
 
 		if ppRoundTimeout > 0 && time.Now().After(deadline) {
+			if protocol.GoalDoneMarker != "" {
+				return "", false, false, fmt.Errorf("pane %s 在 %d 秒內未先輸出 goal completion marker %q，再輸出完成標記 %q", paneID, ppRoundTimeout, protocol.GoalDoneMarker, protocol.DoneMarker)
+			}
 			return "", false, false, fmt.Errorf("pane %s 在 %d 秒內未輸出完成標記 %q", paneID, ppRoundTimeout, protocol.DoneMarker)
 		}
 
@@ -949,11 +981,30 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			controlContent = stripTextFrame(content, protocol.TextBeginMarker, protocol.TextEndMarker)
 			controlNewContent = stripTextFrame(newContent, protocol.TextBeginMarker, protocol.TextEndMarker)
 		}
+		if screenChangedAt.IsZero() || content != lastScreen {
+			lastScreen, screenChangedAt = content, time.Now()
+		}
+		// Once a /goal turn has emitted DONE, retain that observation even if a
+		// later TUI redraw removes it from the capture.  Only the post-DONE
+		// screen-idle period matters from this point onward.
+		if protocol.GoalMode && goalDoneSeen {
+			if time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
+				return goalDoneOutput, goalDoneStopped, false, nil
+			}
+			continue
+		}
 		// Per-round markers contain a fresh run token, so they are safe to find
 		// anywhere in the current capture. Checking the full capture also works
 		// when an alternate-screen TUI redraw means the old baseline is no longer
 		// a comparable prefix.
 		if done, stopped := completionMarkers(controlContent, protocol.DoneMarker, protocol.StopMarker); done {
+			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, protocol.DoneMarker, protocol.StopMarker) {
+				continue
+			}
+			if protocol.GoalMode {
+				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, content
+				continue
+			}
 			if envelope, ok := extractCompletedProtocolEnvelope(content, protocol); ok {
 				return envelope, stopped, false, nil
 			}
@@ -964,6 +1015,13 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// instruction. This boundary prevents standalone markers quoted in old
 		// bootstrap or relay content from completing the new round.
 		if done, stopped := baseMarkersAfterRoundInstruction(controlNewContent, protocol.DoneMarker, protocol.StopMarker, ppDone, ppStop); done {
+			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, ppDone, ppStop) {
+				continue
+			}
+			if protocol.GoalMode {
+				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, content
+				continue
+			}
 			baseProtocol := protocol
 			baseProtocol.DoneMarker = ppDone
 			baseProtocol.StopMarker = ppStop
@@ -972,7 +1030,17 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			}
 			return newContent, stopped, false, nil
 		}
-		if fallback != nil && ppScreenIdleTimeout > 0 && content != baseline {
+		// A valid, nonce-bound receipt is stronger evidence than an arbitrary
+		// terminal screen. If an agent omits DONE, permit the configured idle
+		// fallback after a schema-valid receipt, including for /goal members.
+		if ppReceiptIdleTimeout > 0 && hasValidStatusReceipt(controlContent, protocol) {
+			if !protocol.GoalMode && time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
+				return newContent, false, false, nil
+			}
+		}
+		// A screen-idle selector cannot prove that a strict /goal completion was
+		// closed, so it remains unavailable when that explicit mode is enabled.
+		if fallback != nil && protocol.GoalDoneMarker == "" && ppScreenIdleTimeout > 0 && content != baseline {
 			if screenChangedAt.IsZero() || content != lastScreen {
 				lastScreen, screenChangedAt = content, time.Now()
 			} else if content != fallbackAttemptedFor && time.Since(screenChangedAt) >= time.Duration(ppScreenIdleTimeout)*time.Second {
@@ -989,6 +1057,34 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			}
 		}
 	}
+}
+
+func hasValidStatusReceipt(output string, protocol roundControlProtocol) bool {
+	if !protocol.RequireStatus || protocol.StatusMarker == "" {
+		return false
+	}
+	_, err := parseHandoffStatus(output, protocol.StatusMarker)
+	return err == nil
+}
+
+// goalCompletionPrecedes keeps a /goal pane from handing off merely because
+// it printed the normal turn marker. The goal marker is nonce-bound to this
+// round and must occur before its DONE or ALL_DONE marker.
+func goalCompletionPrecedes(output, goalDone, done, stop string) bool {
+	if goalDone == "" {
+		return true
+	}
+	goalComplete := false
+	for _, line := range strings.Split(output, "\n") {
+		if protocolMarkerLine(line, goalDone) {
+			goalComplete = true
+			continue
+		}
+		if protocolMarkerLine(line, done) || protocolMarkerLine(line, stop) {
+			return goalComplete
+		}
+	}
+	return false
 }
 
 func extractCompletedProtocolEnvelope(content string, protocol roundControlProtocol) (string, bool) {

@@ -16,7 +16,13 @@ import (
 	"github.com/llmore/tmux-ai/internal/tmux"
 )
 
-type handoffMember struct{ ID, Label, Target, Role string }
+type handoffMember struct {
+	ID, Label, Target, Role string
+	// GoalMode sends this member's managed task packet through the agent's
+	// /goal command. It is deliberately member-scoped so other panes keep
+	// their normal interaction mode.
+	GoalMode bool
+}
 
 var errMissingReceipt = errors.New("missing or invalid handoff status receipt")
 
@@ -51,15 +57,24 @@ type handoffRouter func(context.Context, int, handoffMember, turnResult, bool) (
 type handoffResponseSelector func(context.Context, []string, string) (string, int, int, error)
 
 type roundControlProtocol struct {
-	Transport                                                                    handoffTransportKind
-	TextBeginMarker, TextEndMarker, StatusMarker, DoneMarker, StopMarker, Outbox string
-	RequireStatus                                                                bool
+	Transport                                                                                    handoffTransportKind
+	TextBeginMarker, TextEndMarker, StatusMarker, GoalDoneMarker, DoneMarker, StopMarker, Outbox string
+	RequireStatus, GoalMode                                                                      bool
 }
 
 const (
 	maxReceiptRepairAttempts = 2
 	handoffOutcomeConstraint = `outcome must be exactly one of "success", "needs_followup", or "blocked"`
 )
+
+// Codex accepts /goal reset asynchronously.  Do not paste the next /goal
+// packet until its reset turn has actually returned to an idle prompt.
+var codexGoalResetTimeout = 30 * time.Second
+
+// codexGoalResetNoopGrace avoids holding a handoff for the full reset timeout
+// when Codex has no active native goal and acknowledges `/goal reset` without
+// changing the captured screen.
+const codexGoalResetNoopGrace = 2 * time.Second
 
 func newRoundControlProtocol(transport handoffTransportKind, token string, round int, outbox string, required bool) roundControlProtocol {
 	begin, end := textMarkers(token, round)
@@ -82,16 +97,22 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 			b.WriteString("receipt JSON object（實際輸出時接在 status marker 後）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n")
 		}
 	}
+	if p.GoalDoneMarker != "" {
+		fmt.Fprintf(&b, "\n這是 /goal 任務：在交接前，必須先實際完成並關閉目前的 goal。不可只因為想交給其他 agent 就輸出完成標記；若無法完成，先將 goal 以 blocked 結束。goal 完成後，先獨佔一行輸出 goal completion marker value：%s\n", p.GoalDoneMarker)
+	}
 	fmt.Fprintf(&b, "完成 marker value（實際輸出時必須獨佔最後一行）：%s\n全任務完成 marker value（實際輸出時必須獨佔最後一行）：%s", p.DoneMarker, p.StopMarker)
 	return b.String()
 }
 
 type handoffEngine struct {
-	Executor                                            tmux.Executor
-	Guard                                               *handoffGuard
-	Members                                             map[string]handoffMember
-	StartID                                             string
-	InitialInstruction, InitialFingerprint              string
+	Executor                               tmux.Executor
+	Guard                                  *handoffGuard
+	Members                                map[string]handoffMember
+	StartID                                string
+	InitialInstruction, InitialFingerprint string
+	// ResetBeforeStart lists panes that must receive /new before the initial
+	// task. The caller supplies an ordered slice so resets are deterministic.
+	ResetBeforeStart                                    []handoffMember
 	SelectResponses, Summarize, CoordinatorControlsStop bool
 	Transport                                           resolvedHandoffConfig
 	Route                                               handoffRouter
@@ -131,6 +152,15 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		}
 	}
 	fmt.Printf("🚚 Handoff transport: %s (%s)\n", e.Transport.Transport, e.Transport.Source)
+	if ppNewSession {
+		if ppDryRun {
+			for _, member := range e.ResetBeforeStart {
+				fmt.Printf("🔎 Dry run: would send /new to %s\n", member.Label)
+			}
+		} else if err := resetHandoffSessions(ctx, e.Executor, e.ResetBeforeStart); err != nil {
+			return err
+		}
+	}
 	baseline, err := e.Executor.CapturePaneClean(current.Target, ppLines)
 	if err != nil {
 		return fmt.Errorf("capture initial state of %s (%s): %w", current.Label, current.Target, err)
@@ -141,7 +171,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return err
 	}
-	initial := buildTurnMessage(current.Role, e.InitialInstruction, "", handoffPayload{Transport: e.Transport.Transport}, incoming, protocol)
+	initial := buildMemberTurnMessage(current, e.InitialInstruction, "", handoffPayload{Transport: e.Transport.Transport}, incoming, protocol)
 	fingerprint := e.InitialFingerprint
 	if fingerprint == "" {
 		fingerprint = e.InitialInstruction
@@ -153,11 +183,14 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		fmt.Printf("🔎 Dry run: would send %d bytes to %s\n%s\n", len([]byte(initial)), current.Label, truncate(initial, 1000))
 		return nil
 	}
+	if err := resetCodexGoalIfNeeded(ctx, e.Executor, current); err != nil {
+		return fmt.Errorf("reset goal in %s: %w", current.Label, err)
+	}
 	if err := sendToPane(ctx, e.Executor, current.Target, initial); err != nil {
 		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
 	}
 	for round := 1; round <= ppMaxRounds; round++ {
-		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, current.Label, current.Target)
+		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
 		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback())
 		if err != nil {
 			return err
@@ -234,14 +267,134 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if err != nil {
 			return err
 		}
-		message := buildTurnMessage(next.Role, route.Instruction, relay, payload, nextIncoming, nextProtocol)
+		message := buildMemberTurnMessage(next, route.Instruction, relay, payload, nextIncoming, nextProtocol)
 		if err := e.Guard.reserveOutbound("relay to "+next.Label, next.Target, route.Instruction, message, relay+payload.Text); err != nil {
 			return err
+		}
+		if err := resetCodexGoalIfNeeded(ctx, e.Executor, next); err != nil {
+			return fmt.Errorf("reset goal in %s: %w", next.Label, err)
 		}
 		if err := sendToPane(ctx, e.Executor, next.Target, message); err != nil {
 			return fmt.Errorf("relay to %s: %w", next.Label, err)
 		}
 		current, baseline, protocol, incoming = next, nextBaseline, nextProtocol, nextIncoming
+	}
+	return nil
+}
+
+// resetCodexGoalIfNeeded clears Codex's current native goal immediately
+// before a new /goal task is submitted. Other agents, and non-goal members,
+// are left untouched.
+func resetCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handoffMember) error {
+	if !member.GoalMode {
+		return nil
+	}
+	panes, err := ex.ListPanesDetailed()
+	if err != nil {
+		// Process detection is best effort. A failed listing must not turn a
+		// normal goal-mode handoff into a task failure.
+		return nil
+	}
+	canonicalTarget, resolveErr := ex.ResolveTarget(member.Target)
+	if resolveErr != nil {
+		canonicalTarget = member.Target
+	}
+	for _, pane := range panes {
+		if pane.PaneID != member.Target && pane.PaneID != canonicalTarget {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(pane.Command), "codex") {
+			return nil
+		}
+		fmt.Printf("🔄 Resetting Codex goal in %s (%s)\n", member.Label, member.Target)
+		before, captureErr := ex.CapturePaneClean(member.Target, ppLines)
+		if err := sendToPane(ctx, ex, member.Target, "/goal reset"); err != nil {
+			return err
+		}
+		if captureErr != nil || codexGoalResetTimeout <= 0 {
+			return nil
+		}
+		return waitForCodexGoalReset(ctx, ex, member.Target, before)
+	}
+	return nil
+}
+
+func waitForCodexGoalReset(ctx context.Context, ex tmux.Executor, paneID, before string) error {
+	deadline := time.NewTimer(codexGoalResetTimeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	startedAt := time.Now()
+	seenResetActive := false
+	for {
+		current, err := ex.CapturePaneClean(paneID, ppLines)
+		if err != nil {
+			// Reset is best effort; inability to observe the pane must not block
+			// a normal handoff.
+			return nil
+		}
+		if codexGoalResetComplete(current) {
+			return nil
+		}
+		active := codexGoalResetActive(current)
+		seenResetActive = seenResetActive || active
+		if seenResetActive && !active && current != before {
+			return nil
+		}
+		// Codex emits no visible reset state when there is no active goal. Do
+		// not delay the next task for 30 seconds in that normal no-op case.
+		if !seenResetActive && current == before && time.Since(startedAt) >= codexGoalResetNoopGrace {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			// Reset is a best-effort guard against stale native goals. Codex can
+			// finish it without a detectable screen message, so keep the workflow
+			// alive and submit the already-prepared task.
+			fmt.Fprintf(os.Stderr, "warn: timed out waiting for Codex /goal reset in %s; continuing handoff\n", paneID)
+			return nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func codexGoalResetActive(screen string) bool {
+	screen = strings.ToLower(screen)
+	return strings.Contains(screen, "goal active") && strings.Contains(screen, "objective: reset")
+}
+
+func codexGoalResetComplete(screen string) bool {
+	screen = strings.ToLower(screen)
+	return strings.Contains(screen, "goal complete") ||
+		strings.Contains(screen, "goal completed") ||
+		strings.Contains(screen, "已完成 reset") ||
+		strings.Contains(screen, "完成 reset")
+}
+
+func handoffMemberDisplayName(member handoffMember) string {
+	label := strings.TrimSpace(member.Label)
+	if label == "" || label == member.Target {
+		return member.ID
+	}
+	return label
+}
+
+// resetHandoffSessions starts a clean interactive session in every workflow
+// pane. It deliberately uses the normal submit path, so cancellation and
+// submission confirmation have the same safety guarantees as task handoffs.
+func resetHandoffSessions(ctx context.Context, ex tmux.Executor, members []handoffMember) error {
+	seen := make(map[string]struct{}, len(members))
+	for _, member := range members {
+		if _, ok := seen[member.Target]; ok {
+			continue
+		}
+		seen[member.Target] = struct{}{}
+		fmt.Printf("🆕 Starting new session in %s (%s)\n", member.Label, member.Target)
+		if err := sendToPane(ctx, ex, member.Target, "/new"); err != nil {
+			return fmt.Errorf("start new session in %s: %w", member.Label, err)
+		}
 	}
 	return nil
 }
@@ -291,7 +444,12 @@ func (e handoffEngine) protocolFor(store artifact.Store, member handoffMember, t
 			return roundControlProtocol{}, fmt.Errorf("create outbox: %w", err)
 		}
 	}
-	return newRoundControlProtocol(e.Transport.Transport, token, round, outbox, e.CoordinatorControlsStop), nil
+	protocol := newRoundControlProtocol(e.Transport.Transport, token, round, outbox, e.CoordinatorControlsStop)
+	protocol.GoalMode = member.GoalMode
+	if member.GoalMode && ppStrictGoalCompletionMarker {
+		protocol.GoalDoneMarker = roundControlMarker("GOAL_DONE", token, round)
+	}
+	return protocol, nil
 }
 func protocolRound(p roundControlProtocol) int {
 	var n int
@@ -509,7 +667,11 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 	if p.Transport == handoffTransportText && strings.TrimSpace(result.Payload.Text) != "" {
 		content = result.Payload.Text
 		structuredContent = true
-	} else if strings.TrimSpace(content) == "" && result.Status != nil {
+	} else if result.Status != nil && (p.Transport == handoffTransportFile || strings.TrimSpace(content) == "") {
+		// File transport's trustworthy handoff material is the runner-collected
+		// outbox. Terminal capture is only a control channel and often includes
+		// interactive UI chrome, so never ask the response selector to interpret
+		// it when a validated receipt already supplies the route summary.
 		content = result.Status.Summary
 		structuredContent = true
 	}
@@ -569,6 +731,9 @@ func shouldUseFullScreenSelector(err error) bool {
 
 func fullScreenSelectorGuidance(p roundControlProtocol, prior string) string {
 	required := fmt.Sprintf("status %q，以及最後的 %q 或 %q", p.StatusMarker, p.DoneMarker, p.StopMarker)
+	if p.GoalDoneMarker != "" {
+		required = fmt.Sprintf("goal completion marker %q、%s", p.GoalDoneMarker, required)
+	}
 	if p.Transport == handoffTransportText {
 		required = fmt.Sprintf("text frame %q 到 %q、%s", p.TextBeginMarker, p.TextEndMarker, required)
 	}
@@ -639,6 +804,17 @@ func buildTurnMessage(role, instruction, narrative string, payload handoffPayloa
 	b.WriteString("\n\n")
 	b.WriteString(controlProtocolInstruction(p))
 	return b.String()
+}
+
+// buildMemberTurnMessage applies the member-specific input mode only to
+// normal work turns. Control-only messages, such as receipt repair, must
+// remain plain protocol text so they are not interpreted as a new goal.
+func buildMemberTurnMessage(member handoffMember, instruction, narrative string, payload handoffPayload, incoming []artifact.Ref, p roundControlProtocol) string {
+	message := buildTurnMessage(member.Role, instruction, narrative, payload, incoming, p)
+	if member.GoalMode {
+		return "/goal " + message
+	}
+	return message
 }
 func renderArtifactIO(incoming []artifact.Ref, outbox string) string {
 	var b strings.Builder

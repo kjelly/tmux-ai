@@ -29,6 +29,7 @@ type coordinatePreset struct {
 	CoordinatorPolicy   string             `yaml:"coordinator_policy"`
 	StopMembers         []string           `yaml:"stop_members"`
 	MaxSelectionRetries int                `yaml:"max_selection_retries"`
+	NewSession          bool               `yaml:"new_session"`
 	Members             []coordinateMember `yaml:"members"`
 }
 
@@ -37,6 +38,7 @@ type coordinateMember struct {
 	Target        string `yaml:"target"`
 	Role          string `yaml:"role"`
 	HandoffPrompt string `yaml:"handoff_prompt"`
+	GoalMode      bool   `yaml:"goal_mode"`
 }
 
 var coordinateCmd = &cobra.Command{
@@ -82,6 +84,7 @@ func init() {
 	coordinateCmd.Flags().IntVar(&ppApprovalThresholdBytes, "approval-threshold-bytes", 16*1024, "Prompt size requiring --allow-large-relay")
 	coordinateCmd.Flags().BoolVar(&ppAllowLargeRelay, "allow-large-relay", false, "Allow prompts above the approval threshold")
 	coordinateCmd.Flags().BoolVar(&ppDryRun, "dry-run", false, "Print the first handoff without sending it")
+	coordinateCmd.Flags().BoolVar(&ppNewSession, "new", false, "Send /new to every participating pane before starting the workflow")
 	addHandoffFlags(coordinateCmd)
 	_ = coordinateCmd.MarkFlagRequired("preset")
 }
@@ -152,6 +155,9 @@ func runCoordinate() error {
 	if preset.MaxSelectionRetries > 0 {
 		ppMaxSelectionRetries = preset.MaxSelectionRetries
 	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
+		ppNewSession = preset.NewSession
+	}
 	if initial == "" {
 		initial = strings.TrimSpace(preset.Initial)
 	}
@@ -203,9 +209,12 @@ func runCoordinate() error {
 	}
 
 	engineMembers := make(map[string]handoffMember, len(members))
+	resetMembers := make([]handoffMember, 0, len(members))
 	for _, member := range members {
 		id := strings.ToLower(member.Name)
-		engineMembers[id] = handoffMember{ID: id, Label: member.Name, Target: member.Target, Role: member.Role}
+		engineMember := handoffMember{ID: id, Label: member.Name, Target: member.Target, Role: member.Role, GoalMode: member.GoalMode}
+		engineMembers[id] = engineMember
+		resetMembers = append(resetMembers, engineMember)
 	}
 	router := func(ctx context.Context, round int, current handoffMember, result turnResult, stopRequested bool) (handoffRoute, error) {
 		payloadInfo := textPayloadMetadata(result.Payload.Text)
@@ -227,7 +236,8 @@ func runCoordinate() error {
 	return handoffEngine{
 		Executor: ex, Guard: guard, Members: engineMembers, StartID: strings.ToLower(current.Name),
 		InitialInstruction: decision.Instruction, InitialFingerprint: initial,
-		SelectResponses: true, CoordinatorControlsStop: true, Transport: transport, Route: router,
+		ResetBeforeStart: resetMembers,
+		SelectResponses:  true, CoordinatorControlsStop: true, Transport: transport, Route: router,
 	}.Run(ctx)
 }
 

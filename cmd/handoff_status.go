@@ -305,7 +305,7 @@ func removeProtocolLines(output string, protocol roundControlProtocol) string {
 			inText = false
 			continue
 		}
-		if inText || (i >= statusStart && i <= statusEnd) || protocolMarkerLine(line, protocol.DoneMarker) || protocolMarkerLine(line, protocol.StopMarker) {
+		if inText || (i >= statusStart && i <= statusEnd) || protocolMarkerLine(line, protocol.GoalDoneMarker) || protocolMarkerLine(line, protocol.DoneMarker) || protocolMarkerLine(line, protocol.StopMarker) {
 			continue
 		}
 		result = append(result, line)

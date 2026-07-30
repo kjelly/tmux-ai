@@ -32,6 +32,15 @@ func TestTextPayloadFrameRoundTripsAndStatusIsOutsideData(t *testing.T) {
 	}
 }
 
+func TestHandoffMemberDisplayNameAvoidsRepeatingTarget(t *testing.T) {
+	if got := handoffMemberDisplayName(handoffMember{ID: "pane1", Label: "hufu:3", Target: "hufu:3"}); got != "pane1" {
+		t.Fatalf("display name = %q, want pane1", got)
+	}
+	if got := handoffMemberDisplayName(handoffMember{ID: "pane2", Label: "reviewer", Target: "hufu:1"}); got != "reviewer" {
+		t.Fatalf("display name = %q, want reviewer", got)
+	}
+}
+
 func TestTerminalPresentationProtocolRoundTrip(t *testing.T) {
 	begin, end := textMarkers("run", 2)
 	marker := statusMarker("run", 2)
@@ -320,6 +329,40 @@ func TestFileHandoffCollectsOutboxWithoutAgentClaims(t *testing.T) {
 	}
 	if len(result.Produced) != 1 || result.Produced[0].OriginalName != "actual-review.md" {
 		t.Fatalf("produced artifacts = %#v", result.Produced)
+	}
+}
+
+func TestFileHandoffUsesReceiptSummaryInsteadOfTerminalUI(t *testing.T) {
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, outbox, true)
+	output := strings.Join([]string{
+		"Context 72% left", // terminal UI, not handoff content
+		protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review complete","tests":[]}`,
+	}, "\n")
+	selectorCalled := false
+	engine := handoffEngine{
+		Guard:           newHandoffGuard(),
+		SelectResponses: true,
+		Transport:       resolvedHandoffConfig{Transport: handoffTransportFile},
+		SelectResponse: func(context.Context, []string, string) (string, int, int, error) {
+			selectorCalled = true
+			return "", 0, 0, errors.New("selector must not inspect file-transport UI")
+		},
+	}
+	result, err := engine.prepareTurnResultFromOutput(context.Background(), handoffMember{ID: "pane2", Label: "reviewer"}, output, protocol, nil, store, "")
+	if err != nil {
+		t.Fatalf("prepareTurnResultFromOutput() error = %v", err)
+	}
+	if selectorCalled || result.Narrative != "review complete" {
+		t.Fatalf("selectorCalled=%t narrative=%q", selectorCalled, result.Narrative)
 	}
 }
 

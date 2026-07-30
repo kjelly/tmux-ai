@@ -163,7 +163,7 @@ func TestCoordinatorPolicyAndStopRequestAreInTrustedPrompt(t *testing.T) {
 	}
 }
 
-func TestCoordinatorStopMembersAreEnforced(t *testing.T) {
+func TestCoordinatorStopMembersRerouteUnauthorizedStop(t *testing.T) {
 	members := testPingPongCoordinatorMembers()
 	allowed, err := normalizeCoordinatorStopMembers([]string{"PANE1", "pane1"}, members)
 	if err != nil || !reflect.DeepEqual(allowed, []string{"pane1"}) {
@@ -173,11 +173,30 @@ func TestCoordinatorStopMembersAreEnforced(t *testing.T) {
 		t.Fatal("unknown stop member unexpectedly accepted")
 	}
 	stop := handoffCoordinatorDecision{Action: "stop", Reason: "done"}
-	if err := enforceCoordinatorStopMembers(stop, "pane2", allowed); err == nil || !strings.Contains(err.Error(), "policy violation") {
-		t.Fatalf("unauthorized stop error = %v", err)
+	rerouted, err := rerouteUnauthorizedCoordinatorStop(stop, "pane2", allowed)
+	if err != nil {
+		t.Fatalf("unauthorized stop reroute error = %v", err)
 	}
-	if err := enforceCoordinatorStopMembers(stop, "pane1", allowed); err != nil {
-		t.Fatalf("authorized stop rejected: %v", err)
+	if rerouted.Action != "send" || rerouted.Target != "pane1" || !strings.Contains(rerouted.Instruction, "最終複查") {
+		t.Fatalf("unauthorized stop reroute = %#v", rerouted)
+	}
+	authorized, err := rerouteUnauthorizedCoordinatorStop(stop, "pane1", allowed)
+	if err != nil || authorized.Action != "stop" {
+		t.Fatalf("authorized stop = %#v, err = %v", authorized, err)
+	}
+}
+
+func TestDecideHandoffActionReroutesUnauthorizedStopWithoutRetry(t *testing.T) {
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"action":"stop","target":"","instruction":"","reason":"implementation is complete","confidence":0.9}`}, Done: true}}
+	decision, err := decideHandoffActionWithClient(context.Background(), handoffCoordinatorRequest{
+		Round: 9, CurrentID: "pane1", Members: testPingPongCoordinatorMembers(), StopMembers: []string{"pane2"},
+	}, newHandoffGuard(), client)
+	if err != nil {
+		t.Fatalf("decideHandoffActionWithClient() error = %v", err)
+	}
+	if decision.Action != "send" || decision.Target != "pane2" || len(client.Calls) != 1 {
+		t.Fatalf("decision=%#v calls=%d, want one rerouted send", decision, len(client.Calls))
 	}
 }
 
@@ -337,6 +356,37 @@ func TestSendToPaneSubmitsPastedPrompt(t *testing.T) {
 	want := []string{"send-keys", "-t", "%42", "Enter"}
 	if len(ex.ExecCalls) != 1 || !reflect.DeepEqual(ex.ExecCalls[0], want) {
 		t.Fatalf("submit call = %#v, want %#v", ex.ExecCalls, want)
+	}
+}
+
+func TestResetHandoffSessionsSendsNewToEachPaneInOrder(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	oldDelay, oldConfirm := ppSubmitDelay, ppSubmitConfirmTimeout
+	ppSubmitDelay, ppSubmitConfirmTimeout = 0, 0
+	defer func() { ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm }()
+
+	members := []handoffMember{
+		{Label: "planner", Target: "%1"},
+		{Label: "worker", Target: "%2"},
+		{Label: "duplicate worker", Target: "%2"},
+	}
+	if err := resetHandoffSessions(context.Background(), ex, members); err != nil {
+		t.Fatalf("resetHandoffSessions() error = %v", err)
+	}
+	if len(ex.SendLinesCalls) != 2 {
+		t.Fatalf("SendLines calls = %#v, want two /new commands", ex.SendLinesCalls)
+	}
+	for i, call := range ex.SendLinesCalls {
+		if call.Content != "/new" {
+			t.Fatalf("SendLines call %d content = %q, want /new", i, call.Content)
+		}
+	}
+	want := [][]string{
+		{"send-keys", "-t", "%1", "Enter"},
+		{"send-keys", "-t", "%2", "Enter"},
+	}
+	if !reflect.DeepEqual(ex.ExecCalls, want) {
+		t.Fatalf("submit calls = %#v, want %#v", ex.ExecCalls, want)
 	}
 }
 
@@ -518,6 +568,51 @@ func TestWaitForCompletionUsesScreenIdleFallbackWithoutMarker(t *testing.T) {
 	}
 	if stopped || !selected || output != "all fixes completed\nready for next task" || fallbackCalls != 1 {
 		t.Fatalf("output=%q stopped=%t selected=%t calls=%d", output, stopped, selected, fallbackCalls)
+	}
+}
+
+func TestWaitForCompletionUsesIdleValidReceiptWithoutDone(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "receipt", 1, "/tmp/outbox", true)
+	ex.Captures["trec:2"] = protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review complete","tests":[]}`
+
+	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 3, 1
+	defer func() {
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+	}()
+
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil)
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	if stopped || selected || output != ex.Captures["trec:2"] {
+		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
+	}
+}
+
+func TestGoalModeWaitsForIdleAfterDone(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "goal-idle", 1, "/tmp/outbox", true)
+	protocol.GoalMode = true
+	ex.Captures["tgoal:1"] = protocol.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"done","tests":[]}` + "\n" + protocol.DoneMarker
+
+	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 3, 1
+	defer func() {
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+	}()
+
+	started := time.Now()
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:1", "old prompt", protocol, nil)
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Fatalf("goal-mode DONE returned after %s, want about one second of idle time", elapsed)
+	}
+	if stopped || selected || output != ex.Captures["tgoal:1"] {
+		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
 	}
 }
 

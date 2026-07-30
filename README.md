@@ -1058,6 +1058,8 @@ pingpong 靠兩個標記運作：
 
 > **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
 
+> 若 agent 已輸出該輪有效的 status receipt 卻遺漏 `DONE`，`--receipt-idle-timeout`（預設 30 秒）會在畫面維持不變後放行交接。這只適用於 nonce 相符且通過 schema 驗證的 receipt；設為 `0` 可停用此 fallback。
+
 > 啟用 `--coordinator` 時，任何 member 的 stop marker 都只是候選停止訊號。Coordinator 會連同 `--coordinator-policy`、目前 member 與最新結果一起判斷；因此可以規定「只有 reviewer 驗證通過才能停止」，並用 `--stop-members pane1` 做程式層的核准者限制。
 
 #### 起始 Pane 選擇
@@ -1084,10 +1086,14 @@ pingpong 靠兩個標記運作：
 |------|------|
 | `--pane1-role` | 每次傳給 pane1 的訊息前面加上這段角色設定 |
 | `--pane2-role` | 每次傳給 pane2 的訊息前面加上這段角色設定 |
+| `--pane1-goal-mode` | 對 pane1 的每個一般任務 packet 前加上 `/goal ` |
+| `--pane2-goal-mode` | 對 pane2 的每個一般任務 packet 前加上 `/goal ` |
 | `--to-pane1-prompt` | relay **到 pane1** 時的指令（例如 review / 規劃） |
 | `--to-pane2-prompt` | relay **到 pane2** 時的指令（例如實作 / 修改） |
 
 未指定 prompt 時使用預設值「請根據以下上一步的結果繼續執行。」。
+
+`--pane1-goal-mode` 與 `--pane2-goal-mode` 可分別啟用，適合只有部分 agent 支援 `/goal` 的情況。前綴會套用到該 pane 的初始任務與每次 relay；runner 的 receipt-repair 控制訊息不會加上此前綴。若目標 agent 能可靠回顯 runner 的 nonce marker，可加上 `--strict-goal-completion-marker`，要求 `GOAL_DONE__TMUXAI_...` 出現在 `DONE`／`ALL_DONE` 前；預設關閉，以相容使用原生 `/goal` 完成狀態但不回顯自訂 marker 的 agent。
 
 #### LLM Coordinator
 
@@ -1127,8 +1133,12 @@ tmux-ai pingpong \
 | `--start` | `auto` | 起始 pane：`auto`（LLM 判斷）、`pane1`、`pane2` |
 | `--stop` | `ALL_DONE` | 偵測到此關鍵字時結束整個循環 |
 | `--done` | `DONE` | agent 完成單回合時輸出的標記 |
+| `--pane1-goal-mode` | `false` | 對 pane1 的一般任務前加上 `/goal ` |
+| `--pane2-goal-mode` | `false` | 對 pane2 的一般任務前加上 `/goal ` |
+| `--strict-goal-completion-marker` | `false` | 只有 agent 能可靠輸出 runner 的 `GOAL_DONE__...` marker 時才啟用；要求該 marker 先於完成 marker。 |
 | `--max-rounds` | `20` | 最大交替輪數（安全上限） |
 | `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
+| `--receipt-idle-timeout` | `30` | 有效本輪 status receipt 出現後，畫面保持不變多久即可交接（秒；0 停用）。 |
 | `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。適用於不會渲染控制標記的 agent。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
 | `--lines` | `80` | 每次捕捉的 pane 行數 |
@@ -1152,6 +1162,7 @@ tmux-ai pingpong \
 | `--approval-threshold-bytes` | `16384` | 超過此大小需明確加上 `--allow-large-relay`；`0` 停用 |
 | `--allow-large-relay` | `false` | 人工檢查後允許超過 approval threshold 的訊息 |
 | `--dry-run` | `false` | 顯示初始交接內容與大小後停止，不操作 pane |
+| `--new` | `false` | 開始 workflow 前，依序向兩個 pane 送出並提交 `/new`，清除既有對話後才送出初始任務 |
 | `--pane1-role` | — | pane1 的角色描述，附加在每則訊息前 |
 | `--pane2-role` | — | pane2 的角色描述，附加在每則訊息前 |
 | `--to-pane1-prompt` | — | relay 到 pane1 時的指令 |
@@ -1281,14 +1292,17 @@ members:
   - name: implementer
     target: dev:implementation
     role: 你是實作工程師，負責修改程式碼與補測試。
+    goal_mode: true # 每次任務開頭加上 /goal ，只影響這個 target
   - name: tester
     target: dev:verification
     role: 你是獨立驗證工程師，不修改產品程式碼。
 ```
 
-`target` 支援 alias、`%pane_id`、`session:window` 與 `session:window.pane`。`name`、`target`、`role` 必填且必須唯一；`handoff_prompt` 選填。角色會附加到每次送往該成員的訊息，coordinator 的 `target` 只能從 preset 的 member name 中選擇。
+`target` 支援 alias、`%pane_id`、`session:window` 與 `session:window.pane`。`name`、`target`、`role` 必填且必須唯一；`handoff_prompt` 選填。若該 pane 的 agent 支援 `/goal` 指令，可設 `goal_mode: true`：每一個一般任務 packet 都會以 `/goal ` 開頭，只有該 member 受影響。runner 的 receipt-repair 控制訊息不會加上此前綴。角色會附加到每次送往該成員的訊息，coordinator 的 `target` 只能從 preset 的 member name 中選擇。
 
 `coordinator_policy` 是送給 coordinator 的可信控制規則，可限制必經驗證順序與何時應 `needs_human`；`stop_members` 則是程式硬性執行的最終核准者 allowlist，未授權 member 的 `stop` 會以 policy violation 中止。`max_selection_retries` 預設為 2。完整工作內容仍可透過共享檔案交換，但 coordinator 只根據 terminal status 與 policy 做控制判斷。
+
+若需從全新對話開始，可在任一模式加上 `--new`。runner 會依 preset 成員順序（pingpong 則 pane1、pane2）先向每個 participating pane 送出並提交 `/new`，再送出第一個任務；`--dry-run` 只顯示預計動作，不會送出 `/new`。在 YAML preset 也可設定 `new_session: true`，而命令列 `--new` 可明確啟用。
 
 `coordinate` 與 `pingpong` 共用同一個 handoff engine、coordinator prompt/JSON schema 與 action mapping，因此完成標記、policy stop gate、response reselection、bytes/LLM call 限制、重複交接防護、送出確認及 Ctrl-C 取消行為一致。主要安全 flags 與 `pingpong` 相同；可先加 `--dry-run` 檢查第一個 coordinator 決策與實際 prompt，而不操作 tmux。
 
