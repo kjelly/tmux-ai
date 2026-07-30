@@ -109,6 +109,24 @@ func TestGoalModeDoesNotRequireSyntheticMarkerByDefault(t *testing.T) {
 	}
 }
 
+func TestCoordinatorProtocolReservesStopMarkerForCoordinator(t *testing.T) {
+	engine := handoffEngine{
+		CoordinatorControlsStop: true,
+		Transport:               resolvedHandoffConfig{Transport: handoffTransportText},
+	}
+	protocol, err := engine.protocolFor(nil, handoffMember{ID: "fixer"}, "token", 1)
+	if err != nil {
+		t.Fatalf("protocolFor() error = %v", err)
+	}
+	instruction := controlProtocolInstruction(protocol)
+	if !strings.Contains(instruction, "不得輸出全任務完成 marker "+protocol.StopMarker) {
+		t.Fatalf("coordinator stop reservation missing from %q", instruction)
+	}
+	if !strings.Contains(instruction, "最後一行只輸出完成 marker value："+protocol.DoneMarker) {
+		t.Fatalf("coordinator DONE-only instruction missing from %q", instruction)
+	}
+}
+
 func TestBuildMemberTurnMessageLeavesNormalMembersUnchanged(t *testing.T) {
 	protocol := newRoundControlProtocol(handoffTransportText, "token", 1, "", true)
 	member := handoffMember{ID: "tester", Label: "tester", Role: "verify work"}

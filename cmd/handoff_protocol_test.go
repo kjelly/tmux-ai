@@ -41,6 +41,19 @@ func TestHandoffMemberDisplayNameAvoidsRepeatingTarget(t *testing.T) {
 	}
 }
 
+func TestNormalHandoffProtocolAlwaysRequiresSingleReceipt(t *testing.T) {
+	engine := handoffEngine{
+		Transport: resolvedHandoffConfig{Transport: handoffTransportText},
+	}
+	protocol, err := engine.protocolFor(nil, handoffMember{ID: "worker"}, "run", 1)
+	if err != nil {
+		t.Fatalf("protocolFor() error = %v", err)
+	}
+	if !protocol.RequireStatus {
+		t.Fatal("normal handoff protocol must require a structured receipt")
+	}
+}
+
 func TestTerminalPresentationProtocolRoundTrip(t *testing.T) {
 	begin, end := textMarkers("run", 2)
 	marker := statusMarker("run", 2)

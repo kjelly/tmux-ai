@@ -59,7 +59,7 @@ type handoffResponseSelector func(context.Context, []string, string) (string, in
 type roundControlProtocol struct {
 	Transport                                                                                    handoffTransportKind
 	TextBeginMarker, TextEndMarker, StatusMarker, GoalDoneMarker, DoneMarker, StopMarker, Outbox string
-	RequireStatus, GoalMode                                                                      bool
+	RequireStatus, GoalMode, CoordinatorControlsStop                                             bool
 }
 
 const (
@@ -100,7 +100,11 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 	if p.GoalDoneMarker != "" {
 		fmt.Fprintf(&b, "\n這是 /goal 任務：在交接前，必須先實際完成並關閉目前的 goal。不可只因為想交給其他 agent 就輸出完成標記；若無法完成，先將 goal 以 blocked 結束。goal 完成後，先獨佔一行輸出 goal completion marker value：%s\n", p.GoalDoneMarker)
 	}
-	fmt.Fprintf(&b, "完成 marker value（實際輸出時必須獨佔最後一行）：%s\n全任務完成 marker value（實際輸出時必須獨佔最後一行）：%s", p.DoneMarker, p.StopMarker)
+	if p.CoordinatorControlsStop {
+		fmt.Fprintf(&b, "此 workflow 的全程停止只可由 coordinator 依 policy 決定。不得輸出全任務完成 marker %s，也不得因等待 reviewer confirmation 而回報 blocked；完成你本輪職責後，輸出 status receipt，並在最後一行只輸出完成 marker value：%s。coordinator 會負責交給下一位成員或停止。", p.StopMarker, p.DoneMarker)
+	} else {
+		fmt.Fprintf(&b, "完成 marker value（實際輸出時必須獨佔最後一行）：%s\n全任務完成 marker value（實際輸出時必須獨佔最後一行）：%s", p.DoneMarker, p.StopMarker)
+	}
 	return b.String()
 }
 
@@ -189,6 +193,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	if err := sendToPane(ctx, e.Executor, current.Target, initial); err != nil {
 		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
 	}
+	fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
 	for round := 1; round <= ppMaxRounds; round++ {
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
 		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback())
@@ -210,6 +215,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if err != nil {
 			return err
 		}
+		fmt.Printf("🧠 正在判斷 %s 的第 %d 輪結果與下一步\n", handoffMemberDisplayName(current), round)
 		var route handoffRoute
 		for retries := 0; ; retries++ {
 			route, err = e.Route(ctx, round, current, result, stopped)
@@ -225,12 +231,18 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			if retries >= ppMaxSelectionRetries {
 				return fmt.Errorf("coordinator requested response reselection more than --max-selection-retries=%d times: %s", ppMaxSelectionRetries, route.Reason)
 			}
+			fmt.Printf("🔁 Coordinator 要求重新選取 %s 的回覆：%s\n", handoffMemberDisplayName(current), truncate(route.Reason, 120))
 			result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, route.Reason, true)
 			if err != nil {
 				return err
 			}
 		}
 		if route.Stop {
+			reason := strings.TrimSpace(route.Reason)
+			if reason == "" {
+				reason = "Coordinator 判定工作已完成"
+			}
+			fmt.Printf("🏁 Workflow 已完成：%s\n", truncate(reason, 120))
 			return nil
 		}
 		if route.Confidence < ppMinCoordConfidence {
@@ -243,6 +255,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if route.Instruction == "" {
 			return fmt.Errorf("router returned an empty instruction for %s", next.Label)
 		}
+		fmt.Printf("➡️ 下一步交給 %s (%s)：%s\n", handoffMemberDisplayName(next), next.Target, displayHandoffRouteReason(route.Reason))
 		payload, nextIncoming, err := e.routePayload(result, route, store)
 		if err != nil {
 			return err
@@ -277,9 +290,18 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if err := sendToPane(ctx, e.Executor, next.Target, message); err != nil {
 			return fmt.Errorf("relay to %s: %w", next.Label, err)
 		}
+		fmt.Printf("📨 已送出第 %d 輪交接給 %s\n", round+1, handoffMemberDisplayName(next))
 		current, baseline, protocol, incoming = next, nextBaseline, nextProtocol, nextIncoming
 	}
+	fmt.Printf("⏹️ 已達最大輪數 %d，workflow 停止\n", ppMaxRounds)
 	return nil
+}
+
+func displayHandoffRouteReason(reason string) string {
+	if reason = strings.TrimSpace(reason); reason != "" {
+		return truncate(reason, 120)
+	}
+	return "依既定交接順序繼續"
 }
 
 // resetCodexGoalIfNeeded clears Codex's current native goal immediately
@@ -444,8 +466,12 @@ func (e handoffEngine) protocolFor(store artifact.Store, member handoffMember, t
 			return roundControlProtocol{}, fmt.Errorf("create outbox: %w", err)
 		}
 	}
-	protocol := newRoundControlProtocol(e.Transport.Transport, token, round, outbox, e.CoordinatorControlsStop)
+	// Every normal handoff uses one structured receipt. The runner validates
+	// that receipt and the completion envelope locally before routing; this
+	// does not add another agent response or coordinator call.
+	protocol := newRoundControlProtocol(e.Transport.Transport, token, round, outbox, true)
 	protocol.GoalMode = member.GoalMode
+	protocol.CoordinatorControlsStop = e.CoordinatorControlsStop
 	if member.GoalMode && ppStrictGoalCompletionMarker {
 		protocol.GoalDoneMarker = roundControlMarker("GOAL_DONE", token, round)
 	}
@@ -730,7 +756,10 @@ func shouldUseFullScreenSelector(err error) bool {
 }
 
 func fullScreenSelectorGuidance(p roundControlProtocol, prior string) string {
-	required := fmt.Sprintf("status %q，以及最後的 %q 或 %q", p.StatusMarker, p.DoneMarker, p.StopMarker)
+	required := fmt.Sprintf("status %q，以及最後的 %q", p.StatusMarker, p.DoneMarker)
+	if !p.CoordinatorControlsStop {
+		required = fmt.Sprintf("status %q，以及最後的 %q 或 %q", p.StatusMarker, p.DoneMarker, p.StopMarker)
+	}
 	if p.GoalDoneMarker != "" {
 		required = fmt.Sprintf("goal completion marker %q、%s", p.GoalDoneMarker, required)
 	}

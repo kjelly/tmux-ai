@@ -44,43 +44,44 @@ import (
 // ── flags ──────────────────────────────────────────────────────────────
 
 var (
-	ppPane1                  string
-	ppPane2                  string
-	ppPreset                 string
-	ppInitial                string
-	ppStop                   string
-	ppDone                   string
-	ppStart                  string
-	ppMaxRounds              int
-	ppInterval               int
-	ppLines                  int
-	ppRoundTimeout           int
-	ppScreenIdleTimeout      int
-	ppReceiptIdleTimeout     int
-	ppSummarize              bool
-	ppCoordinator            bool
-	ppCoordinatorPolicy      string
-	ppStopMembers            []string
-	ppCoordTimeout           int
-	ppMaxSelectionRetries    int
-	ppInitialFrom            string
-	ppInitialLines           int
-	ppSubmitDelay            int
-	ppSubmitConfirmTimeout   int
-	ppSubmitRetries          int
-	ppMaxRelayBytes          int
-	ppMaxTotalRelayBytes     int
-	ppMaxLLMCalls            int
-	ppMaxSamePaneRounds      int
-	ppMaxDuplicateHandoffs   int
-	ppMinResponseLines       int
-	ppMaxResponseLines       int
-	ppMinCoordConfidence     float64
-	ppApprovalThresholdBytes int
-	ppAllowLargeRelay        bool
-	ppDryRun                 bool
-	ppNewSession             bool
-	ppPresetHandoff          handoffPresetConfig
+	ppPane1                   string
+	ppPane2                   string
+	ppPreset                  string
+	ppInitial                 string
+	ppStop                    string
+	ppDone                    string
+	ppStart                   string
+	ppMaxRounds               int
+	ppInterval                int
+	ppLines                   int
+	ppRoundTimeout            int
+	ppScreenIdleTimeout       int
+	ppReceiptIdleTimeout      int
+	ppCompletionSettleTimeout int
+	ppSummarize               bool
+	ppCoordinator             bool
+	ppCoordinatorPolicy       string
+	ppStopMembers             []string
+	ppCoordTimeout            int
+	ppMaxSelectionRetries     int
+	ppInitialFrom             string
+	ppInitialLines            int
+	ppSubmitDelay             int
+	ppSubmitConfirmTimeout    int
+	ppSubmitRetries           int
+	ppMaxRelayBytes           int
+	ppMaxTotalRelayBytes      int
+	ppMaxLLMCalls             int
+	ppMaxSamePaneRounds       int
+	ppMaxDuplicateHandoffs    int
+	ppMinResponseLines        int
+	ppMaxResponseLines        int
+	ppMinCoordConfidence      float64
+	ppApprovalThresholdBytes  int
+	ppAllowLargeRelay         bool
+	ppDryRun                  bool
+	ppNewSession              bool
+	ppPresetHandoff           handoffPresetConfig
 
 	// Role-based division of labour
 	ppPane1Role                  string // prepended to every message sent to pane1
@@ -199,6 +200,7 @@ func init() {
 	pingpongCmd.Flags().IntVar(&ppRoundTimeout, "round-timeout", 600, "Per-round timeout in seconds (0 = no timeout)")
 	pingpongCmd.Flags().IntVar(&ppScreenIdleTimeout, "screen-idle-timeout", 0, "After this many unchanged-screen seconds, use the LLM to detect a completed response (0 disables)")
 	pingpongCmd.Flags().IntVar(&ppReceiptIdleTimeout, "receipt-idle-timeout", 30, "After a valid status receipt and this many unchanged-screen seconds, hand off without DONE (0 disables)")
+	pingpongCmd.Flags().IntVar(&ppCompletionSettleTimeout, "completion-settle-timeout", 1000, "Milliseconds a validated completion envelope must remain unchanged before handoff (0 disables)")
 	pingpongCmd.Flags().BoolVar(&ppSummarize, "summarize", false, "Run relayed content through Ollama for summarization before sending")
 	pingpongCmd.Flags().BoolVar(&ppCoordinator, "coordinator", false, "Use the LLM each round to choose the next pane and relay instruction")
 	pingpongCmd.Flags().StringVar(&ppCoordinatorPolicy, "coordinator-policy", "", "Trusted workflow policy used for routing and stop decisions")
@@ -256,6 +258,9 @@ func runPingPong() error {
 	}
 	if ppSubmitConfirmTimeout < 0 || ppSubmitRetries < 0 {
 		return fmt.Errorf("submit confirmation timeout and retries must not be negative")
+	}
+	if ppCompletionSettleTimeout < 0 {
+		return fmt.Errorf("--completion-settle-timeout must not be negative")
 	}
 	if ppMaxRelayBytes <= 0 {
 		return fmt.Errorf("--max-relay-bytes must be greater than zero")
@@ -430,6 +435,7 @@ type pingPongPreset struct {
 	MaxSelectionRetries int      `yaml:"max_selection_retries"`
 	RoundTimeout        int      `yaml:"round_timeout"`
 	ScreenIdleTimeout   int      `yaml:"screen_idle_timeout"`
+	CompletionSettleMS  *int     `yaml:"completion_settle_ms"`
 	SubmitDelay         int      `yaml:"submit_delay"`
 	Lines               int      `yaml:"lines"`
 	NewSession          bool     `yaml:"new_session"`
@@ -518,6 +524,9 @@ func applyPingPongPreset() error {
 	}
 	if preset.ScreenIdleTimeout > 0 {
 		ppScreenIdleTimeout = preset.ScreenIdleTimeout
+	}
+	if preset.CompletionSettleMS != nil {
+		ppCompletionSettleTimeout = *preset.CompletionSettleMS
 	}
 	if preset.SubmitDelay > 0 {
 		ppSubmitDelay = preset.SubmitDelay
@@ -921,6 +930,33 @@ func waitForCompletion(ctx context.Context, ex tmux.Executor, paneID, baseline s
 	return output, stopped, err
 }
 
+// completionSettleState implements the runner-local second validation phase.
+// The agent still emits one response: after its nonce-bound envelope passes
+// local protocol validation, a later identical pane capture commits it for
+// handoff. Any redraw resets the settle window.
+type completionSettleState struct {
+	screen, envelope string
+	stopped          bool
+	observedAt       time.Time
+	captures         int
+}
+
+func (s *completionSettleState) observe(screen, envelope string, stopped bool, now time.Time, settle time.Duration) bool {
+	if settle <= 0 {
+		return true
+	}
+	if s.captures == 0 || s.screen != screen || s.envelope != envelope || s.stopped != stopped {
+		s.screen = screen
+		s.envelope = envelope
+		s.stopped = stopped
+		s.observedAt = now
+		s.captures = 1
+		return false
+	}
+	s.captures++
+	return s.captures >= 2 && now.Sub(s.observedAt) >= settle
+}
+
 // waitForCompletionWithFallback keeps the marker protocol as the authoritative
 // fast path.  Some interactive agents cannot be made to render an arbitrary
 // marker reliably, though.  For those, an explicitly enabled fallback asks the
@@ -947,6 +983,8 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 	var goalDoneSeen bool
 	var goalDoneStopped bool
 	var goalDoneOutput string
+	var receiptWaitAnnounced bool
+	var completionSettle completionSettleState
 
 	for {
 		select {
@@ -989,6 +1027,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// screen-idle period matters from this point onward.
 		if protocol.GoalMode && goalDoneSeen {
 			if time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
+				fmt.Printf("✅ Pane %s 已連續穩定 %s，開始處理本輪結果\n", paneID, completionIdleDuration())
 				return goalDoneOutput, goalDoneStopped, false, nil
 			}
 			continue
@@ -1001,14 +1040,26 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, protocol.DoneMarker, protocol.StopMarker) {
 				continue
 			}
-			if protocol.GoalMode {
-				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, content
+			if !protocol.RequireStatus {
+				return newContent, stopped, false, nil
+			}
+			envelope, valid := extractCompletedProtocolEnvelope(content, protocol)
+			if !valid {
 				continue
 			}
-			if envelope, ok := extractCompletedProtocolEnvelope(content, protocol); ok {
+			if protocol.GoalMode {
+				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
+				fmt.Printf("✅ Pane %s 已偵測到 %s；goal mode 需等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
+				continue
+			}
+			if completionSettle.captures == 0 || completionSettle.screen != content {
+				fmt.Printf("✅ Pane %s 已驗證 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
+			}
+			if completionSettle.observe(content, envelope, stopped, time.Now(), completionSettleDuration()) {
+				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
 				return envelope, stopped, false, nil
 			}
-			return newContent, stopped, false, nil
+			continue
 		}
 		// Some agents ignore the requested per-round suffix and print the base
 		// marker. Accept that only after the current round's unique control
@@ -1018,23 +1069,47 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, ppDone, ppStop) {
 				continue
 			}
+			if !protocol.RequireStatus {
+				return newContent, stopped, false, nil
+			}
 			if protocol.GoalMode {
-				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, content
+				baseProtocol := protocol
+				baseProtocol.DoneMarker = ppDone
+				baseProtocol.StopMarker = ppStop
+				envelope, valid := extractCompletedProtocolEnvelope(content, baseProtocol)
+				if !valid {
+					continue
+				}
+				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
+				fmt.Printf("✅ Pane %s 已偵測到相容的 %s；goal mode 需等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
 				continue
 			}
 			baseProtocol := protocol
 			baseProtocol.DoneMarker = ppDone
 			baseProtocol.StopMarker = ppStop
-			if envelope, ok := extractCompletedProtocolEnvelope(content, baseProtocol); ok {
+			envelope, valid := extractCompletedProtocolEnvelope(content, baseProtocol)
+			if !valid {
+				continue
+			}
+			if completionSettle.captures == 0 || completionSettle.screen != content {
+				fmt.Printf("✅ Pane %s 已驗證相容的 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
+			}
+			if completionSettle.observe(content, envelope, stopped, time.Now(), completionSettleDuration()) {
+				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
 				return envelope, stopped, false, nil
 			}
-			return newContent, stopped, false, nil
+			continue
 		}
 		// A valid, nonce-bound receipt is stronger evidence than an arbitrary
 		// terminal screen. If an agent omits DONE, permit the configured idle
 		// fallback after a schema-valid receipt, including for /goal members.
 		if ppReceiptIdleTimeout > 0 && hasValidStatusReceipt(controlContent, protocol) {
+			if !receiptWaitAnnounced {
+				fmt.Printf("🧾 Pane %s 已偵測到有效 status receipt，但尚未偵測到完成標記；等待畫面連續穩定 %s\n", paneID, completionIdleDuration())
+				receiptWaitAnnounced = true
+			}
 			if !protocol.GoalMode && time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
+				fmt.Printf("✅ Pane %s 已連續穩定 %s，使用 status receipt 處理本輪結果\n", paneID, completionIdleDuration())
 				return newContent, false, false, nil
 			}
 		}
@@ -1044,6 +1119,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if screenChangedAt.IsZero() || content != lastScreen {
 				lastScreen, screenChangedAt = content, time.Now()
 			} else if content != fallbackAttemptedFor && time.Since(screenChangedAt) >= time.Duration(ppScreenIdleTimeout)*time.Second {
+				fmt.Printf("💤 Pane %s 畫面已連續 %s 無變化，正在判斷是否已完成本輪\n", paneID, time.Duration(ppScreenIdleTimeout)*time.Second)
 				selected, fallbackErr := fallback(ctx, content)
 				// Do not repeatedly spend LLM calls on an unchanged screen. A new
 				// render receives a fresh fingerprint and can be considered again.
@@ -1052,11 +1128,28 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 					return "", false, false, fmt.Errorf("screen-idle completion fallback for %s: %w", paneID, fallbackErr)
 				}
 				if strings.TrimSpace(selected) != "" {
+					fmt.Printf("✅ 已從 Pane %s 的穩定畫面確認本輪完成\n", paneID)
 					return selected, false, true, nil
 				}
+				fmt.Printf("⏳ Pane %s 尚未能確認完成，將在畫面再次變化後繼續觀察\n", paneID)
 			}
 		}
 	}
+}
+
+func completionIdleDuration() time.Duration {
+	return time.Duration(ppReceiptIdleTimeout) * time.Second
+}
+
+func completionSettleDuration() time.Duration {
+	return time.Duration(ppCompletionSettleTimeout) * time.Millisecond
+}
+
+func detectedCompletionMarker(stopped bool) string {
+	if stopped {
+		return "全任務完成標記"
+	}
+	return "DONE 完成標記"
 }
 
 func hasValidStatusReceipt(output string, protocol roundControlProtocol) bool {

@@ -29,6 +29,7 @@ type coordinatePreset struct {
 	CoordinatorPolicy   string             `yaml:"coordinator_policy"`
 	StopMembers         []string           `yaml:"stop_members"`
 	MaxSelectionRetries int                `yaml:"max_selection_retries"`
+	CompletionSettleMS  *int               `yaml:"completion_settle_ms"`
 	NewSession          bool               `yaml:"new_session"`
 	Members             []coordinateMember `yaml:"members"`
 }
@@ -66,6 +67,7 @@ func init() {
 	coordinateCmd.Flags().IntVar(&ppInterval, "interval", 2000, "Poll interval in milliseconds")
 	coordinateCmd.Flags().IntVar(&ppLines, "lines", 256, "Pane lines captured per turn")
 	coordinateCmd.Flags().IntVar(&ppRoundTimeout, "round-timeout", 600, "Per-round timeout in seconds (0 = no timeout)")
+	coordinateCmd.Flags().IntVar(&ppCompletionSettleTimeout, "completion-settle-timeout", 1000, "Milliseconds a validated completion envelope must remain unchanged before handoff (0 disables)")
 	coordinateCmd.Flags().IntVar(&ppCoordTimeout, "coordinator-timeout", 60, "Coordinator timeout in seconds")
 	coordinateCmd.Flags().StringVar(&ppCoordinatorPolicy, "coordinator-policy", "", "Trusted workflow policy used for routing and stop decisions")
 	coordinateCmd.Flags().StringSliceVar(&ppStopMembers, "stop-members", nil, "Member IDs allowed to approve coordinator stop")
@@ -155,6 +157,9 @@ func runCoordinate() error {
 	if preset.MaxSelectionRetries > 0 {
 		ppMaxSelectionRetries = preset.MaxSelectionRetries
 	}
+	if preset.CompletionSettleMS != nil {
+		ppCompletionSettleTimeout = *preset.CompletionSettleMS
+	}
 	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
 		ppNewSession = preset.NewSession
 	}
@@ -166,6 +171,9 @@ func runCoordinate() error {
 	}
 	if ppMaxRounds <= 0 || ppLines <= 0 || ppMaxRelayBytes <= 0 || ppMaxTotalRelayBytes <= 0 || ppMaxLLMCalls <= 0 {
 		return fmt.Errorf("round, line, relay, and LLM limits must be greater than zero")
+	}
+	if ppCompletionSettleTimeout < 0 {
+		return fmt.Errorf("--completion-settle-timeout must not be negative")
 	}
 	if ppMaxSamePaneRounds <= 0 || ppMaxDuplicateHandoffs <= 0 || ppMinResponseLines <= 0 || ppMaxResponseLines < ppMinResponseLines {
 		return fmt.Errorf("handoff and response limits are invalid")

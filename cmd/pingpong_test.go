@@ -528,6 +528,51 @@ func TestWaitForCompletionStopsAfterRepeatedCaptureFailures(t *testing.T) {
 	}
 }
 
+func TestCompletionSettleRequiresStableLaterCapture(t *testing.T) {
+	var state completionSettleState
+	start := time.Unix(100, 0)
+	settle := time.Second
+
+	if state.observe("screen-a", "envelope", false, start, settle) {
+		t.Fatal("first validated capture must not commit the handoff")
+	}
+	if state.observe("screen-a", "envelope", false, start.Add(500*time.Millisecond), settle) {
+		t.Fatal("capture before settle duration unexpectedly committed the handoff")
+	}
+	if !state.observe("screen-a", "envelope", false, start.Add(time.Second), settle) {
+		t.Fatal("stable later capture did not commit the handoff")
+	}
+}
+
+func TestCompletionSettleResetsAfterRedraw(t *testing.T) {
+	var state completionSettleState
+	start := time.Unix(100, 0)
+	settle := time.Second
+
+	if state.observe("screen-a", "envelope", false, start, settle) {
+		t.Fatal("first validated capture must not commit the handoff")
+	}
+	if state.observe("screen-b", "envelope", false, start.Add(time.Second), settle) {
+		t.Fatal("redrawn screen must reset the settle window")
+	}
+	if !state.observe("screen-b", "envelope", false, start.Add(2*time.Second), settle) {
+		t.Fatal("stable capture after redraw did not commit the handoff")
+	}
+}
+
+func TestCompletedEnvelopeRequiresValidReceipt(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportText, "missing-receipt", 1, "", true)
+	output := strings.Join([]string{
+		protocol.TextBeginMarker,
+		"implementation complete",
+		protocol.TextEndMarker,
+		protocol.DoneMarker,
+	}, "\n")
+	if _, ok := extractCompletedProtocolEnvelope(output, protocol); ok {
+		t.Fatal("completion envelope without a valid receipt was accepted")
+	}
+}
+
 func TestWaitForCompletionFindsUniqueMarkerAfterTUIRedraw(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	ex.Captures["trec:2"] = "completely redrawn alternate screen\nSTOP_unique\n>"
@@ -647,15 +692,22 @@ func TestWaitForCompletionExtractsProtocolEnvelopeAfterPromptRedraw(t *testing.T
 
 	ex := tmux.NewFakeExecutor()
 	ex.Captures["trec:2"] = current
-	oldInterval, oldTimeout := ppInterval, ppRoundTimeout
-	ppInterval, ppRoundTimeout = 1, 1
+	oldInterval, oldTimeout, oldSettle := ppInterval, ppRoundTimeout, ppCompletionSettleTimeout
+	ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = 1, 1, 10
 	defer func() {
-		ppInterval, ppRoundTimeout = oldInterval, oldTimeout
+		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
 	}()
 
+	started := time.Now()
 	output, stopped, err := waitForCompletion(context.Background(), ex, "trec:2", baseline, protocol)
 	if err != nil {
 		t.Fatalf("waitForCompletion() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 8*time.Millisecond {
+		t.Fatalf("completion returned after %s without honoring the settle window", elapsed)
+	}
+	if len(ex.CaptureCalls) < 2 {
+		t.Fatalf("capture calls = %d, want at least two validation captures", len(ex.CaptureCalls))
 	}
 	if !stopped {
 		t.Fatal("waitForCompletion() stopped = false, want true")
