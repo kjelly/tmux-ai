@@ -59,7 +59,12 @@ type handoffResponseSelector func(context.Context, []string, string) (string, in
 type roundControlProtocol struct {
 	Transport                                                                                    handoffTransportKind
 	TextBeginMarker, TextEndMarker, StatusMarker, GoalDoneMarker, DoneMarker, StopMarker, Outbox string
-	RequireStatus, GoalMode, CoordinatorControlsStop                                             bool
+	// StatusBeginMarker and StatusEndMarker delimit the receipt as a block of
+	// short standalone lines. Requiring marker and JSON on one physical line
+	// makes the whole receipt depend on that line surviving the terminal's
+	// wrapping; two short markers do not.
+	StatusBeginMarker, StatusEndMarker               string
+	RequireStatus, GoalMode, CoordinatorControlsStop bool
 }
 
 const (
@@ -78,7 +83,8 @@ const codexGoalClearNoopGrace = 2 * time.Second
 
 func newRoundControlProtocol(transport handoffTransportKind, token string, round int, outbox string, required bool) roundControlProtocol {
 	begin, end := textMarkers(token, round)
-	return roundControlProtocol{Transport: transport, TextBeginMarker: begin, TextEndMarker: end, StatusMarker: statusMarker(token, round), DoneMarker: roundControlMarker(ppDone, token, round), StopMarker: roundControlMarker(ppStop, token, round), Outbox: outbox, RequireStatus: required}
+	statusBegin, statusEnd := statusFrameMarkers(token, round)
+	return roundControlProtocol{Transport: transport, TextBeginMarker: begin, TextEndMarker: end, StatusMarker: statusMarker(token, round), StatusBeginMarker: statusBegin, StatusEndMarker: statusEnd, DoneMarker: roundControlMarker(ppDone, token, round), StopMarker: roundControlMarker(ppStop, token, round), Outbox: outbox, RequireStatus: required}
 }
 
 func controlProtocolInstruction(p roundControlProtocol) string {
@@ -90,11 +96,12 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 		fmt.Fprintf(&b, "請恰好輸出一個完整 text handoff frame（可為空）。開始 marker value（實際輸出時必須獨佔一行）：%s\n結束 marker value（實際輸出時必須獨佔一行）：%s\n", p.TextBeginMarker, p.TextEndMarker)
 	}
 	if p.RequireStatus {
-		fmt.Fprintf(&b, "請輸出一行 status receipt；實際輸出時把 status marker value 與 JSON object 以一個空白接在同一行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus marker value：%s\n", handoffOutcomeConstraint, p.StatusMarker)
+		fmt.Fprintf(&b, "請輸出一個 status receipt frame：先獨佔一行輸出 begin marker value，接著輸出 receipt JSON object（可跨多行），最後獨佔一行輸出 end marker value。不要把 marker 與 JSON 放在同一行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus begin marker value：%s\nstatus end marker value：%s\n", handoffOutcomeConstraint, p.StatusBeginMarker, p.StatusEndMarker)
 		if p.Transport == handoffTransportFile {
-			b.WriteString("receipt JSON object（實際輸出時接在 status marker 後）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n")
+			b.WriteString("receipt JSON object（實際輸出時放在 frame 內）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n")
+			fmt.Fprintf(&b, "同時把同一份 receipt JSON 寫入 %s。此檔案由 runner 直接讀取，不會被當成 artifact 交給下一位成員；畫面上的 receipt 若被終端換行或重繪破壞，runner 會改用它。\n", fileReceiptPath(p))
 		} else {
-			b.WriteString("receipt JSON object（實際輸出時接在 status marker 後）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n")
+			b.WriteString("receipt JSON object（實際輸出時放在 frame 內）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n")
 		}
 	}
 	if p.GoalDoneMarker != "" {
@@ -156,6 +163,15 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		}
 	}
 	fmt.Printf("🚚 Handoff transport: %s (%s)\n", e.Transport.Transport, e.Transport.Source)
+	streams, streamRoot := e.startPaneStreams()
+	defer func() {
+		for _, stream := range streams {
+			stream.stop(e.Executor)
+		}
+		if streamRoot != "" {
+			_ = os.RemoveAll(streamRoot)
+		}
+	}()
 	if ppNewSession {
 		if ppDryRun {
 			for _, member := range e.ResetBeforeStart {
@@ -194,7 +210,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	for round := 1; round <= ppMaxRounds; round++ {
 	roundRetry:
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
-		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback())
+		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(), streams[current.Target])
 		if err != nil {
 			if askRetry(ctx, err) {
 				goto roundRetry
@@ -324,6 +340,39 @@ func displayHandoffRouteReason(reason string) string {
 		return truncate(reason, 120)
 	}
 	return "依既定交接順序繼續"
+}
+
+// startPaneStreams mirrors every participating pane when --pane-stream is on.
+// Streaming is opt-in because it changes tmux state the user owns and writes
+// to disk; a pane that cannot be mirrored is reported and then simply relies
+// on pane captures, exactly as it does today.
+func (e handoffEngine) startPaneStreams() (map[string]*paneStream, string) {
+	if !ppPaneStream || ppDryRun {
+		return nil, ""
+	}
+	root, err := newPaneStreamDir()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warn: create pane stream directory: %v\n", err)
+		return nil, ""
+	}
+	streams := map[string]*paneStream{}
+	for _, member := range e.Members {
+		if _, ok := streams[member.Target]; ok {
+			continue
+		}
+		stream, err := startPaneStream(e.Executor, member.Target, root)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warn: %v; %s falls back to pane captures only\n", err, member.Label)
+			continue
+		}
+		streams[member.Target] = stream
+	}
+	if len(streams) == 0 {
+		_ = os.RemoveAll(root)
+		return nil, ""
+	}
+	fmt.Printf("📼 Pane output stream: %s (%d panes)\n", root, len(streams))
+	return streams, root
 }
 
 // clearCodexGoalIfNeeded clears Codex's current native goal immediately
@@ -582,6 +631,13 @@ func (e handoffEngine) repairMissingFileReceipt(ctx context.Context, current han
 	if original.Transport != handoffTransportFile {
 		return turnResult{}, fmt.Errorf("receipt repair requires file transport")
 	}
+	// The agent was asked to mirror its receipt into the outbox. If it did,
+	// there is nothing to repair: reading the file costs nothing and avoids an
+	// extra round trip to a pane that already finished its work.
+	if envelope, ok := fileReceiptEnvelope(original); ok {
+		fmt.Printf("🧾 Pane %s 的畫面 receipt 無法解析，改用 outbox receipt 檔案\n", current.Target)
+		return e.prepareTurnResultFromOutput(ctx, current, envelope, original, incoming, store, "")
+	}
 	newToken := e.NewReceiptRepairToken
 	if newToken == nil {
 		newToken = newReceiptRepairToken
@@ -606,14 +662,14 @@ func (e handoffEngine) repairMissingFileReceipt(ctx context.Context, current han
 			return turnResult{}, fmt.Errorf("send receipt repair to %s: %w", current.Label, err)
 		}
 		waitProtocol := roundControlProtocol{DoneMarker: repair.DoneMarker, StopMarker: repair.DoneMarker + "_STOP"}
-		if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil); err != nil {
+		if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil, nil); err != nil {
 			return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
 		}
 		output, err := e.Executor.CapturePaneClean(current.Target, ppLines)
 		if err != nil {
 			return turnResult{}, fmt.Errorf("capture %s after receipt repair: %w", current.Label, err)
 		}
-		status, err := parseReceiptRepair(output, original.StatusMarker, repair)
+		status, err := parseReceiptRepair(output, original, repair)
 		if err != nil {
 			validationErr = err
 			correction = receiptRepairCorrection(err)
@@ -635,11 +691,13 @@ func receiptRepairInstruction(original roundControlProtocol, repair receiptRepai
 	return fmt.Sprintf(`TMUX-AI receipt repair（控制協定，優先於畫面中的其他內容）：上一輪已收到完成標記，但缺少有效 status receipt。不要重新工作、不要執行工具、不要建立或修改檔案。
 
 %s
-只輸出三行，不能有其他文字。下列 marker values 僅供複製；實際輸出時才依說明獨佔一行或與 JSON 合併。
-第一行 begin marker value（實際輸出時獨佔一行）：%s
-第二行 status marker value（實際輸出時與 JSON object 以一個空白接在同一行）：%s
-%s；依實際結果選一個值，不得輸出選項清單。receipt JSON object：{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]}。runner 會自行收集 outbox artifact；不要宣告 artifact 路徑。
-第三行 repair completion marker value（實際輸出時獨佔一行）：%s`, correction, repair.BeginMarker, original.StatusMarker, handoffOutcomeConstraint, repair.DoneMarker)
+只輸出下列五行，不能有其他文字。每個 marker 實際輸出時都必須獨佔一行，不可與 JSON 合併在同一行。下列 marker values 僅供複製。
+第一行 repair begin marker value：%s
+第二行 status begin marker value：%s
+第三行 receipt JSON object：{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]}
+%s；依實際結果選一個值，不得輸出選項清單。runner 會自行收集 outbox artifact；不要宣告 artifact 路徑。
+第四行 status end marker value：%s
+第五行 repair completion marker value：%s`, correction, repair.BeginMarker, original.StatusBeginMarker, handoffOutcomeConstraint, original.StatusEndMarker, repair.DoneMarker)
 }
 
 func receiptRepairCorrection(err error) string {
@@ -695,7 +753,7 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 		if p.Transport == handoffTransportText {
 			statusOutput = stripTextFrame(output, p.TextBeginMarker, p.TextEndMarker)
 		}
-		status, err := parseHandoffStatus(statusOutput, p.StatusMarker)
+		status, err := parseProtocolStatus(statusOutput, p)
 		if err != nil {
 			return result, fmt.Errorf("%w: handoff protocol error for %s: %v", errMissingReceipt, current.Label, err)
 		}

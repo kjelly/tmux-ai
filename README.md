@@ -1058,9 +1058,13 @@ pingpong 靠兩個標記運作：
 
 > **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
 
+> Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行，JSON 放在兩者之間並可跨多行。這讓 receipt 不再依賴「marker 與 JSON 同一行」在終端寬度下完整存活。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
+>
 > 若 agent 已輸出該輪有效的 status receipt 卻遺漏 `DONE`，`--receipt-idle-timeout`（預設 30 秒）會在畫面維持不變後放行交接。這只適用於 nonce 相符且通過 schema 驗證的 receipt；設為 `0` 可停用此 fallback。
 >
-> 正常換手採 runner 端兩階段驗證，不要求 agent 額外回覆 ACK：先驗證同一輪的完整 text/file envelope、status receipt 與完成 marker，再等待畫面於 `--completion-settle-timeout` 期間保持一致。預設為 1000 毫秒；設為 `0` 可停用穩定期。preset 可用 `completion_settle_ms` 設定。
+> `--pane-stream`（preset：`pane_stream: true`，預設關閉）另外用 `tmux pipe-pane` 把每個 pane 的輸出鏡像到本機檔案。`capture-pane` 只看得到目前放得下、且 TUI 最後畫出來的內容，因此 alternate screen 捲掉的完成、或兩次 poll 之間被重繪蓋掉的完成都會遺失；輸出串流兩者都留得住，而且因為鏡像發生在 tmux 端，agent 在容器或 ssh 遠端也一樣有效。串流只會餵給和畫面同一套 nonce-bound envelope 驗證，因此它能救回「確實顯示過」的完成，不能無中生有；只看到 marker 卻湊不出有效 envelope 時會讓路給其他 fallback。已經被別人 pipe 的 pane 不會被接管，該 pane 就退回純畫面偵測。
+>
+> 正常換手採 runner 端兩階段驗證，不要求 agent 額外回覆 ACK：先驗證同一輪的完整 text/file envelope、status receipt 與完成 marker，再等待該 envelope 於 `--completion-settle-timeout` 期間保持一致。穩定判準是已驗證的 envelope 而非整張畫面，因此 TUI 的計時器、token 計數或 footer 重繪不會延後已完成的交接。預設為 1000 毫秒；設為 `0` 可停用穩定期。preset 可用 `completion_settle_ms` 設定。
 
 > 啟用 `--coordinator` 時，任何 member 的 stop marker 都只是候選停止訊號。Coordinator 會連同 `--coordinator-policy`、目前 member 與最新結果一起判斷；因此可以規定「只有 reviewer 驗證通過才能停止」，並用 `--stop-members pane1` 做程式層的核准者限制。
 
@@ -1142,6 +1146,7 @@ tmux-ai pingpong \
 | `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
 | `--completion-settle-timeout` | `1000` | 完整且有效的完成 envelope 必須維持不變多久才換手（毫秒；0 停用）。此驗證完全在 runner 本地進行。 |
 | `--receipt-idle-timeout` | `30` | 有效本輪 status receipt 出現後，畫面保持不變多久即可交接（秒；0 停用）。 |
+| `--pane-stream` | `false` | 以 `tmux pipe-pane` 鏡像 pane 輸出，救回畫面已捲掉或被重繪蓋掉的完成 envelope。 |
 | `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。適用於不會渲染控制標記的 agent。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
 | `--lines` | `80` | 每次捕捉的 pane 行數 |
@@ -1585,3 +1590,5 @@ text_handoff:
 CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。
 
 Coordinator mode 會自動要求每輪輸出 `HANDOFF_STATUS` JSON（`success`、`needs_followup` 或 `blocked`）。這是 runner control protocol，不應寫進 role、initial 或 handoff prompt。file coordinator 只可選 runner artifact IDs；text coordinator 只看到 payload metadata，不會取得或改寫 payload 原文。
+
+file transport 另外會要求 agent 把同一份 receipt JSON 寫入該輪 outbox 的 `_handoff_receipt.json`。畫面上的 receipt 仍是預設來源；只有在它被終端換行或重繪破壞時，runner 才改讀這個檔案，並因此省下一次 receipt repair 往返。這個檔案屬於 control plane：runner 不會把它列為 artifact，也不會轉交下一位 member。text transport 不使用它——該模式本來就不假設 runner 與 agent 共享 filesystem。

@@ -2,6 +2,11 @@
 // exposes opaque IDs rather than paths to workflow policy and coordinators.
 package artifact
 
+// ReceiptFileName is the runner-owned control file an agent may write in its
+// outbox instead of rendering the status receipt on screen. It belongs to the
+// control plane, so Collect never turns it into a forwardable artifact.
+const ReceiptFileName = "_handoff_receipt.json"
+
 type Limits struct {
 	MaxFilesPerTurn int
 	MaxFileBytes    int64

@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -557,45 +558,30 @@ func TestCompletionSettleRequiresStableLaterCapture(t *testing.T) {
 	start := time.Unix(100, 0)
 	settle := time.Second
 
-	if state.observe("screen-a", "envelope", false, start, settle) {
+	if state.observe("envelope-a", false, start, settle) {
 		t.Fatal("first validated capture must not commit the handoff")
 	}
-	if state.observe("screen-a", "envelope", false, start.Add(500*time.Millisecond), settle) {
+	if state.observe("envelope-a", false, start.Add(500*time.Millisecond), settle) {
 		t.Fatal("capture before settle duration unexpectedly committed the handoff")
 	}
-	if !state.observe("screen-a", "envelope", false, start.Add(time.Second), settle) {
+	if !state.observe("envelope-a", false, start.Add(time.Second), settle) {
 		t.Fatal("stable later capture did not commit the handoff")
 	}
 }
 
-func TestCompletionSettleResetsAfterRedraw(t *testing.T) {
+func TestCompletionSettleResetsWhenEnvelopeChanges(t *testing.T) {
 	var state completionSettleState
 	start := time.Unix(100, 0)
 	settle := time.Second
 
-	if state.observe("screen-a", "envelope", false, start, settle) {
+	if state.observe("envelope-a", false, start, settle) {
 		t.Fatal("first validated capture must not commit the handoff")
 	}
-	if state.observe("screen-b", "envelope", false, start.Add(time.Second), settle) {
-		t.Fatal("redrawn screen must reset the settle window")
+	if state.observe("envelope-b", false, start.Add(time.Second), settle) {
+		t.Fatal("a changed envelope must reset the settle window")
 	}
-	if !state.observe("screen-b", "envelope", false, start.Add(2*time.Second), settle) {
-		t.Fatal("stable capture after redraw did not commit the handoff")
-	}
-}
-
-func TestCompletionSettleCanUseEnvelopeAsGoalModeStabilityKey(t *testing.T) {
-	var state completionSettleState
-	start := time.Unix(100, 0)
-	settle := time.Second
-
-	// Goal-mode callers use the validated envelope as the screen key, so
-	// unrelated terminal redraws cannot postpone the handoff.
-	if state.observe("envelope", "envelope", false, start, settle) {
-		t.Fatal("first validated capture must not commit the handoff")
-	}
-	if !state.observe("envelope", "envelope", false, start.Add(time.Second), settle) {
-		t.Fatal("stable envelope did not commit the goal-mode handoff")
+	if !state.observe("envelope-b", false, start.Add(2*time.Second), settle) {
+		t.Fatal("stable capture after the change did not commit the handoff")
 	}
 }
 
@@ -656,7 +642,7 @@ func TestWaitForCompletionUsesScreenIdleFallbackWithoutMarker(t *testing.T) {
 	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", roundControlProtocol{}, func(_ context.Context, screen string) (string, error) {
 		fallbackCalls++
 		return "all fixes completed\nready for next task", nil
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -676,7 +662,7 @@ func TestWaitForCompletionUsesIdleValidReceiptWithoutDone(t *testing.T) {
 		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -701,7 +687,7 @@ func TestGoalModeClearsThenWaitsForIdleBeforeHandoff(t *testing.T) {
 	}()
 
 	started := time.Now()
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:1", "old prompt", protocol, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:1", "old prompt", protocol, nil, nil)
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -735,7 +721,7 @@ func TestGoalModeDoesNotRepeatClearWhileScreenIsStillChanging(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
-	_, _, _, err := waitForCompletionWithFallback(ctx, ex, "tgoal:changing", "old prompt", protocol, nil)
+	_, _, _, err := waitForCompletionWithFallback(ctx, ex, "tgoal:changing", "old prompt", protocol, nil, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForCompletionWithFallback() error = %v, want context deadline", err)
 	}
@@ -759,7 +745,7 @@ func TestGoalModeHandsOffAfterReceiptAndNativeGoalCompletionWithoutDone(t *testi
 		ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:native", "old prompt", protocol, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:native", "old prompt", protocol, nil, nil)
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -848,5 +834,80 @@ func TestRoundControlMarkersAreUnique(t *testing.T) {
 	oldOutput := "previous work\nHANDOFF_DONE\nHANDOFF_DONE__TMUXAI_old_1"
 	if done, _ := completionMarkers(oldOutput, first, "REVIEW_PASSED__TMUXAI_run123_1"); done {
 		t.Fatal("old completion markers completed a new round")
+	}
+}
+
+func TestWaitForCompletionSettlesWhileUnrelatedChromeRepaints(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "repaint", 1, "/tmp/outbox", true)
+	envelope := protocol.StatusMarker + ` {"version":1,"outcome":"success","summary":"done","tests":[]}` + "\n" + protocol.DoneMarker
+
+	captures := 0
+	ex := tmux.NewFakeExecutor()
+	ex.CaptureHook = func(string, int) (string, error) {
+		// Coding-agent TUIs repaint footer chrome on every frame. That must not
+		// postpone a completion whose envelope has already stopped changing.
+		captures++
+		return envelope + "\ncontext left: " + strconv.Itoa(100-captures) + "%", nil
+	}
+
+	oldInterval, oldTimeout, oldSettle := ppInterval, ppRoundTimeout, ppCompletionSettleTimeout
+	ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = 1, 3, 1
+	defer func() {
+		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
+	}()
+
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	if stopped || selected || output != envelope {
+		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
+	}
+}
+
+func TestWaitForCompletionUsesOutboxReceiptWhenScreenReceiptIsUnusable(t *testing.T) {
+	outbox := t.TempDir()
+	protocol := newRoundControlProtocol(handoffTransportFile, "outbox-fallback", 1, outbox, true)
+	if err := os.WriteFile(fileReceiptPath(protocol), []byte(`{"version":1,"outcome":"needs_followup","summary":"survived the terminal"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ex := tmux.NewFakeExecutor()
+	// The pane rendered the receipt marker across a wrap boundary, so nothing
+	// on screen can be parsed; only the completion marker survived intact.
+	ex.Captures["trec:2"] = "HANDOFF_STATUS__TMUXAI_outbox-\nfallback_1 {\"version\":1,\"outcome\":\n\"needs_followup\"}\n" + protocol.DoneMarker
+
+	oldInterval, oldTimeout, oldSettle := ppInterval, ppRoundTimeout, ppCompletionSettleTimeout
+	ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = 1, 3, 0
+	defer func() {
+		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
+	}()
+
+	output, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	status, err := parseHandoffStatus(output, protocol.StatusMarker)
+	if err != nil {
+		t.Fatalf("recovered output did not parse: %v (output=%q)", err, output)
+	}
+	if status.Summary != "survived the terminal" {
+		t.Fatalf("status = %#v", status)
+	}
+}
+
+func TestWaitForCompletionKeepsPollingWhenNeitherReceiptExists(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "no-receipt", 1, t.TempDir(), true)
+	ex := tmux.NewFakeExecutor()
+	ex.Captures["trec:2"] = "work finished\n" + protocol.DoneMarker
+
+	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 1, 0
+	defer func() {
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+	}()
+
+	if _, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil); err == nil {
+		t.Fatal("a completion marker with no receipt anywhere was accepted")
 	}
 }

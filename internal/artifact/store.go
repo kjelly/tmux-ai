@@ -117,6 +117,11 @@ func (s *fileStore) Collect(memberID string, round int, outbox string, claims []
 		if d.IsDir() {
 			return nil
 		}
+		// The receipt is control-plane state the runner asked for; it must not
+		// be snapshotted, counted against artifact limits, or relayed onwards.
+		if rel == ReceiptFileName {
+			return nil
+		}
 		info, err := d.Info()
 		if err != nil {
 			return err

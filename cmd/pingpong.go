@@ -81,6 +81,7 @@ var (
 	ppAllowLargeRelay         bool
 	ppDryRun                  bool
 	ppNewSession              bool
+	ppPaneStream              bool
 	ppPresetHandoff           handoffPresetConfig
 
 	// Role-based division of labour
@@ -226,6 +227,7 @@ func init() {
 	pingpongCmd.Flags().BoolVar(&ppAllowLargeRelay, "allow-large-relay", false, "Explicitly allow prompts above --approval-threshold-bytes")
 	pingpongCmd.Flags().BoolVar(&ppDryRun, "dry-run", false, "Prepare and print the initial handoff without sending to tmux")
 	pingpongCmd.Flags().BoolVar(&ppNewSession, "new", false, "Send /new to every participating pane before starting the workflow")
+	pingpongCmd.Flags().BoolVar(&ppPaneStream, "pane-stream", false, "Mirror pane output through tmux pipe-pane and recover completions the pane capture lost")
 
 	addHandoffFlags(pingpongCmd)
 
@@ -441,6 +443,7 @@ type pingPongPreset struct {
 	SubmitDelay         int      `yaml:"submit_delay"`
 	Lines               int      `yaml:"lines"`
 	NewSession          bool     `yaml:"new_session"`
+	PaneStream          bool     `yaml:"pane_stream"`
 }
 
 func resolvePingPongPresetInitial(preset pingPongPreset, start string) (string, error) {
@@ -538,6 +541,9 @@ func applyPingPongPreset() error {
 	}
 	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
 		ppNewSession = preset.NewSession
+	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("pane-stream") {
+		ppPaneStream = preset.PaneStream
 	}
 	return nil
 }
@@ -928,27 +934,33 @@ func controlMarkerInstruction(done, stop string) string {
 // every round complete immediately.
 // If the per-round timeout is reached, returns an error.
 func waitForCompletion(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol) (string, bool, error) {
-	output, stopped, _, err := waitForCompletionWithFallback(ctx, ex, paneID, baseline, protocol, nil)
+	output, stopped, _, err := waitForCompletionWithFallback(ctx, ex, paneID, baseline, protocol, nil, nil)
 	return output, stopped, err
 }
 
 // completionSettleState implements the runner-local second validation phase.
 // The agent still emits one response: after its nonce-bound envelope passes
-// local protocol validation, a later identical pane capture commits it for
-// handoff. Any redraw resets the settle window.
+// local protocol validation, a later identical observation of that envelope
+// commits it for handoff.
+//
+// The stability key is deliberately the validated envelope rather than the
+// whole capture. The envelope is nonce-bound and self-delimiting, so it is
+// already proof that the turn finished rendering; requiring the entire pane to
+// be byte-identical would let any repainting UI chrome — elapsed timers, token
+// counters, rotating footer hints — hold a completed turn until the round
+// timeout.
 type completionSettleState struct {
-	screen, envelope string
-	stopped          bool
-	observedAt       time.Time
-	captures         int
+	envelope   string
+	stopped    bool
+	observedAt time.Time
+	captures   int
 }
 
-func (s *completionSettleState) observe(screen, envelope string, stopped bool, now time.Time, settle time.Duration) bool {
+func (s *completionSettleState) observe(envelope string, stopped bool, now time.Time, settle time.Duration) bool {
 	if settle <= 0 {
 		return true
 	}
-	if s.captures == 0 || s.screen != screen || s.envelope != envelope || s.stopped != stopped {
-		s.screen = screen
+	if s.captures == 0 || s.envelope != envelope || s.stopped != stopped {
 		s.envelope = envelope
 		s.stopped = stopped
 		s.observedAt = now
@@ -965,7 +977,7 @@ func (s *completionSettleState) observe(screen, envelope string, stopped bool, n
 // selector only after the entire pane has remained unchanged for a bounded
 // period.  A selector cannot fabricate text: it returns a slice of the actual
 // captured screen, and an empty slice means "still working".
-func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error)) (string, bool, bool, error) {
+func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error), stream *paneStream) (string, bool, bool, error) {
 	interval := time.Duration(ppInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -987,6 +999,48 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 	var goalDoneOutput string
 	var receiptWaitAnnounced bool
 	var completionSettle completionSettleState
+
+	// commitCompletion validates a detected completion marker and holds it in
+	// the settle window until the envelope is observed twice. ready=false means
+	// the runner must keep polling; goal members always take that path once,
+	// because their native goal has to be cleared before any handoff. found
+	// reports whether a usable envelope was recovered at all, so a caller that
+	// has weaker evidence can fall through to the remaining fallbacks instead
+	// of waiting out the round on a completion it cannot validate.
+	commitCompletion := func(content string, envelopeProtocol roundControlProtocol, stopped, compatible bool) (string, bool, bool, error) {
+		envelope, valid := extractCompletedProtocolEnvelope(content, envelopeProtocol)
+		if !valid {
+			// File transport may carry the receipt in the runner-owned outbox,
+			// which no terminal rendering can damage. Prefer the pane when it
+			// parses, and fall back to the file before declaring the receipt
+			// missing.
+			synthesized, ok := fileReceiptEnvelope(protocol)
+			if !ok {
+				return "", false, false, nil
+			}
+			envelope = synthesized
+		}
+		verified := detectedCompletionMarker(stopped)
+		if compatible {
+			verified = "相容的" + verified
+		}
+		if protocol.GoalMode {
+			if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+				return "", false, true, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
+			}
+			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
+			fmt.Printf("✅ Pane %s 已驗證 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, verified, completionIdleDuration())
+			return "", false, true, nil
+		}
+		if completionSettle.captures == 0 || completionSettle.envelope != envelope {
+			fmt.Printf("✅ Pane %s 已驗證 %s；等待完成 envelope 穩定 %s\n", paneID, verified, completionSettleDuration())
+		}
+		if completionSettle.observe(envelope, stopped, time.Now(), completionSettleDuration()) {
+			fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
+			return envelope, true, true, nil
+		}
+		return "", false, true, nil
+	}
 
 	for {
 		select {
@@ -1046,30 +1100,11 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			if !protocol.RequireStatus {
 				return newContent, stopped, false, nil
 			}
-			envelope, valid := extractCompletedProtocolEnvelope(content, protocol)
-			if !valid {
-				continue
+			envelope, ready, _, err := commitCompletion(content, protocol, stopped, false)
+			if err != nil {
+				return "", false, false, err
 			}
-			if protocol.GoalMode {
-				if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
-					return "", false, false, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
-				}
-				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
-				fmt.Printf("✅ Pane %s 已驗證 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
-				continue
-			}
-			settleScreen := content
-			if protocol.GoalMode {
-				// A Codex goal may continue repainting explanatory UI after it has
-				// emitted its nonce-bound receipt. For a goal handoff the validated
-				// envelope, not unrelated terminal redraws, is the stable value.
-				settleScreen = envelope
-			}
-			if completionSettle.captures == 0 || completionSettle.screen != settleScreen {
-				fmt.Printf("✅ Pane %s 已驗證 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
-			}
-			if completionSettle.observe(settleScreen, envelope, stopped, time.Now(), completionSettleDuration()) {
-				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
+			if ready {
 				return envelope, stopped, false, nil
 			}
 			continue
@@ -1088,30 +1123,42 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			baseProtocol := protocol
 			baseProtocol.DoneMarker = ppDone
 			baseProtocol.StopMarker = ppStop
-			envelope, valid := extractCompletedProtocolEnvelope(content, baseProtocol)
-			if !valid {
-				continue
+			envelope, ready, _, err := commitCompletion(content, baseProtocol, stopped, true)
+			if err != nil {
+				return "", false, false, err
 			}
-			if protocol.GoalMode {
-				if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
-					return "", false, false, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
-				}
-				goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
-				fmt.Printf("✅ Pane %s 已驗證相容的 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, detectedCompletionMarker(stopped), completionIdleDuration())
-				continue
-			}
-			settleScreen := content
-			if protocol.GoalMode {
-				settleScreen = envelope
-			}
-			if completionSettle.captures == 0 || completionSettle.screen != settleScreen {
-				fmt.Printf("✅ Pane %s 已驗證相容的 %s；等待完成 envelope 穩定 %s\n", paneID, detectedCompletionMarker(stopped), completionSettleDuration())
-			}
-			if completionSettle.observe(settleScreen, envelope, stopped, time.Now(), completionSettleDuration()) {
-				fmt.Printf("✅ Pane %s 的完成 envelope 已穩定，開始處理本輪結果\n", paneID)
+			if ready {
 				return envelope, stopped, false, nil
 			}
 			continue
+		}
+		// The pane only shows what currently fits and what the TUI last
+		// painted. A completion that scrolled out of an alternate screen, or
+		// that was repainted away between two polls, is still in the pane's
+		// output stream. It goes through the same envelope extractor as the
+		// capture, so the stream can only recover a completion that really was
+		// rendered.
+		if streamText, ok := stream.snapshot(); ok {
+			streamControl := streamText
+			if protocol.Transport == handoffTransportText {
+				streamControl = stripTextFrame(streamText, protocol.TextBeginMarker, protocol.TextEndMarker)
+			}
+			if done, stopped := completionMarkers(streamControl, protocol.DoneMarker, protocol.StopMarker); done {
+				envelope, ready, found, err := commitCompletion(streamText, protocol, stopped, false)
+				if err != nil {
+					return "", false, false, err
+				}
+				if ready {
+					fmt.Printf("📼 Pane %s 的完成 envelope 由 pane output stream 還原\n", paneID)
+					return envelope, stopped, false, nil
+				}
+				// Without a validated envelope the stream has only seen a
+				// marker. That is weaker evidence than the pane capture, so it
+				// must not keep the remaining fallbacks from running.
+				if found {
+					continue
+				}
+			}
 		}
 		// A valid, nonce-bound receipt is stronger evidence than an arbitrary
 		// terminal screen. A non-strict goal turn may also finish without the
@@ -1127,16 +1174,27 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			fmt.Printf("✅ Pane %s 已驗證有效 status receipt 與 native goal 完成狀態；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, completionIdleDuration())
 			continue
 		}
+		// A receipt written to the runner-owned outbox is exactly as
+		// authoritative as one rendered in the pane, and terminal rendering
+		// cannot damage it. Goal members keep needing the native completion
+		// state checked above, so this only relaxes the normal path.
+		fileEnvelope, fileReceipt := "", false
+		if !receiptValid && !protocol.GoalMode {
+			fileEnvelope, fileReceipt = fileReceiptEnvelope(protocol)
+		}
 		// If an agent omits DONE, normal members can use the configured idle
 		// fallback after a schema-valid receipt. Goal members additionally need
 		// the explicit native completion state checked above.
-		if ppReceiptIdleTimeout > 0 && receiptValid {
+		if ppReceiptIdleTimeout > 0 && (receiptValid || fileReceipt) {
 			if !receiptWaitAnnounced {
 				fmt.Printf("🧾 Pane %s 已偵測到有效 status receipt，但尚未偵測到完成標記；等待畫面連續穩定 %s\n", paneID, completionIdleDuration())
 				receiptWaitAnnounced = true
 			}
 			if !protocol.GoalMode && time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
 				fmt.Printf("✅ Pane %s 已連續穩定 %s，使用 status receipt 處理本輪結果\n", paneID, completionIdleDuration())
+				if fileReceipt {
+					return fileEnvelope, false, false, nil
+				}
 				return newContent, false, false, nil
 			}
 		}
@@ -1204,7 +1262,7 @@ func hasValidStatusReceipt(output string, protocol roundControlProtocol) bool {
 	if !protocol.RequireStatus || protocol.StatusMarker == "" {
 		return false
 	}
-	_, err := parseHandoffStatus(output, protocol.StatusMarker)
+	_, err := parseProtocolStatus(output, protocol)
 	return err == nil
 }
 
@@ -1278,7 +1336,7 @@ func extractCompletedProtocolEnvelope(content string, protocol roundControlProto
 			return "", false
 		}
 	} else if protocol.RequireStatus {
-		block, err := extractHandoffStatusBlock(strings.Join(lines[segmentStart:completionAt], "\n"), protocol.StatusMarker)
+		block, err := extractProtocolStatusBlock(strings.Join(lines[segmentStart:completionAt], "\n"), protocol)
 		if err != nil {
 			return "", false
 		}
@@ -1293,7 +1351,7 @@ func extractCompletedProtocolEnvelope(content string, protocol roundControlProto
 		if protocol.Transport == handoffTransportText {
 			statusOutput = stripTextFrame(envelope, protocol.TextBeginMarker, protocol.TextEndMarker)
 		}
-		if _, err := parseHandoffStatus(statusOutput, protocol.StatusMarker); err != nil {
+		if _, err := parseProtocolStatus(statusOutput, protocol); err != nil {
 			return "", false
 		}
 	}

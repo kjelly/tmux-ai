@@ -2,7 +2,10 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -50,13 +53,99 @@ func statusMarker(runToken string, round int) string {
 	return fmt.Sprintf("HANDOFF_STATUS__TMUXAI_%s_%d", runToken, round)
 }
 
+func statusFrameMarkers(runToken string, round int) (string, string) {
+	prefix := fmt.Sprintf("TMUXAI_%s_%d", runToken, round)
+	return "HANDOFF_STATUS_BEGIN__" + prefix, "HANDOFF_STATUS_END__" + prefix
+}
+
+// parseProtocolStatus reads this round's receipt in either supported shape:
+// the framed form the runner asks for, or the legacy single line that carries
+// the marker and the JSON together. Runner-synthesized receipts also use the
+// legacy shape, since nothing renders them.
+func parseProtocolStatus(output string, p roundControlProtocol) (*handoffStatus, error) {
+	block, err := extractProtocolStatusBlock(output, p)
+	if err != nil {
+		return nil, err
+	}
+	return decodeHandoffStatus([]byte(block.JSON))
+}
+
+func extractProtocolStatusBlock(output string, p roundControlProtocol) (handoffStatusBlock, error) {
+	if p.StatusBeginMarker == "" || p.StatusEndMarker == "" {
+		return extractHandoffStatusBlock(output, p.StatusMarker)
+	}
+	block, frameErr := extractFramedStatusBlock(output, p.StatusBeginMarker, p.StatusEndMarker)
+	if frameErr == nil {
+		return block, nil
+	}
+	block, inlineErr := extractHandoffStatusBlock(output, p.StatusMarker)
+	if inlineErr == nil {
+		return block, nil
+	}
+	// A frame that was found but did not hold a usable object is the more
+	// specific diagnosis; fall back to the inline error only when no frame was
+	// present at all.
+	if !errors.Is(frameErr, errNoStatusFrame) {
+		return handoffStatusBlock{}, frameErr
+	}
+	return handoffStatusBlock{}, inlineErr
+}
+
+var errNoStatusFrame = errors.New("no handoff status frame")
+
+// extractFramedStatusBlock binds the receipt to the newest complete frame.
+// Newest-wins matches how completion markers are resolved and keeps an echoed
+// or repainted earlier frame from making the current receipt unreadable.
+func extractFramedStatusBlock(output, begin, end string) (handoffStatusBlock, error) {
+	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
+	endAt := -1
+	for i, line := range lines {
+		if protocolMarkerLine(line, end) {
+			endAt = i
+		}
+	}
+	if endAt < 0 {
+		return handoffStatusBlock{}, fmt.Errorf("%w %s", errNoStatusFrame, end)
+	}
+	beginAt := -1
+	for i := endAt - 1; i >= 0; i-- {
+		if protocolMarkerLine(lines[i], begin) {
+			beginAt = i
+			break
+		}
+	}
+	if beginAt < 0 {
+		return handoffStatusBlock{}, fmt.Errorf("%w: missing begin marker %s", errNoStatusFrame, begin)
+	}
+	closingPrefix, _, _ := matchProtocolMarker(lines[endAt], end, false)
+	var joined strings.Builder
+	for _, line := range lines[beginAt+1 : endAt] {
+		joined.WriteString(stripPresentationContinuation(line, closingPrefix))
+		joined.WriteByte('\n')
+		if joined.Len() > 16*1024 {
+			return handoffStatusBlock{}, fmt.Errorf("handoff status frame %s exceeds the size limit", begin)
+		}
+	}
+	object, ok := completeJSONObject(joined.String())
+	if !ok {
+		return handoffStatusBlock{}, fmt.Errorf("handoff status frame %s does not contain a JSON object", begin)
+	}
+	return handoffStatusBlock{JSON: object, Start: beginAt, End: endAt}, nil
+}
+
 func parseHandoffStatus(output, marker string) (*handoffStatus, error) {
 	block, err := extractHandoffStatusBlock(output, marker)
 	if err != nil {
 		return nil, err
 	}
+	return decodeHandoffStatus([]byte(block.JSON))
+}
+
+// decodeHandoffStatus applies the same schema validation to a receipt whether
+// it was recovered from the pane or read from the outbox receipt file.
+func decodeHandoffStatus(data []byte) (*handoffStatus, error) {
 	var status handoffStatus
-	if err := json.Unmarshal([]byte(block.JSON), &status); err != nil {
+	if err := json.Unmarshal(data, &status); err != nil {
 		return nil, fmt.Errorf("parse handoff status: %w", err)
 	}
 	if status.Version != 1 {
@@ -74,6 +163,70 @@ func parseHandoffStatus(output, marker string) (*handoffStatus, error) {
 type handoffStatusBlock struct {
 	JSON       string
 	Start, End int
+}
+
+const maxFileReceiptBytes = 64 * 1024
+
+// fileReceiptPath returns the outbox receipt file for a file-transport round.
+// File transport already requires the runner and the agent to share a
+// filesystem, so this adds no precondition of its own; text transport, which
+// carries no such requirement, never uses it.
+func fileReceiptPath(p roundControlProtocol) string {
+	if p.Transport != handoffTransportFile || p.Outbox == "" {
+		return ""
+	}
+	return filepath.Join(p.Outbox, artifact.ReceiptFileName)
+}
+
+// readFileReceipt loads the receipt an agent wrote to its outbox instead of, or
+// in addition to, rendering it in the pane. The outbox is created per member
+// and per round, so the file is already scoped to this turn and needs no
+// separate nonce.
+func readFileReceipt(p roundControlProtocol) (*handoffStatus, error) {
+	path := fileReceiptPath(p)
+	if path == "" {
+		return nil, fmt.Errorf("receipt file requires file transport")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("receipt file %s is not a regular file", path)
+	}
+	if info.Size() > maxFileReceiptBytes {
+		return nil, fmt.Errorf("receipt file %s exceeds %d bytes", path, maxFileReceiptBytes)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	status, err := decodeHandoffStatus(data)
+	if err != nil {
+		return nil, fmt.Errorf("receipt file %s: %w", path, err)
+	}
+	// Artifact discovery stays runner-owned: the outbox scan is the authority,
+	// so a claimed path here must not reach the coordinator.
+	status.Artifacts = nil
+	return status, nil
+}
+
+// fileReceiptEnvelope renders a validated outbox receipt in the same on-screen
+// form the rest of the pipeline parses, so a file receipt and a pane receipt
+// converge on one code path.
+func fileReceiptEnvelope(p roundControlProtocol) (string, bool) {
+	if !p.RequireStatus || p.StatusMarker == "" {
+		return "", false
+	}
+	status, err := readFileReceipt(p)
+	if err != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		return "", false
+	}
+	return p.StatusMarker + " " + string(encoded), true
 }
 
 // receiptRepairProtocol bounds a replacement receipt after a completed file
@@ -95,7 +248,7 @@ func newReceiptRepairProtocol(original roundControlProtocol, token string) recei
 // frame. The receipt retains the original round's status marker: that marker
 // remains the binding between the repaired control plane and its artifact
 // outbox.
-func parseReceiptRepair(output, originalStatusMarker string, repair receiptRepairProtocol) (*handoffStatus, error) {
+func parseReceiptRepair(output string, original roundControlProtocol, repair receiptRepairProtocol) (*handoffStatus, error) {
 	lines := strings.Split(strings.ReplaceAll(output, "\r\n", "\n"), "\n")
 	doneAt := -1
 	for i, line := range lines {
@@ -120,7 +273,7 @@ func parseReceiptRepair(output, originalStatusMarker string, repair receiptRepai
 	if beginAt < 0 {
 		return nil, fmt.Errorf("missing receipt repair begin marker %s", repair.BeginMarker)
 	}
-	return parseHandoffStatus(strings.Join(lines[beginAt+1:doneAt], "\n"), originalStatusMarker)
+	return parseProtocolStatus(strings.Join(lines[beginAt+1:doneAt], "\n"), original)
 }
 
 func extractHandoffStatusBlock(output, marker string) (handoffStatusBlock, error) {
@@ -197,15 +350,26 @@ func matchProtocolMarker(line, marker string, allowRemainder bool) (prefix, rema
 	}
 	prefix, remainder = line[:at], line[at+len(marker):]
 	if allowRemainder {
-		if remainder == "" || !unicode.IsSpace(rune(remainder[0])) {
+		// A standalone marker line already tolerates markdown emphasis. Apply
+		// the same tolerance before the payload so an agent that renders
+		// "**MARKER** {json}" is not treated as having omitted its receipt.
+		// The separating whitespace is still required, so a longer marker
+		// sharing this prefix (round 11 vs round 1) cannot match.
+		remainder = strings.TrimLeft(remainder, markerDecoration)
+		first, _ := utf8.DecodeRuneInString(remainder)
+		if remainder == "" || !unicode.IsSpace(first) {
 			return "", "", false
 		}
 		return prefix, remainder, true
 	}
 	remainder = strings.TrimSpace(remainder)
-	remainder = strings.Trim(remainder, "*_~`")
+	remainder = strings.Trim(remainder, markerDecoration)
 	return prefix, remainder, remainder == ""
 }
+
+// markerDecoration lists the inline markdown characters agents wrap protocol
+// markers in. It deliberately excludes anything that can begin a JSON value.
+const markerDecoration = "*_~`"
 
 func isProtocolPresentationPrefix(value string) bool {
 	for _, r := range value {
@@ -293,7 +457,7 @@ func removeProtocolLines(output string, protocol roundControlProtocol) string {
 	var result []string
 	inText := false
 	statusStart, statusEnd := -1, -1
-	if block, err := extractHandoffStatusBlock(maskTextFrame(output, protocol.TextBeginMarker, protocol.TextEndMarker), protocol.StatusMarker); err == nil {
+	if block, err := extractProtocolStatusBlock(maskTextFrame(output, protocol.TextBeginMarker, protocol.TextEndMarker), protocol); err == nil {
 		statusStart, statusEnd = block.Start, block.End
 	}
 	for i, line := range strings.Split(output, "\n") {
@@ -305,7 +469,7 @@ func removeProtocolLines(output string, protocol roundControlProtocol) string {
 			inText = false
 			continue
 		}
-		if inText || (i >= statusStart && i <= statusEnd) || protocolMarkerLine(line, protocol.GoalDoneMarker) || protocolMarkerLine(line, protocol.DoneMarker) || protocolMarkerLine(line, protocol.StopMarker) {
+		if inText || (i >= statusStart && i <= statusEnd) || protocolMarkerLine(line, protocol.StatusBeginMarker) || protocolMarkerLine(line, protocol.StatusEndMarker) || protocolMarkerLine(line, protocol.GoalDoneMarker) || protocolMarkerLine(line, protocol.DoneMarker) || protocolMarkerLine(line, protocol.StopMarker) {
 			continue
 		}
 		result = append(result, line)

@@ -31,6 +31,7 @@ type coordinatePreset struct {
 	MaxSelectionRetries int                `yaml:"max_selection_retries"`
 	CompletionSettleMS  *int               `yaml:"completion_settle_ms"`
 	NewSession          bool               `yaml:"new_session"`
+	PaneStream          bool               `yaml:"pane_stream"`
 	Members             []coordinateMember `yaml:"members"`
 }
 
@@ -89,6 +90,7 @@ func init() {
 	coordinateCmd.Flags().BoolVar(&ppAllowLargeRelay, "allow-large-relay", false, "Allow prompts above the approval threshold")
 	coordinateCmd.Flags().BoolVar(&ppDryRun, "dry-run", false, "Print the first handoff without sending it")
 	coordinateCmd.Flags().BoolVar(&ppNewSession, "new", false, "Send /new to every participating pane before starting the workflow")
+	coordinateCmd.Flags().BoolVar(&ppPaneStream, "pane-stream", false, "Mirror pane output through tmux pipe-pane and recover completions the pane capture lost")
 	addHandoffFlags(coordinateCmd)
 	_ = coordinateCmd.MarkFlagRequired("preset")
 }
@@ -164,6 +166,9 @@ func runCoordinate() error {
 	}
 	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
 		ppNewSession = preset.NewSession
+	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("pane-stream") {
+		ppPaneStream = preset.PaneStream
 	}
 	if initial == "" {
 		initial = strings.TrimSpace(preset.Initial)

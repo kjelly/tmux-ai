@@ -50,11 +50,25 @@ func (e *executorImpl) CapturePane(paneID string, lines int) (string, error) {
 	if lines <= 0 {
 		lines = 100
 	}
-	out, err := e.exec("capture-pane", "-p", "-t", paneID, "-S", fmt.Sprintf("-%d", lines))
+	// -J rejoins lines the terminal hard-wrapped at the pane width. Without it
+	// a receipt marker split across the wrap boundary becomes unmatchable, so
+	// a completed turn looks like a missing receipt.
+	out, err := e.exec("capture-pane", "-p", "-J", "-t", paneID, "-S", fmt.Sprintf("-%d", lines))
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimRight(out, "\n"), nil
+	return trimLineEnds(strings.TrimRight(out, "\n")), nil
+}
+
+// trimLineEnds restores the trailing-space trimming that capture-pane applies
+// on its own but -J turns off. Keeping captures free of padding preserves the
+// previous relay content and keeps screen-stability comparisons meaningful.
+func trimLineEnds(content string) string {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		lines[i] = strings.TrimRight(line, " \t")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (e *executorImpl) CapturePaneClean(paneID string, lines int) (string, error) {

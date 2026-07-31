@@ -91,3 +91,12 @@ func TestMixedTextAndControlPreservesOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestTrimLineEndsRestoresCapturePaneTrimming(t *testing.T) {
+	// capture-pane -J keeps the padding tmux normally strips, which would make
+	// every screen comparison and relayed line carry pane-width whitespace.
+	got := trimLineEnds("marker  \n  indented\t\nplain")
+	if want := "marker\n  indented\nplain"; got != want {
+		t.Fatalf("trimLineEnds() = %q, want %q", got, want)
+	}
+}

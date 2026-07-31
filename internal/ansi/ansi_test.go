@@ -1,6 +1,9 @@
 package ansi
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestStrip(t *testing.T) {
 	cases := []struct {
@@ -23,5 +26,35 @@ func TestStrip(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: got %q, want %q", c.name, got, c.want)
 		}
+	}
+}
+
+func TestNormalizeStreamSplitsRepaintedRows(t *testing.T) {
+	// A full-screen TUI separates rows with cursor motion, not newlines.
+	raw := "\x1b[2J\x1b[1;1H\x1b[32mDONE_MARKER\x1b[0m\x1b[2;1Hnext row\rrewritten row"
+	got := NormalizeStream(raw)
+	want := []string{"DONE_MARKER", "next row", "rewritten row"}
+	lines := strings.Split(got, "\n")
+	for _, w := range want {
+		found := false
+		for _, line := range lines {
+			if line == w {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("NormalizeStream() = %q, missing standalone line %q", got, w)
+		}
+	}
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("NormalizeStream() left escape bytes: %q", got)
+	}
+}
+
+func TestNormalizeStreamKeepsColumnsApartAndDropsOSC(t *testing.T) {
+	got := NormalizeStream("left\x1b[4Cright\x1b]0;window title\x07 end")
+	if got != "left right end" {
+		t.Fatalf("NormalizeStream() = %q", got)
 	}
 }
