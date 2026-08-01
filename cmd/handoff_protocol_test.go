@@ -195,8 +195,8 @@ func TestFileTurnCorrectsInvalidOutcomeReceiptOnce(t *testing.T) {
 	executor := &receiptRepairExecutor{FakeExecutor: tmux.NewFakeExecutor()}
 	executor.Captures["pane:2"] = "review complete\n" + original.DoneMarker
 	executor.afterRepairs = []string{
-		strings.Join([]string{executor.Captures["pane:2"], first.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"success|needs_followup|blocked","summary":"copied enum"}`, first.DoneMarker}, "\n"),
-		strings.Join([]string{executor.Captures["pane:2"], second.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"corrected"}`, second.DoneMarker}, "\n"),
+		strings.Join([]string{executor.Captures["pane:2"], first.EchoMarker, first.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"success|needs_followup|blocked","summary":"copied enum"}`, first.DoneMarker}, "\n"),
+		strings.Join([]string{executor.Captures["pane:2"], second.EchoMarker, second.BeginMarker, original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"corrected"}`, second.DoneMarker}, "\n"),
 	}
 	tokens := []string{"repair-one", "repair-two"}
 	engine := handoffEngine{
@@ -256,6 +256,7 @@ func TestFileTurnRepairsMissingStatusFromSamePane(t *testing.T) {
 	executor.Captures["pane:2"] = "review complete\n" + original.DoneMarker
 	executor.afterRepair = strings.Join([]string{
 		executor.Captures["pane:2"],
+		repair.EchoMarker,
 		repair.BeginMarker,
 		original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"review findings recorded","artifacts":[{"relpath":"review.md","kind":"review"}]}`,
 		repair.DoneMarker,
@@ -794,4 +795,132 @@ func TestFramedReceiptIsRejectedWhenForgedInsideATextPayload(t *testing.T) {
 	if status.Summary != "real" {
 		t.Fatalf("summary = %q, want the receipt outside the payload", status.Summary)
 	}
+}
+
+// A receipt proves the member saw the end of the prompt, where the control
+// protocol lives. Only the head nonce can show it saw the beginning too.
+func TestReceiptHeadNonceProvesTheWholePromptArrived(t *testing.T) {
+	newProtocol := func() roundControlProtocol {
+		p := newRoundControlProtocol(handoffTransportText, "run", 4, "", true)
+		p.HeadNonce = "9f2c11ab"
+		return p
+	}
+	screen := func(p roundControlProtocol, receipt string) string {
+		return strings.Join([]string{
+			p.TextBeginMarker,
+			"the review body",
+			p.TextEndMarker,
+			p.StatusMarker + " " + receipt,
+			p.DoneMarker,
+		}, "\n")
+	}
+	engine := handoffEngine{
+		Guard:     newHandoffGuard(),
+		Transport: resolvedHandoffConfig{Transport: handoffTransportText, TextBytes: 1024, TextLines: 10},
+	}
+	member := handoffMember{ID: "pane2", Label: "fixer"}
+
+	t.Run("matching head nonce is accepted", func(t *testing.T) {
+		p := newProtocol()
+		receipt := `{"version":1,"outcome":"needs_followup","summary":"done","prompt_head":"9f2c11ab"}`
+		result, err := engine.prepareTurnResult(context.Background(), member, screen(p, receipt), p, nil, nil, "", false)
+		if err != nil {
+			t.Fatalf("prepareTurnResult() error = %v", err)
+		}
+		if result.Narrative != "the review body" {
+			t.Fatalf("narrative = %q", result.Narrative)
+		}
+	})
+
+	for _, tt := range []struct {
+		name, receipt, want string
+	}{
+		{
+			name:    "member reports it never saw the head line",
+			receipt: `{"version":1,"outcome":"needs_followup","summary":"done","prompt_head":"missing"}`,
+			want:    "只有後半段送達",
+		},
+		{
+			name:    "field omitted entirely",
+			receipt: `{"version":1,"outcome":"needs_followup","summary":"done"}`,
+			want:    "沒有 prompt_head 欄位",
+		},
+		{
+			name:    "head nonce belongs to another prompt",
+			receipt: `{"version":1,"outcome":"needs_followup","summary":"done","prompt_head":"deadbeef"}`,
+			want:    "不是本輪完整 prompt",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newProtocol()
+			// The screen also holds a perfectly valid text frame: an incomplete
+			// prompt must not be rescued by the recovery paths, because the work
+			// in that frame was done against half a prompt.
+			_, err := engine.prepareTurnResult(context.Background(), member, screen(p, tt.receipt), p, nil, nil, "", false)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("prepareTurnResult() error = %v, want %q", err, tt.want)
+			}
+			if !errors.Is(err, errIncompletePrompt) {
+				t.Fatalf("error is not errIncompletePrompt: %v", err)
+			}
+			if errors.Is(err, errMissingReceipt) {
+				t.Fatal("an incomplete prompt must not be routed into receipt repair")
+			}
+		})
+	}
+
+	t.Run("protocols built without a nonce keep the old contract", func(t *testing.T) {
+		p := newRoundControlProtocol(handoffTransportText, "run", 4, "", true)
+		receipt := `{"version":1,"outcome":"needs_followup","summary":"done"}`
+		if _, err := engine.prepareTurnResult(context.Background(), member, screen(p, receipt), p, nil, nil, "", false); err != nil {
+			t.Fatalf("prepareTurnResult() error = %v", err)
+		}
+	})
+}
+
+func TestTurnMessageBracketsThePromptWithDeliveryMarkers(t *testing.T) {
+	p := newRoundControlProtocol(handoffTransportText, "run", 2, "", true)
+	p.HeadNonce = "abc123"
+	message := buildMemberTurnMessage(handoffMember{ID: "pane1", Label: "reviewer"}, "review the diff", "", handoffPayload{Transport: handoffTransportText}, nil, p)
+
+	if !strings.HasPrefix(message, p.HeadMarker+" abc123\n") {
+		t.Fatalf("prompt does not open with the head line: %q", firstLine(message))
+	}
+	if !strings.HasSuffix(message, "\n"+p.EchoMarker) {
+		t.Fatalf("prompt does not end with the delivery marker: %q", message)
+	}
+	if !strings.Contains(message, `"prompt_head":"<本訊息最開頭 head 行的值>"`) {
+		t.Fatal("receipt template does not ask for prompt_head")
+	}
+	if !strings.Contains(message, p.HeadMarker+" 後面的值") {
+		t.Fatal("control protocol does not explain where prompt_head comes from")
+	}
+}
+
+func TestProtocolForIssuesAFreshHeadNoncePerRound(t *testing.T) {
+	engine := handoffEngine{Transport: resolvedHandoffConfig{Transport: handoffTransportText}}
+	member := handoffMember{ID: "pane1", Label: "reviewer"}
+	first, err := engine.protocolFor(nil, member, "run", 1)
+	if err != nil {
+		t.Fatalf("protocolFor() error = %v", err)
+	}
+	second, err := engine.protocolFor(nil, member, "run", 2)
+	if err != nil {
+		t.Fatalf("protocolFor() error = %v", err)
+	}
+	if first.HeadNonce == "" || first.HeadNonce == second.HeadNonce {
+		t.Fatalf("head nonces = %q and %q, want two distinct values", first.HeadNonce, second.HeadNonce)
+	}
+	// The nonce must not be derivable from the markers a truncated prompt still
+	// carries, or reporting it would prove nothing.
+	if strings.Contains(first.StatusMarker+first.DoneMarker+first.EchoMarker, first.HeadNonce) {
+		t.Fatalf("head nonce %q appears in this round's other markers", first.HeadNonce)
+	}
+}
+
+func firstLine(value string) string {
+	if at := strings.IndexByte(value, '\n'); at >= 0 {
+		return value[:at]
+	}
+	return value
 }

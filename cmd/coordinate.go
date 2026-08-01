@@ -30,6 +30,8 @@ type coordinatePreset struct {
 	StopMembers         []string           `yaml:"stop_members"`
 	MaxSelectionRetries int                `yaml:"max_selection_retries"`
 	CompletionSettleMS  *int               `yaml:"completion_settle_ms"`
+	PasteChunkSize      int                `yaml:"paste_chunk_size"`
+	PasteChunkDelayMS   *int               `yaml:"paste_chunk_delay_ms"`
 	NewSession          bool               `yaml:"new_session"`
 	PaneStream          bool               `yaml:"pane_stream"`
 	Members             []coordinateMember `yaml:"members"`
@@ -76,8 +78,14 @@ func init() {
 	coordinateCmd.Flags().StringSliceVar(&ppStopMembers, "stop-members", nil, "Member IDs allowed to approve coordinator stop")
 	coordinateCmd.Flags().IntVar(&ppMaxSelectionRetries, "max-selection-retries", 2, "Maximum response reselections per round")
 	coordinateCmd.Flags().IntVar(&ppSubmitDelay, "submit-delay", 500, "Delay in milliseconds before pressing Enter")
-	coordinateCmd.Flags().IntVar(&ppSubmitConfirmTimeout, "submit-confirm-timeout", 5000, "Milliseconds to confirm prompt submission")
+	coordinateCmd.Flags().IntVar(&ppSubmitConfirmTimeout, "submit-confirm-timeout", 8000, "Milliseconds to watch a pane after Enter before deciding the prompt was not consumed (0 disables)")
 	coordinateCmd.Flags().IntVar(&ppSubmitRetries, "submit-retries", 1, "Additional Enter attempts")
+	coordinateCmd.Flags().BoolVar(&ppAllowShellPane, "allow-shell-pane", false, "Send prompts even when a pane's foreground process is a plain shell instead of an agent")
+	coordinateCmd.Flags().StringVar(&ppInputEchoCheck, "input-echo-check", inputEchoAuto, "Verify the pasted prompt is visible before pressing Enter: auto, strict, or off")
+	coordinateCmd.Flags().IntVar(&ppPendingInputTimeout, "pending-input-timeout", 45, "Seconds an unconsumed prompt may sit in a pane's input area before Enter is re-sent (0 disables)")
+	coordinateCmd.Flags().IntVar(&ppPendingInputNudges, "pending-input-nudges", 1, "Extra Enter attempts during a round while the prompt is provably unconsumed")
+	coordinateCmd.Flags().IntVar(&ppPasteChunkSize, "paste-chunk-size", 500, "Runes pasted into a pane per chunk")
+	coordinateCmd.Flags().IntVar(&ppPasteChunkDelay, "paste-chunk-delay", 1000, "Delay in milliseconds between pasted chunks")
 	coordinateCmd.Flags().IntVar(&ppMaxRelayBytes, "max-relay-bytes", 32*1024, "Maximum bytes in one outbound prompt")
 	coordinateCmd.Flags().IntVar(&ppMaxTotalRelayBytes, "max-total-relay-bytes", 128*1024, "Maximum total outbound bytes")
 	coordinateCmd.Flags().IntVar(&ppMaxLLMCalls, "max-llm-calls", 40, "Maximum coordinator/selector calls")
@@ -164,6 +172,12 @@ func runCoordinate() error {
 	if preset.CompletionSettleMS != nil {
 		ppCompletionSettleTimeout = *preset.CompletionSettleMS
 	}
+	if preset.PasteChunkSize > 0 {
+		ppPasteChunkSize = preset.PasteChunkSize
+	}
+	if preset.PasteChunkDelayMS != nil {
+		ppPasteChunkDelay = *preset.PasteChunkDelayMS
+	}
 	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("new") {
 		ppNewSession = preset.NewSession
 	}
@@ -181,6 +195,12 @@ func runCoordinate() error {
 	}
 	if ppCompletionSettleTimeout < 0 {
 		return fmt.Errorf("--completion-settle-timeout must not be negative")
+	}
+	if err := validatePasteOptions(); err != nil {
+		return err
+	}
+	if err := validateSubmitOptions(); err != nil {
+		return err
 	}
 	if ppMaxSamePaneRounds <= 0 || ppMaxDuplicateHandoffs <= 0 || ppMinResponseLines <= 0 || ppMaxResponseLines < ppMinResponseLines {
 		return fmt.Errorf("handoff and response limits are invalid")
@@ -202,7 +222,7 @@ func runCoordinate() error {
 		byName[key] = members[i]
 	}
 	guard := newHandoffGuard()
-	ex := tmux.NewExecutor()
+	ex := tmux.NewExecutorWithOptions(pasteOptions())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

@@ -371,16 +371,16 @@ func TestSendToPaneSubmitsPastedPrompt(t *testing.T) {
 	ppSubmitDelay = 0
 	ppSubmitConfirmTimeout = 0
 	defer func() { ppSubmitDelay = oldDelay; ppSubmitConfirmTimeout = oldConfirm }()
-	if err := sendToPane(context.Background(), ex, "%42", "run the tests"); err != nil {
+	if _, err := sendToPane(context.Background(), ex, "%42", "run the tests", ""); err != nil {
 		t.Fatalf("sendToPane() error = %v", err)
 	}
 
 	if len(ex.SendLinesCalls) != 1 {
 		t.Fatalf("SendLines calls = %d, want 1", len(ex.SendLinesCalls))
 	}
-	want := []string{"send-keys", "-t", "%42", "Enter"}
-	if len(ex.ExecCalls) != 1 || !reflect.DeepEqual(ex.ExecCalls[0], want) {
-		t.Fatalf("submit call = %#v, want %#v", ex.ExecCalls, want)
+	want := [][]string{{"send-keys", "-t", "%42", "Enter"}}
+	if got := submitExecCalls(ex); !reflect.DeepEqual(got, want) {
+		t.Fatalf("submit calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -410,8 +410,8 @@ func TestResetHandoffSessionsSendsNewToEachPaneInOrder(t *testing.T) {
 		{"send-keys", "-t", "%1", "Enter"},
 		{"send-keys", "-t", "%2", "Enter"},
 	}
-	if !reflect.DeepEqual(ex.ExecCalls, want) {
-		t.Fatalf("submit calls = %#v, want %#v", ex.ExecCalls, want)
+	if got := submitExecCalls(ex); !reflect.DeepEqual(got, want) {
+		t.Fatalf("submit calls = %#v, want %#v", got, want)
 	}
 }
 
@@ -420,7 +420,7 @@ func TestSendToPaneCanceledBeforePasteSendsNothing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := sendToPane(ctx, ex, "%42", "must not be sent")
+	_, err := sendToPane(ctx, ex, "%42", "must not be sent", "")
 	if err == nil || !strings.Contains(err.Error(), "canceled before paste") {
 		t.Fatalf("sendToPane() error = %v", err)
 	}
@@ -438,7 +438,10 @@ func TestSendToPaneCanceledDuringDelayDoesNotPressEnter(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- sendToPane(ctx, ex, "%42", "pasted but never submitted") }()
+	go func() {
+		_, err := sendToPane(ctx, ex, "%42", "pasted but never submitted", "")
+		done <- err
+	}()
 
 	select {
 	case <-ex.SendLinesCalled:
@@ -450,8 +453,8 @@ func TestSendToPaneCanceledDuringDelayDoesNotPressEnter(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "Enter was not sent") {
 		t.Fatalf("sendToPane() error = %v", err)
 	}
-	if len(ex.SendLinesCalls) != 1 || len(ex.ExecCalls) != 0 {
-		t.Fatalf("canceled delayed send calls: SendLines=%d Exec=%d", len(ex.SendLinesCalls), len(ex.ExecCalls))
+	if len(ex.SendLinesCalls) != 1 || len(submitExecCalls(ex)) != 0 {
+		t.Fatalf("canceled delayed send calls: SendLines=%d submit=%d", len(ex.SendLinesCalls), len(submitExecCalls(ex)))
 	}
 }
 
@@ -642,7 +645,7 @@ func TestWaitForCompletionUsesScreenIdleFallbackWithoutMarker(t *testing.T) {
 	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", roundControlProtocol{}, func(_ context.Context, screen string) (string, error) {
 		fallbackCalls++
 		return "all fixes completed\nready for next task", nil
-	}, nil)
+	}, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -662,7 +665,7 @@ func TestWaitForCompletionUsesIdleValidReceiptWithoutDone(t *testing.T) {
 		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -687,7 +690,7 @@ func TestGoalModeClearsThenWaitsForIdleBeforeHandoff(t *testing.T) {
 	}()
 
 	started := time.Now()
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:1", "old prompt", protocol, nil, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:1", "old prompt", protocol, nil, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -721,7 +724,7 @@ func TestGoalModeDoesNotRepeatClearWhileScreenIsStillChanging(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
-	_, _, _, err := waitForCompletionWithFallback(ctx, ex, "tgoal:changing", "old prompt", protocol, nil, nil)
+	_, _, _, err := waitForCompletionWithFallback(ctx, ex, "tgoal:changing", "old prompt", protocol, nil, nil, submitResult{})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waitForCompletionWithFallback() error = %v, want context deadline", err)
 	}
@@ -745,7 +748,7 @@ func TestGoalModeHandsOffAfterReceiptAndNativeGoalCompletionWithoutDone(t *testi
 		ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:native", "old prompt", protocol, nil, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "tgoal:native", "old prompt", protocol, nil, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -856,7 +859,7 @@ func TestWaitForCompletionSettlesWhileUnrelatedChromeRepaints(t *testing.T) {
 		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -883,7 +886,7 @@ func TestWaitForCompletionUsesOutboxReceiptWhenScreenReceiptIsUnusable(t *testin
 		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
 	}()
 
-	output, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil)
+	output, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -896,18 +899,33 @@ func TestWaitForCompletionUsesOutboxReceiptWhenScreenReceiptIsUnusable(t *testin
 	}
 }
 
-func TestWaitForCompletionKeepsPollingWhenNeitherReceiptExists(t *testing.T) {
-	protocol := newRoundControlProtocol(handoffTransportFile, "no-receipt", 1, t.TempDir(), true)
+func TestWaitForCompletionDefersMalformedFileReceiptToRepairAfterDone(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "malformed-receipt", 1, t.TempDir(), true)
 	ex := tmux.NewFakeExecutor()
-	ex.Captures["trec:2"] = "work finished\n" + protocol.DoneMarker
+	completed := strings.Join([]string{
+		protocol.StatusBeginMarker,
+		`{"outcome":"needs_followup","summary":"version was omitted"}`,
+		protocol.StatusEndMarker,
+		protocol.DoneMarker,
+	}, "\n")
+	ex.Captures["trec:2"] = completed
 
-	oldInterval, oldTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout
-	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = 1, 1, 0
+	oldInterval, oldTimeout, oldReceiptIdle, oldSettle := ppInterval, ppRoundTimeout, ppReceiptIdleTimeout, ppCompletionSettleTimeout
+	ppInterval, ppRoundTimeout, ppReceiptIdleTimeout, ppCompletionSettleTimeout = 1, 1, 0, 0
 	defer func() {
-		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
+		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldReceiptIdle, oldSettle
 	}()
 
-	if _, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil); err == nil {
-		t.Fatal("a completion marker with no receipt anywhere was accepted")
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil, submitResult{})
+	if err != nil {
+		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	}
+	if output != completed || stopped || selected {
+		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
+	}
+
+	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	if _, err := engine.prepareTurnResult(context.Background(), handoffMember{ID: "pane2", Label: "reviewer", Target: "trec:2"}, output, protocol, nil, nil, "", false); !errors.Is(err, errMissingReceipt) {
+		t.Fatalf("prepareTurnResult() error = %v, want errMissingReceipt for receipt repair", err)
 	}
 }

@@ -9,9 +9,13 @@ import (
 	"strings"
 )
 
-// runWithRetry keeps interactive handoff workflows alive after a runtime
-// failure. The operation is rebuilt by the caller so a retry gets a fresh
-// engine/guard state instead of reusing partially consumed round state.
+// runWithRetry retries an entire workflow after a failure that escaped its
+// round-level recovery. The operation is rebuilt by the caller so a restart
+// gets a fresh engine/guard state instead of reusing partially consumed state.
+//
+// Keep this wording distinct from askRetry's "retry this round" prompt: the
+// two operations have deliberately different scopes, and treating a restart
+// as a round retry can send the initial task to a pane twice.
 func runWithRetry(ctx context.Context, run func() error, in io.Reader, out io.Writer) error {
 	reader := bufio.NewReader(in)
 	for {
@@ -19,7 +23,7 @@ func runWithRetry(ctx context.Context, run func() error, in io.Reader, out io.Wr
 			return nil
 		} else {
 			fmt.Fprintf(out, "\n工作流程發生錯誤：%v\n", err)
-			fmt.Fprint(out, "是否要重試？[y/N] ")
+			fmt.Fprint(out, "是否要從頭重啟整個 workflow？[y/N] ")
 		}
 
 		lineCh := make(chan string, 1)

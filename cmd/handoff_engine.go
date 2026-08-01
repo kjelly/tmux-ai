@@ -65,6 +65,15 @@ type roundControlProtocol struct {
 	// wrapping; two short markers do not.
 	StatusBeginMarker, StatusEndMarker               string
 	RequireStatus, GoalMode, CoordinatorControlsStop bool
+	// HeadMarker labels the first line of the prompt and EchoMarker its last.
+	// They bracket the message so the runner can check delivery from both ends:
+	// EchoMarker on screen before Enter proves the paste arrived, and HeadNonce
+	// repeated in the receipt proves the member answered the whole message.
+	//
+	// HeadNonce is empty unless a caller supplies one, which leaves the head
+	// requirement out of the receipt contract for protocols built outside a
+	// running workflow.
+	HeadMarker, HeadNonce, EchoMarker string
 }
 
 const (
@@ -84,7 +93,7 @@ const codexGoalClearNoopGrace = 2 * time.Second
 func newRoundControlProtocol(transport handoffTransportKind, token string, round int, outbox string, required bool) roundControlProtocol {
 	begin, end := textMarkers(token, round)
 	statusBegin, statusEnd := statusFrameMarkers(token, round)
-	return roundControlProtocol{Transport: transport, TextBeginMarker: begin, TextEndMarker: end, StatusMarker: statusMarker(token, round), StatusBeginMarker: statusBegin, StatusEndMarker: statusEnd, DoneMarker: roundControlMarker(ppDone, token, round), StopMarker: roundControlMarker(ppStop, token, round), Outbox: outbox, RequireStatus: required}
+	return roundControlProtocol{Transport: transport, TextBeginMarker: begin, TextEndMarker: end, StatusMarker: statusMarker(token, round), StatusBeginMarker: statusBegin, StatusEndMarker: statusEnd, DoneMarker: roundControlMarker(ppDone, token, round), StopMarker: roundControlMarker(ppStop, token, round), HeadMarker: promptHeadMarker(token, round), EchoMarker: promptEchoMarker(token, round), Outbox: outbox, RequireStatus: required}
 }
 
 func controlProtocolInstruction(p roundControlProtocol) string {
@@ -98,10 +107,13 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 	if p.RequireStatus {
 		fmt.Fprintf(&b, "請輸出一個 status receipt frame：先獨佔一行輸出 begin marker value，接著輸出 receipt JSON object（可跨多行），最後獨佔一行輸出 end marker value。不要把 marker 與 JSON 放在同一行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus begin marker value：%s\nstatus end marker value：%s\n", handoffOutcomeConstraint, p.StatusBeginMarker, p.StatusEndMarker)
 		if p.Transport == handoffTransportFile {
-			b.WriteString("receipt JSON object（實際輸出時放在 frame 內）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n")
+			fmt.Fprintf(&b, "receipt JSON object（實際輸出時放在 frame 內）：%s。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n", receiptJSONTemplate(p))
 			fmt.Fprintf(&b, "同時把同一份 receipt JSON 寫入 %s。此檔案由 runner 直接讀取，不會被當成 artifact 交給下一位成員；畫面上的 receipt 若被終端換行或重繪破壞，runner 會改用它。\n", fileReceiptPath(p))
 		} else {
-			b.WriteString("receipt JSON object（實際輸出時放在 frame 內）：{\"version\":1,\"outcome\":\"needs_followup\",\"summary\":\"本輪摘要\",\"tests\":[]}；text transport 不得帶 artifacts 欄位。\n")
+			fmt.Fprintf(&b, "receipt JSON object（實際輸出時放在 frame 內）：%s；text transport 不得帶 artifacts 欄位。\n", receiptJSONTemplate(p))
+		}
+		if p.HeadNonce != "" {
+			fmt.Fprintf(&b, "prompt_head 必須填入本訊息「最開頭那一行」%s 後面的值，原字照抄。runner 用它確認整則 prompt 完整送達；receipt 本身只證明你看到訊息結尾。若本訊息開頭沒有那一行，填 \"missing\"，不要猜測或從其他 marker 推導。\n", p.HeadMarker)
 		}
 	}
 	if p.GoalDoneMarker != "" {
@@ -112,7 +124,21 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 	} else {
 		fmt.Fprintf(&b, "完成 marker value（實際輸出時必須獨佔最後一行）：%s\n全任務完成 marker value（實際輸出時必須獨佔最後一行）：%s", p.DoneMarker, p.StopMarker)
 	}
+	if p.EchoMarker != "" {
+		fmt.Fprintf(&b, "\n\n（以下最後一行是 runner 的送達檢查標記，不是任務內容：不要回應、輸出或引用它。）\n%s", p.EchoMarker)
+	}
 	return b.String()
+}
+
+// receiptJSONTemplate keeps the example receipt and the fields the runner
+// actually validates in one place, so a new required field cannot be documented
+// in prose while the template still shows a receipt that would be rejected.
+func receiptJSONTemplate(p roundControlProtocol) string {
+	head := ""
+	if p.HeadNonce != "" {
+		head = `,"prompt_head":"<本訊息最開頭 head 行的值>"`
+	}
+	return `{"version":1,"outcome":"needs_followup","summary":"本輪摘要","tests":[]` + head + `}`
 }
 
 type handoffEngine struct {
@@ -129,6 +155,20 @@ type handoffEngine struct {
 	Route                                               handoffRouter
 	SelectResponse                                      handoffResponseSelector
 	NewReceiptRepairToken                               func() (string, error)
+	// NewPromptHeadNonce is injectable so a test can predict the value a member
+	// is asked to repeat.
+	NewPromptHeadNonce func() (string, error)
+}
+
+func (e handoffEngine) newPromptHeadNonce() (string, error) {
+	if e.NewPromptHeadNonce != nil {
+		return e.NewPromptHeadNonce()
+	}
+	value := make([]byte, 6)
+	if _, err := rand.Read(value); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value), nil
 }
 
 func (e handoffEngine) Run(ctx context.Context) (runErr error) {
@@ -203,14 +243,15 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		fmt.Printf("🔎 Dry run: would send %d bytes to %s\n%s\n", len([]byte(initial)), current.Label, truncate(initial, 1000))
 		return nil
 	}
-	if err := sendToPane(ctx, e.Executor, current.Target, initial); err != nil {
+	submit, err := sendToPane(ctx, e.Executor, current.Target, initial, protocol.EchoMarker)
+	if err != nil {
 		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
 	}
 	fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
 	for round := 1; round <= ppMaxRounds; round++ {
 	roundRetry:
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
-		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(), streams[current.Target])
+		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(), streams[current.Target], submit)
 		if err != nil {
 			if askRetry(ctx, err) {
 				goto roundRetry
@@ -322,14 +363,15 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			}
 			return err
 		}
-		if err := sendToPane(ctx, e.Executor, next.Target, message); err != nil {
+		nextSubmit, err := sendToPane(ctx, e.Executor, next.Target, message, nextProtocol.EchoMarker)
+		if err != nil {
 			if askRetry(ctx, err) {
 				goto roundRetry
 			}
 			return fmt.Errorf("relay to %s: %w", next.Label, err)
 		}
 		fmt.Printf("📨 已送出第 %d 輪交接給 %s\n", round+1, handoffMemberDisplayName(next))
-		current, baseline, protocol, incoming = next, nextBaseline, nextProtocol, nextIncoming
+		current, baseline, protocol, incoming, submit = next, nextBaseline, nextProtocol, nextIncoming, nextSubmit
 	}
 	fmt.Printf("⏹️ 已達最大輪數 %d，workflow 停止\n", ppMaxRounds)
 	return nil
@@ -401,7 +443,7 @@ func clearCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handof
 		}
 		fmt.Printf("🔄 Clearing Codex goal in %s (%s)\n", member.Label, member.Target)
 		before, captureErr := ex.CapturePaneClean(member.Target, ppLines)
-		if err := sendToPane(ctx, ex, member.Target, "/goal clear"); err != nil {
+		if _, err := sendToPane(ctx, ex, member.Target, "/goal clear", ""); err != nil {
 			return err
 		}
 		if captureErr != nil || codexGoalClearTimeout <= 0 {
@@ -416,7 +458,7 @@ func clearCodexGoalIfNeeded(ctx context.Context, ex tmux.Executor, member handof
 		// run's receipt. A fresh Codex conversation is the safe fallback before
 		// the pane can receive another managed /goal task.
 		fmt.Fprintf(os.Stderr, "warn: Codex /goal clear was not confirmed in %s; starting a fresh session before its next handoff\n", member.Target)
-		if err := sendToPane(ctx, ex, member.Target, "/new"); err != nil {
+		if _, err := sendToPane(ctx, ex, member.Target, "/new", ""); err != nil {
 			return fmt.Errorf("start fresh Codex session after goal clear timeout: %w", err)
 		}
 		return nil
@@ -497,7 +539,7 @@ func resetHandoffSessions(ctx context.Context, ex tmux.Executor, members []hando
 		}
 		seen[member.Target] = struct{}{}
 		fmt.Printf("🆕 Starting new session in %s (%s)\n", member.Label, member.Target)
-		if err := sendToPane(ctx, ex, member.Target, "/new"); err != nil {
+		if _, err := sendToPane(ctx, ex, member.Target, "/new", ""); err != nil {
 			return fmt.Errorf("start new session in %s: %w", member.Label, err)
 		}
 	}
@@ -553,6 +595,11 @@ func (e handoffEngine) protocolFor(store artifact.Store, member handoffMember, t
 	// that receipt and the completion envelope locally before routing; this
 	// does not add another agent response or coordinator call.
 	protocol := newRoundControlProtocol(e.Transport.Transport, token, round, outbox, true)
+	nonce, err := e.newPromptHeadNonce()
+	if err != nil {
+		return roundControlProtocol{}, fmt.Errorf("create prompt head nonce: %w", err)
+	}
+	protocol.HeadNonce = nonce
 	protocol.GoalMode = member.GoalMode
 	protocol.CoordinatorControlsStop = e.CoordinatorControlsStop
 	if member.GoalMode && ppStrictGoalCompletionMarker {
@@ -578,6 +625,12 @@ func (e handoffEngine) prepareTurnResult(ctx context.Context, current handoffMem
 	}
 	result, err := e.prepareTurnResultFromOutput(ctx, current, output, p, incoming, store, guidance)
 	if err == nil {
+		return result, err
+	}
+	// An incomplete prompt is not a reading problem, so none of the recoveries
+	// below apply: the text frame, the outbox receipt and the screen selector
+	// would each hand on work the member did against half a prompt.
+	if errors.Is(err, errIncompletePrompt) {
 		return result, err
 	}
 	// A file handoff receipt is the control-plane authority for the outbox.
@@ -658,11 +711,12 @@ func (e handoffEngine) repairMissingFileReceipt(ctx context.Context, current han
 		if err := e.Guard.reserveOutbound("receipt repair to "+current.Label, current.Target, instruction, instruction, original.StatusMarker); err != nil {
 			return turnResult{}, err
 		}
-		if err := sendToPane(ctx, e.Executor, current.Target, instruction); err != nil {
+		submit, err := sendToPane(ctx, e.Executor, current.Target, instruction, repair.EchoMarker)
+		if err != nil {
 			return turnResult{}, fmt.Errorf("send receipt repair to %s: %w", current.Label, err)
 		}
 		waitProtocol := roundControlProtocol{DoneMarker: repair.DoneMarker, StopMarker: repair.DoneMarker + "_STOP"}
-		if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil, nil); err != nil {
+		if _, _, _, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, waitProtocol, nil, nil, submit); err != nil {
 			return turnResult{}, fmt.Errorf("%w; receipt repair failed: %v", originalErr, err)
 		}
 		output, err := e.Executor.CapturePaneClean(current.Target, ppLines)
@@ -694,10 +748,29 @@ func receiptRepairInstruction(original roundControlProtocol, repair receiptRepai
 只輸出下列五行，不能有其他文字。每個 marker 實際輸出時都必須獨佔一行，不可與 JSON 合併在同一行。下列 marker values 僅供複製。
 第一行 repair begin marker value：%s
 第二行 status begin marker value：%s
-第三行 receipt JSON object：{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]}
+第三行 receipt JSON object：%s
 %s；依實際結果選一個值，不得輸出選項清單。runner 會自行收集 outbox artifact；不要宣告 artifact 路徑。
 第四行 status end marker value：%s
-第五行 repair completion marker value：%s`, correction, repair.BeginMarker, original.StatusBeginMarker, handoffOutcomeConstraint, original.StatusEndMarker, repair.DoneMarker)
+第五行 repair completion marker value：%s%s`, correction, repair.BeginMarker, original.StatusBeginMarker, repairReceiptJSON(original), handoffOutcomeConstraint, original.StatusEndMarker, repair.DoneMarker, repairEchoSuffix(repair))
+}
+
+// repairReceiptJSON supplies prompt_head as a literal rather than asking the
+// member to recall it. This turn is not a delivery test: the original turn
+// already completed, so its prompt provably arrived. The field is filled in only
+// to keep one receipt schema across both paths.
+func repairReceiptJSON(original roundControlProtocol) string {
+	head := ""
+	if original.HeadNonce != "" {
+		head = `,"prompt_head":"` + original.HeadNonce + `"`
+	}
+	return `{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]` + head + `}`
+}
+
+func repairEchoSuffix(repair receiptRepairProtocol) string {
+	if repair.EchoMarker == "" {
+		return ""
+	}
+	return fmt.Sprintf("\n\n（以下最後一行是 runner 的送達檢查標記，不是要輸出的那五行之一：不要回應、輸出或引用它。）\n%s", repair.EchoMarker)
 }
 
 func receiptRepairCorrection(err error) string {
@@ -756,6 +829,9 @@ func (e handoffEngine) prepareTurnResultFromOutput(ctx context.Context, current 
 		status, err := parseProtocolStatus(statusOutput, p)
 		if err != nil {
 			return result, fmt.Errorf("%w: handoff protocol error for %s: %v", errMissingReceipt, current.Label, err)
+		}
+		if err := validatePromptDelivery(status, p, current.Label); err != nil {
+			return result, err
 		}
 		if p.Transport == handoffTransportText && len(status.Artifacts) > 0 {
 			return result, fmt.Errorf("text transport status contains artifacts")
@@ -904,6 +980,11 @@ func (e handoffEngine) routePayload(result turnResult, route handoffRoute, store
 }
 func buildTurnMessage(role, instruction, narrative string, payload handoffPayload, incoming []artifact.Ref, p roundControlProtocol) string {
 	var b strings.Builder
+	// The head line goes first so that a message which arrives truncated or in
+	// two pieces cannot carry it into the piece that holds the control protocol.
+	if p.HeadNonce != "" {
+		fmt.Fprintf(&b, "%s %s\n\n", p.HeadMarker, p.HeadNonce)
+	}
 	if role != "" {
 		b.WriteString(role)
 		b.WriteString("\n\n")

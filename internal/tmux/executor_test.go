@@ -60,8 +60,21 @@ func TestSendTextChunksStopsAfterCancellation(t *testing.T) {
 }
 
 func TestTextThrottleDefaults(t *testing.T) {
-	if sendTextChunkSize != 500 || sendTextChunkDelay != time.Second {
-		t.Fatalf("throttle = %d chars/%s, want 500 chars/1s", sendTextChunkSize, sendTextChunkDelay)
+	defaults := DefaultOptions()
+	if defaults.PasteChunkRunes != 500 || defaults.PasteChunkDelay != time.Second {
+		t.Fatalf("throttle = %d runes/%s, want 500 runes/1s", defaults.PasteChunkRunes, defaults.PasteChunkDelay)
+	}
+}
+
+func TestPasteOptionsFallBackToDefaults(t *testing.T) {
+	normalized := Options{PasteChunkRunes: -1, PasteChunkDelay: -time.Second}.normalized()
+	if normalized != DefaultOptions() {
+		t.Fatalf("normalized = %#v, want the defaults", normalized)
+	}
+	// Zero delay is a legitimate choice for an agent that handles one paste.
+	fast := Options{PasteChunkRunes: 8000, PasteChunkDelay: 0}.normalized()
+	if fast.PasteChunkRunes != 8000 || fast.PasteChunkDelay != 0 {
+		t.Fatalf("normalized = %#v, want the caller's values", fast)
 	}
 }
 

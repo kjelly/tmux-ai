@@ -154,8 +154,8 @@ func TestClearCodexGoalIfNeeded(t *testing.T) {
 	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/goal clear" {
 		t.Fatalf("SendLinesCalls = %#v, want one /goal clear", ex.SendLinesCalls)
 	}
-	if len(ex.ExecCalls) != 1 || ex.ExecCalls[0][0] != "send-keys" {
-		t.Fatalf("ExecCalls = %#v, want one Enter submission", ex.ExecCalls)
+	if calls := submitExecCalls(ex); len(calls) != 1 || calls[0][0] != "send-keys" {
+		t.Fatalf("submit calls = %#v, want one Enter submission", calls)
 	}
 }
 

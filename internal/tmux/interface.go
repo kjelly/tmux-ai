@@ -8,6 +8,7 @@ import "context"
 type Executor interface {
 	CapturePane(paneID string, lines int) (string, error)
 	CapturePaneClean(paneID string, lines int) (string, error)
+	CaptureScreenClean(paneID string) (string, error)
 	SendKeys(paneID, keys string) error
 	SendLines(paneID, content string) error
 	SendKeysContext(ctx context.Context, paneID, keys string) error

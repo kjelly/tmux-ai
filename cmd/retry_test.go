@@ -24,7 +24,7 @@ func TestRunWithRetryRetriesAfterError(t *testing.T) {
 	if calls != 2 {
 		t.Fatalf("run calls = %d, want 2", calls)
 	}
-	if !strings.Contains(out.String(), "是否要重試") {
+	if !strings.Contains(out.String(), "從頭重啟整個 workflow") {
 		t.Fatalf("prompt missing from output: %q", out.String())
 	}
 }

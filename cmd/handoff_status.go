@@ -19,11 +19,17 @@ type testClaim struct {
 	Detail string `json:"detail,omitempty"`
 }
 type handoffStatus struct {
-	Version   int              `json:"version"`
-	Outcome   string           `json:"outcome"`
-	Summary   string           `json:"summary"`
-	Tests     testClaims       `json:"tests,omitempty"`
-	Artifacts []artifact.Claim `json:"artifacts,omitempty"`
+	Version int    `json:"version"`
+	Outcome string `json:"outcome"`
+	Summary string `json:"summary"`
+	// PromptHead is the value the member read from the head line of the prompt
+	// it answered. A receipt is proof that the member saw the end of the
+	// message — that is where the control protocol lives — but not that it saw
+	// the beginning, so this is the only field that can show a prompt arrived
+	// whole rather than truncated or split into two submissions.
+	PromptHead string           `json:"prompt_head,omitempty"`
+	Tests      testClaims       `json:"tests,omitempty"`
+	Artifacts  []artifact.Claim `json:"artifacts,omitempty"`
 }
 
 type testClaims []testClaim
@@ -51,6 +57,21 @@ func (claims *testClaims) UnmarshalJSON(data []byte) error {
 
 func statusMarker(runToken string, round int) string {
 	return fmt.Sprintf("HANDOFF_STATUS__TMUXAI_%s_%d", runToken, round)
+}
+
+// promptHeadMarker labels the first line of a runner-built prompt. Its value is
+// a nonce that appears nowhere else in the message, so a member that only
+// received the tail of the prompt cannot reproduce it — not even by pattern,
+// since the round token in the other markers does not determine it.
+func promptHeadMarker(runToken string, round int) string {
+	return fmt.Sprintf("TMUXAI_PROMPT_HEAD__TMUXAI_%s_%d", runToken, round)
+}
+
+// promptEchoMarker ends a runner-built prompt. It is never asked for in a reply:
+// the runner looks for it on screen before pressing Enter, to know that what it
+// pasted actually reached the pane rather than being discarded on the way.
+func promptEchoMarker(runToken string, round int) string {
+	return fmt.Sprintf("TMUXAI_PROMPT_ECHO__TMUXAI_%s_%d", runToken, round)
 }
 
 func statusFrameMarkers(runToken string, round int) (string, string) {
@@ -160,6 +181,35 @@ func decodeHandoffStatus(data []byte) (*handoffStatus, error) {
 	return &status, nil
 }
 
+// errIncompletePrompt marks a round whose member demonstrably answered
+// something other than the whole prompt the runner sent. It is deliberately not
+// an errMissingReceipt: the receipt is present and well-formed, and no amount of
+// re-asking for a receipt or re-selecting screen text can repair a prompt that
+// arrived in pieces.
+var errIncompletePrompt = errors.New("prompt did not reach the member intact")
+
+// validatePromptDelivery compares the head nonce the member reported against the
+// one the runner put at the top of the prompt. A member can only produce that
+// value by having received the beginning of the message, so a mismatch means the
+// paste was truncated, split into two submissions, or that the reply belongs to
+// a different round.
+func validatePromptDelivery(status *handoffStatus, p roundControlProtocol, label string) error {
+	if p.HeadNonce == "" || status == nil {
+		return nil
+	}
+	reported := strings.TrimSpace(status.PromptHead)
+	switch {
+	case reported == p.HeadNonce:
+		return nil
+	case reported == "":
+		return fmt.Errorf("%w: %s 的 receipt 沒有 prompt_head 欄位，無法確認本輪 prompt 是否完整送達", errIncompletePrompt, label)
+	case strings.EqualFold(reported, "missing"):
+		return fmt.Errorf("%w: %s 回報沒有看到 prompt 開頭的 head 行，本輪 prompt 只有後半段送達（paste 被截斷或被提前提交成兩則訊息）", errIncompletePrompt, label)
+	default:
+		return fmt.Errorf("%w: %s 回報的 prompt_head 是 %q，本輪應為 %q；該回覆對應的不是本輪完整 prompt", errIncompletePrompt, label, truncate(reported, 40), p.HeadNonce)
+	}
+}
+
 type handoffStatusBlock struct {
 	JSON       string
 	Start, End int
@@ -235,12 +285,17 @@ func fileReceiptEnvelope(p roundControlProtocol) (string, bool) {
 type receiptRepairProtocol struct {
 	BeginMarker string
 	DoneMarker  string
+	// EchoMarker is the repair message's own delivery check. Reusing the
+	// original round's marker would find that prompt still on screen and pass
+	// without the repair request having arrived at all.
+	EchoMarker string
 }
 
 func newReceiptRepairProtocol(original roundControlProtocol, token string) receiptRepairProtocol {
 	return receiptRepairProtocol{
 		BeginMarker: roundControlMarker("HANDOFF_RECEIPT_BEGIN", token, protocolRound(original)),
 		DoneMarker:  roundControlMarker("HANDOFF_RECEIPT_DONE", token, protocolRound(original)),
+		EchoMarker:  promptEchoMarker(token, protocolRound(original)),
 	}
 }
 
@@ -408,6 +463,15 @@ func stripPresentationContinuation(line, markerPrefix string) string {
 	return line
 }
 
+func carriesDeliveryMarker(line string, protocol roundControlProtocol) bool {
+	for _, marker := range []string{protocol.HeadMarker, protocol.EchoMarker} {
+		if marker != "" && strings.Contains(line, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func protocolMarkerLine(line, marker string) bool {
 	_, _, ok := matchProtocolMarker(line, marker, false)
 	return ok
@@ -470,6 +534,14 @@ func removeProtocolLines(output string, protocol roundControlProtocol) string {
 			continue
 		}
 		if inText || (i >= statusStart && i <= statusEnd) || protocolMarkerLine(line, protocol.StatusBeginMarker) || protocolMarkerLine(line, protocol.StatusEndMarker) || protocolMarkerLine(line, protocol.GoalDoneMarker) || protocolMarkerLine(line, protocol.DoneMarker) || protocolMarkerLine(line, protocol.StopMarker) {
+			continue
+		}
+		// The delivery markers are runner bookkeeping that the pane renders as
+		// part of the prompt. They carry no task content, so they must not be
+		// relayed onwards even when a capture includes the prompt itself. The
+		// head line carries a value after the marker, so match by containment
+		// rather than as a standalone marker line.
+		if carriesDeliveryMarker(line, protocol) {
 			continue
 		}
 		result = append(result, line)

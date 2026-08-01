@@ -98,7 +98,7 @@ func TestWaitForCompletionRecoversARepaintedCompletionFromTheStream(t *testing.T
 		ppInterval, ppRoundTimeout, ppCompletionSettleTimeout = oldInterval, oldTimeout, oldSettle
 	}()
 
-	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream)
+	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}
@@ -133,7 +133,7 @@ func TestStreamCannotCompleteARoundWithoutAValidEnvelope(t *testing.T) {
 		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
 	}()
 
-	if _, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream); err == nil {
+	if _, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream, submitResult{}); err == nil {
 		t.Fatal("a bare stream marker with no receipt completed the round")
 	}
 }
@@ -161,7 +161,7 @@ func TestStreamMarkerDoesNotBlockTheReceiptIdleFallback(t *testing.T) {
 		ppInterval, ppRoundTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldReceiptIdle
 	}()
 
-	output, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream)
+	output, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, stream, submitResult{})
 	if err != nil {
 		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
 	}

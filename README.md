@@ -1058,9 +1058,27 @@ pingpong 靠兩個標記運作：
 
 > **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
 
-> Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行，JSON 放在兩者之間並可跨多行。這讓 receipt 不再依賴「marker 與 JSON 同一行」在終端寬度下完整存活。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
+> Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行，JSON 放在兩者之間並可跨多行。JSON 為 `{"version":1,"outcome":…,"summary":…,"tests":[],"prompt_head":…}`；`prompt_head` 由 runner 驗證，見下方送達檢查。這讓 receipt 不再依賴「marker 與 JSON 同一行」在終端寬度下完整存活。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
 >
 > 若 agent 已輸出該輪有效的 status receipt 卻遺漏 `DONE`，`--receipt-idle-timeout`（預設 30 秒）會在畫面維持不變後放行交接。這只適用於 nonce 相符且通過 schema 驗證的 receipt；設為 `0` 可停用此 fallback。
+>
+> 這裡的「不變」不是整張 capture 逐位元組相同。coding-agent TUI 會永遠重繪計時器、token 計數與 footer 提示，這樣的畫面永遠不會相同。runner 改為量測每一列的變動頻率：最近 32 次比較中變動 3 次以上的列視為 UI chrome，判斷閒置時忽略。列以「距離最後一行的距離」定位，因為輪次進行中 capture 會變長，只有這個距離對 footer 穩定，而 alternate-screen TUI 高度固定，頂端狀態列同樣適用。三道保險：樣本不足 8 次前不做任何判斷；被視為 chrome 的列超過畫面四分之一時，代表畫面真的在忙，退回整張比較；帶本輪 marker 的列一律不排除。
+>
+> 頻率無法區分 spinner 與「Analyzing 37/512」這類原地更新的進度列，兩者都會被當成 chrome。因此這個濾波只用在 receipt-idle：那條路徑要求一份 nonce 相符、schema 通過的 receipt，agent 已宣告完成，閒置判斷只是 debounce。`--screen-idle-timeout` 的 LLM selector 沒有 receipt 可對照，預設仍比較整張 capture；要一併套用需明確加上 `--screen-idle-normalize`（preset：`screen_idle_normalize`）。
+>
+> Prompt 以 `--paste-chunk-size` 個 rune 為單位貼入，每塊之間等待 `--paste-chunk-delay` 毫秒（preset：`paste_chunk_size`、`paste_chunk_delay_ms`）。預設 500 runes／1000 毫秒偏保守：一次收到大量貼上的互動式 TUI 可能吃掉部分內容或提前送出。但在這個速率下，32 KB 的 relay 要花一分鐘以上才貼完，而那整段時間都是目的端可能誤處理輸入的窗口。各 agent 的耐受度差很多，確認目的端能處理大塊貼上時可放寬（例如 `--paste-chunk-size 4000 --paste-chunk-delay 200`）。
+>
+> 送出前會先問 tmux 這個 pane 是否真的收得到輸入（`#{pane_in_mode}`、`#{pane_dead}`、`#{pane_current_command}`）。pane 在 copy-mode 時，`send-keys` 與 `paste-buffer` 都會被導進該模式的 key table，整段 prompt 直接被 tmux 丟掉——不是排隊、不是延後送達（已在真實 tmux 驗證）。使用者用滑鼠滾輪捲動 pane 就會進入 copy-mode，這是整輪 prompt 憑空消失最常見的成因，而且事後在 pane 上留不下任何痕跡，所以檢查必須發生在貼上之前：runner 會先送 `send-keys -X cancel` 取消該模式並確認，再貼上。pane 程序已結束（`pane_dead=1`）直接停止。前景程序是 shell 時也停止，因為 agent 不在等待輸入，prompt 會被 shell 當成指令逐行執行；確定要這樣做時用 `--allow-shell-pane`。無法讀取 pane 狀態時不阻擋送出——讀不到狀態不是 pane 有問題的證據。
+>
+> 每則 runner 產生的 prompt 前後各夾一個標記，讓送達可以從兩端檢查。最後一行是本輪唯一的送達標記 `TMUXAI_PROMPT_ECHO__…`：貼上後、按 Enter 前，runner 會在畫面上找它。找到就證明「這一輪的 paste」真的抵達輸入區（不是上一輪的殘影，因為標記逐輪不同）。找不到時分兩種：畫面出現 `[Pasted text …]` 這類佔位符，或畫面比貼上前多出兩列以上，代表確實收到了只是尾端沒渲染，只印一次警告後繼續；完全看不出收到任何東西時直接停止，**不按 Enter**——對一個沒收到我們文字的輸入區按 Enter，只會提交裡面原本殘留的東西。`--input-echo-check=strict` 會把「無法確認」也視為失敗；`off` 完全停用。會讀輸入但完全不回顯的目的端（例如自訂的非互動 wrapper）在畫面上與「沒收到」無法區分，必須用 `off`。
+>
+> 另一端是 prompt 最開頭的 `TMUXAI_PROMPT_HEAD__… <nonce>`，nonce 每輪隨機且只出現在那一行，無法從其他 marker 推導。控制協定要求 receipt 帶上 `"prompt_head"`，填入該值。這補上 receipt 原本證明不了的事：receipt 位於訊息尾端，能收到它只證明 agent 看到「結尾」。若 prompt 被截斷、或在分塊貼上途中被提前提交成兩則訊息（agent 只對後半段作答），它就拿不到 head nonce，必須回報 `"missing"`，runner 隨即以「只有後半段送達」停止，且不會被 text frame 還原、outbox receipt 或畫面 selector 這些復原路徑救回來——那些工作是對半個 prompt 做的。填錯值（例如答的是別輪的 prompt）同樣停止。receipt repair 是唯一例外：那一輪的原始 prompt 早已完成，不是送達測試，因此 runner 直接把 nonce 寫在修補指令裡，只為維持單一 receipt schema。
+>
+> Enter 送出後的確認判準不是「畫面有變」。agent TUI 會永遠重繪計時器與 footer 提示，所以即使 Enter 被吃掉，畫面每次 poll 都不一樣，「有變」永遠成立。runner 改為只看「非重繪列」是否變化：prompt 被接受時輸入區會清空、內容會移進 transcript，這些列在那之後就不再變動；Enter 被吃掉時只有 footer 在動。一列必須被觀察到重繪過才能認定是重繪列，因此判斷需要時間：`--submit-confirm-timeout`（預設 8000 毫秒）內若有 5 列以上同時變化，視為輸入區已被消化並立即通過（正常送出通常在 1 秒內就走這條路）；否則等觀察滿 4 秒後才以非重繪列作結論。窗口小於約 6000 毫秒時無法分辨 chrome，判準會退回舊行為「有任何變化就算送出成功」。判定 Enter 未生效時會依 `--submit-retries` 重送 Enter，仍無效則停止並說明看到的是什麼。
+>
+> 送出確認只有幾秒的視野，因此每輪還有一道長視野檢查。runner 記下「prompt 還在輸入區、尚未按 Enter」時的畫面，輪次進行中持續比對：若畫面除了重繪列以外和當時完全相同，代表這一輪什麼都沒發生過——不是 agent 在慢慢想，而是 prompt 沒進去。超過 `--pending-input-timeout`（預設 45 秒）會補送 Enter，次數上限 `--pending-input-nudges`（預設 1），用完仍相同則以明確錯誤停止，而不是等到 `--round-timeout` 才報「未輸出完成標記」。補送 Enter 之所以安全，正是因為觸發條件是「畫面與按 Enter 前完全相同」：任何權限確認對話框本身就是非重繪列的變化，會讓這道檢查先退場。這段期間也不會呼叫 `--screen-idle-timeout` 的 LLM selector——那張畫面靜止的原因就是從來沒送進去，問 LLM「這輪完成了嗎」只會得到錯的答案。此檢查比對的是 pane 目前顯示的畫面（不含 scrollback），因為輸入區是畫面的性質；設 `--pending-input-timeout 0` 可停用。
+>
+> 輪次逾時的錯誤訊息會指出實際卡在哪一段：完全沒有完成標記、有完成標記但 receipt 無效（附上驗證錯誤）、text handoff frame 沒有關閉、有有效 receipt 但缺完成標記、envelope 反覆被改寫而無法穩定、或 goal 尚未關閉。完成標記只在 pane output stream 出現時也會註明。
 >
 > `--pane-stream`（preset：`pane_stream: true`，預設關閉）另外用 `tmux pipe-pane` 把每個 pane 的輸出鏡像到本機檔案。`capture-pane` 只看得到目前放得下、且 TUI 最後畫出來的內容，因此 alternate screen 捲掉的完成、或兩次 poll 之間被重繪蓋掉的完成都會遺失；輸出串流兩者都留得住，而且因為鏡像發生在 tmux 端，agent 在容器或 ssh 遠端也一樣有效。串流只會餵給和畫面同一套 nonce-bound envelope 驗證，因此它能救回「確實顯示過」的完成，不能無中生有；只看到 marker 卻湊不出有效 envelope 時會讓路給其他 fallback。已經被別人 pipe 的 pane 不會被接管，該 pane 就退回純畫面偵測。
 >
@@ -1146,6 +1164,9 @@ tmux-ai pingpong \
 | `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
 | `--completion-settle-timeout` | `1000` | 完整且有效的完成 envelope 必須維持不變多久才換手（毫秒；0 停用）。此驗證完全在 runner 本地進行。 |
 | `--receipt-idle-timeout` | `30` | 有效本輪 status receipt 出現後，畫面保持不變多久即可交接（秒；0 停用）。 |
+| `--paste-chunk-size` | `500` | 每次貼進 pane 的 rune 數。 |
+| `--paste-chunk-delay` | `1000` | 兩個貼上區塊之間的間隔（毫秒；0 表示不等待）。 |
+| `--screen-idle-normalize` | `false` | 讓 `--screen-idle-timeout` 也忽略持續重繪的 UI chrome（receipt-idle 一律啟用）。 |
 | `--pane-stream` | `false` | 以 `tmux pipe-pane` 鏡像 pane 輸出，救回畫面已捲掉或被重繪蓋掉的完成 envelope。 |
 | `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。適用於不會渲染控制標記的 agent。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
@@ -1159,6 +1180,12 @@ tmux-ai pingpong \
 | `--initial-from` | — | 從 `pane1` 或 `pane2` 的最新完成回覆 bootstrap |
 | `--initial-from-lines` | `500` | bootstrap 時供 LLM 選擇的精確尾端行數 |
 | `--submit-delay` | `500` | 貼上訊息後等待多少毫秒再送出 Enter；大型 prompt 可提高 |
+| `--submit-confirm-timeout` | `8000` | Enter 送出後觀察多少毫秒才判定 prompt 是否被輸入區消化（0 停用；低於約 6000 會退回「有任何變化就算成功」） |
+| `--submit-retries` | `1` | 判定 Enter 未生效時額外重送 Enter 的次數 |
+| `--allow-shell-pane` | `false` | 即使 pane 前景程序是 shell（agent 不在執行中）也送出 prompt |
+| `--input-echo-check` | `auto` | 按 Enter 前確認貼上的 prompt 已出現在畫面：`auto` 只在完全看不出收到內容時停止；`strict` 連「無法確認」也停止；`off` 停用（回顯不可見的目的端需要） |
+| `--pending-input-timeout` | `45` | prompt 留在輸入區未被消化多少秒後補送 Enter（秒；0 停用） |
+| `--pending-input-nudges` | `1` | 一輪內最多補送幾次 Enter；用完仍未被消化就停止 |
 | `--max-relay-bytes` | `32768` | 任一送出訊息的 UTF-8 byte 上限；超限時停止且不送出 |
 | `--max-total-relay-bytes` | `131072` | 整個 workflow 累積送出 byte 上限 |
 | `--max-llm-calls` | `40` | selector、coordinator 與 summarizer 的呼叫總上限 |
@@ -1189,6 +1216,9 @@ tmux-ai pingpong \
 每次 relay 時，目標 pane 收到的完整訊息：
 
 ```
+TMUXAI_PROMPT_HEAD__TMUXAI_<token>_<round> <nonce>
+                          ← runner 產生；receipt 的 prompt_head 必須回報這個值
+
 [pane-role]               ← --pane1-role 或 --pane2-role
 
 [relay instruction]       ← --to-pane1-prompt 或 --to-pane2-prompt
@@ -1197,8 +1227,15 @@ tmux-ai pingpong \
 [captured content]
 === 輸出結束 ===
 
-完成時請在最後一行輸出 DONE。如果所有任務已全部完成，請輸出 ALL_DONE。
+TMUX-AI runner control protocol：text/file 資料平面、status receipt frame、
+本輪完成 marker 與 prompt_head 要求（runner 產生，preset 不需自行撰寫）
+
+TMUXAI_PROMPT_ECHO__TMUXAI_<token>_<round>
+                          ← runner 的送達檢查標記；不需回應，也不會被 relay
 ```
+
+頭尾兩行都由 runner 產生並自行驗證：開頭那行讓 receipt 能證明整則 prompt 完整
+送達，最後一行讓 runner 在按 Enter 前確認 paste 真的進了輸入區。
 
 #### `review.md` review/fix preset
 

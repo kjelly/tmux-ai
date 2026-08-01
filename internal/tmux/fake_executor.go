@@ -18,9 +18,14 @@ type FakeExecutor struct {
 	ListWindowsResult []string
 	PanesDetailed     []PaneInfo
 	ExecResult        map[string]string // joined args → result
-	ExecError         error
-	CaptureError      error
-	ExecCalls         [][]string
+	// ExecHook answers a call before ExecResult is consulted. The bool reports
+	// whether it handled the call, so a hook can serve one command (for example
+	// a pane-state query whose answer changes between reads) and leave the rest
+	// to the recorded results.
+	ExecHook     func(args []string) (string, bool, error)
+	ExecError    error
+	CaptureError error
+	ExecCalls    [][]string
 }
 
 type captureCall struct {
@@ -69,6 +74,12 @@ func (f *FakeExecutor) CapturePaneClean(paneID string, lines int) (string, error
 		return "", f.CaptureError
 	}
 	return f.Captures[paneID], nil
+}
+
+// CaptureScreenClean shares the recorded captures: a test double has no
+// scrollback to distinguish from the visible screen.
+func (f *FakeExecutor) CaptureScreenClean(paneID string) (string, error) {
+	return f.CapturePaneClean(paneID, 0)
 }
 
 func (f *FakeExecutor) SendKeys(paneID, keys string) error {
@@ -147,6 +158,11 @@ func (f *FakeExecutor) ResolveTarget(target string) (string, error) {
 func (f *FakeExecutor) Exec(args ...string) (string, error) {
 	f.ExecCalls = append(f.ExecCalls, append([]string(nil), args...))
 	key := joinArgs(args)
+	if f.ExecHook != nil {
+		if out, handled, err := f.ExecHook(args); handled {
+			return out, err
+		}
+	}
 	if f.ExecError != nil {
 		return "", f.ExecError
 	}

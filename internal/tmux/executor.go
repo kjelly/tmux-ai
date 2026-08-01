@@ -23,14 +23,47 @@ type PaneInfo struct {
 	WindowActive bool
 }
 
-type executorImpl struct{}
+type executorImpl struct {
+	options Options
+}
 
-const sendTextChunkSize = 500
+// Options tunes how a prompt is pasted into a pane. The defaults are
+// deliberately slow: an interactive TUI that receives a large paste in one
+// burst can drop part of it or submit early. Agents differ widely in what they
+// tolerate, though, and at the default rate a 32 KB relay spends over a minute
+// pasting — a long window in which the destination can mishandle the input.
+type Options struct {
+	// PasteChunkRunes is the paste size in runes, not bytes, so a CJK prompt
+	// is chunked the same way an ASCII one is.
+	PasteChunkRunes int
+	PasteChunkDelay time.Duration
+}
 
-var sendTextChunkDelay = time.Second
+const (
+	defaultPasteChunkRunes = 500
+	defaultPasteChunkDelay = time.Second
+)
+
+func DefaultOptions() Options {
+	return Options{PasteChunkRunes: defaultPasteChunkRunes, PasteChunkDelay: defaultPasteChunkDelay}
+}
+
+func (o Options) normalized() Options {
+	if o.PasteChunkRunes <= 0 {
+		o.PasteChunkRunes = defaultPasteChunkRunes
+	}
+	if o.PasteChunkDelay < 0 {
+		o.PasteChunkDelay = defaultPasteChunkDelay
+	}
+	return o
+}
 
 func NewExecutor() Executor {
-	return &executorImpl{}
+	return NewExecutorWithOptions(DefaultOptions())
+}
+
+func NewExecutorWithOptions(options Options) Executor {
+	return &executorImpl{options: options.normalized()}
 }
 
 func (e *executorImpl) exec(args ...string) (string, error) {
@@ -79,6 +112,18 @@ func (e *executorImpl) CapturePaneClean(paneID string, lines int) (string, error
 	return ansi.Strip(raw), nil
 }
 
+// CaptureScreenClean returns only what the pane currently displays. Whether a
+// pasted prompt is still sitting in an agent's input area is a property of the
+// visible screen: a TUI that redraws by scrolling pushes identical frames into
+// the scrollback, and including that history would read a repaint as output.
+func (e *executorImpl) CaptureScreenClean(paneID string) (string, error) {
+	out, err := e.exec("capture-pane", "-p", "-J", "-t", paneID)
+	if err != nil {
+		return "", err
+	}
+	return ansi.Strip(trimLineEnds(strings.TrimRight(out, "\n"))), nil
+}
+
 func (e *executorImpl) SendKeys(paneID, keys string) error {
 	return e.SendKeysContext(context.Background(), paneID, keys)
 }
@@ -108,7 +153,7 @@ func (e *executorImpl) SendTextContext(ctx context.Context, paneID, content stri
 
 func (e *executorImpl) sendTextChunks(ctx context.Context, paneID, content string) error {
 	return sendMixedTextWith(
-		ctx, content, sendTextChunkSize, sendTextChunkDelay,
+		ctx, content, e.options.PasteChunkRunes, e.options.PasteChunkDelay,
 		func(chunk string) error { return e.pasteTextChunk(paneID, chunk) },
 		func(control rune) error {
 			_, err := e.exec("send-keys", "-t", paneID, string(control))

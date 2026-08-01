@@ -56,6 +56,7 @@ var (
 	ppLines                   int
 	ppRoundTimeout            int
 	ppScreenIdleTimeout       int
+	ppScreenIdleNormalize     bool
 	ppReceiptIdleTimeout      int
 	ppCompletionSettleTimeout int
 	ppSummarize               bool
@@ -69,6 +70,12 @@ var (
 	ppSubmitDelay             int
 	ppSubmitConfirmTimeout    int
 	ppSubmitRetries           int
+	ppAllowShellPane          bool
+	ppInputEchoCheck          string
+	ppPendingInputTimeout     int
+	ppPendingInputNudges      int
+	ppPasteChunkSize          int
+	ppPasteChunkDelay         int
 	ppMaxRelayBytes           int
 	ppMaxTotalRelayBytes      int
 	ppMaxLLMCalls             int
@@ -96,6 +103,44 @@ var (
 
 // defaultRelayPrompt is used when no direction-specific prompt is provided.
 const defaultRelayPrompt = "請根據以下上一步的結果繼續執行。"
+
+// pasteOptions turns the paste-throttle flags into executor options. Both are
+// validated before the workflow starts, so a zero delay here is a deliberate
+// choice rather than an unset value.
+func pasteOptions() tmux.Options {
+	return tmux.Options{
+		PasteChunkRunes: ppPasteChunkSize,
+		PasteChunkDelay: time.Duration(ppPasteChunkDelay) * time.Millisecond,
+	}
+}
+
+func validatePasteOptions() error {
+	if ppPasteChunkSize <= 0 {
+		return fmt.Errorf("--paste-chunk-size must be greater than zero")
+	}
+	if ppPasteChunkDelay < 0 {
+		return fmt.Errorf("--paste-chunk-delay must not be negative")
+	}
+	return nil
+}
+
+func validateSubmitOptions() error {
+	if ppSubmitDelay < 0 {
+		return fmt.Errorf("--submit-delay must not be negative")
+	}
+	if ppSubmitConfirmTimeout < 0 || ppSubmitRetries < 0 {
+		return fmt.Errorf("submit confirmation timeout and retries must not be negative")
+	}
+	if ppPendingInputTimeout < 0 || ppPendingInputNudges < 0 {
+		return fmt.Errorf("--pending-input-timeout and --pending-input-nudges must not be negative")
+	}
+	switch ppInputEchoCheck {
+	case inputEchoAuto, inputEchoStrict, inputEchoOff:
+	default:
+		return fmt.Errorf("--input-echo-check must be one of %q, %q, or %q", inputEchoAuto, inputEchoStrict, inputEchoOff)
+	}
+	return nil
+}
 
 var pingpongCmd = &cobra.Command{
 	Use:   "pingpong",
@@ -202,6 +247,7 @@ func init() {
 	pingpongCmd.Flags().IntVar(&ppLines, "lines", 256, "Lines of pane content to capture per relay")
 	pingpongCmd.Flags().IntVar(&ppRoundTimeout, "round-timeout", 600, "Per-round timeout in seconds (0 = no timeout)")
 	pingpongCmd.Flags().IntVar(&ppScreenIdleTimeout, "screen-idle-timeout", 0, "After this many unchanged-screen seconds, use the LLM to detect a completed response (0 disables)")
+	pingpongCmd.Flags().BoolVar(&ppScreenIdleNormalize, "screen-idle-normalize", false, "Ignore continuously repainting UI chrome when deciding the screen is idle for --screen-idle-timeout")
 	pingpongCmd.Flags().IntVar(&ppReceiptIdleTimeout, "receipt-idle-timeout", 30, "After a valid status receipt and this many unchanged-screen seconds, hand off without DONE (0 disables)")
 	pingpongCmd.Flags().IntVar(&ppCompletionSettleTimeout, "completion-settle-timeout", 1000, "Milliseconds a validated completion envelope must remain unchanged before handoff (0 disables)")
 	pingpongCmd.Flags().BoolVar(&ppSummarize, "summarize", false, "Run relayed content through Ollama for summarization before sending")
@@ -213,8 +259,14 @@ func init() {
 	pingpongCmd.Flags().StringVar(&ppInitialFrom, "initial-from", "", "Bootstrap with the latest completed response from pane1 or pane2")
 	pingpongCmd.Flags().IntVar(&ppInitialLines, "initial-from-lines", 500, "Recent source-pane lines scanned by --initial-from")
 	pingpongCmd.Flags().IntVar(&ppSubmitDelay, "submit-delay", 500, "Delay in milliseconds between pasting a prompt and pressing Enter")
-	pingpongCmd.Flags().IntVar(&ppSubmitConfirmTimeout, "submit-confirm-timeout", 5000, "Milliseconds to wait for pane output/state change after Enter (0 disables confirmation)")
+	pingpongCmd.Flags().IntVar(&ppSubmitConfirmTimeout, "submit-confirm-timeout", 8000, "Milliseconds to watch a pane after Enter before deciding the prompt was not consumed (0 disables; below ~6000 the verdict degrades to \"anything changed\")")
 	pingpongCmd.Flags().IntVar(&ppSubmitRetries, "submit-retries", 1, "Additional Enter attempts when submission is not observable")
+	pingpongCmd.Flags().BoolVar(&ppAllowShellPane, "allow-shell-pane", false, "Send prompts even when a pane's foreground process is a plain shell instead of an agent")
+	pingpongCmd.Flags().StringVar(&ppInputEchoCheck, "input-echo-check", inputEchoAuto, "Verify the pasted prompt is visible before pressing Enter: auto, strict, or off")
+	pingpongCmd.Flags().IntVar(&ppPendingInputTimeout, "pending-input-timeout", 45, "Seconds an unconsumed prompt may sit in a pane's input area before Enter is re-sent (0 disables)")
+	pingpongCmd.Flags().IntVar(&ppPendingInputNudges, "pending-input-nudges", 1, "Extra Enter attempts during a round while the prompt is provably unconsumed")
+	pingpongCmd.Flags().IntVar(&ppPasteChunkSize, "paste-chunk-size", 500, "Runes pasted into a pane per chunk")
+	pingpongCmd.Flags().IntVar(&ppPasteChunkDelay, "paste-chunk-delay", 1000, "Delay in milliseconds between pasted chunks")
 	pingpongCmd.Flags().IntVar(&ppMaxRelayBytes, "max-relay-bytes", 32*1024, "Maximum UTF-8 bytes allowed in any outbound prompt (excess stops the workflow)")
 	pingpongCmd.Flags().IntVar(&ppMaxTotalRelayBytes, "max-total-relay-bytes", 128*1024, "Maximum total UTF-8 bytes sent during one workflow")
 	pingpongCmd.Flags().IntVar(&ppMaxLLMCalls, "max-llm-calls", 40, "Maximum selector/coordinator/summarizer LLM calls")
@@ -257,11 +309,11 @@ func runPingPong() error {
 	if ppPane1 == ppPane2 {
 		return fmt.Errorf("--pane1 and --pane2 must be different panes")
 	}
-	if ppSubmitDelay < 0 {
-		return fmt.Errorf("--submit-delay must not be negative")
+	if err := validateSubmitOptions(); err != nil {
+		return err
 	}
-	if ppSubmitConfirmTimeout < 0 || ppSubmitRetries < 0 {
-		return fmt.Errorf("submit confirmation timeout and retries must not be negative")
+	if err := validatePasteOptions(); err != nil {
+		return err
 	}
 	if ppCompletionSettleTimeout < 0 {
 		return fmt.Errorf("--completion-settle-timeout must not be negative")
@@ -306,7 +358,7 @@ func runPingPong() error {
 		toPane2Prompt = defaultRelayPrompt
 	}
 
-	ex := tmux.NewExecutor()
+	ex := tmux.NewExecutorWithOptions(pasteOptions())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -439,8 +491,11 @@ type pingPongPreset struct {
 	MaxSelectionRetries int      `yaml:"max_selection_retries"`
 	RoundTimeout        int      `yaml:"round_timeout"`
 	ScreenIdleTimeout   int      `yaml:"screen_idle_timeout"`
+	ScreenIdleNormalize bool     `yaml:"screen_idle_normalize"`
 	CompletionSettleMS  *int     `yaml:"completion_settle_ms"`
 	SubmitDelay         int      `yaml:"submit_delay"`
+	PasteChunkSize      int      `yaml:"paste_chunk_size"`
+	PasteChunkDelayMS   *int     `yaml:"paste_chunk_delay_ms"`
 	Lines               int      `yaml:"lines"`
 	NewSession          bool     `yaml:"new_session"`
 	PaneStream          bool     `yaml:"pane_stream"`
@@ -530,11 +585,20 @@ func applyPingPongPreset() error {
 	if preset.ScreenIdleTimeout > 0 {
 		ppScreenIdleTimeout = preset.ScreenIdleTimeout
 	}
+	if ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("screen-idle-normalize") {
+		ppScreenIdleNormalize = preset.ScreenIdleNormalize
+	}
 	if preset.CompletionSettleMS != nil {
 		ppCompletionSettleTimeout = *preset.CompletionSettleMS
 	}
 	if preset.SubmitDelay > 0 {
 		ppSubmitDelay = preset.SubmitDelay
+	}
+	if preset.PasteChunkSize > 0 {
+		ppPasteChunkSize = preset.PasteChunkSize
+	}
+	if preset.PasteChunkDelayMS != nil {
+		ppPasteChunkDelay = *preset.PasteChunkDelayMS
 	}
 	if preset.Lines > 0 {
 		ppLines = preset.Lines
@@ -934,7 +998,7 @@ func controlMarkerInstruction(done, stop string) string {
 // every round complete immediately.
 // If the per-round timeout is reached, returns an error.
 func waitForCompletion(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol) (string, bool, error) {
-	output, stopped, _, err := waitForCompletionWithFallback(ctx, ex, paneID, baseline, protocol, nil, nil)
+	output, stopped, _, err := waitForCompletionWithFallback(ctx, ex, paneID, baseline, protocol, nil, nil, submitResult{})
 	return output, stopped, err
 }
 
@@ -977,7 +1041,7 @@ func (s *completionSettleState) observe(envelope string, stopped bool, now time.
 // selector only after the entire pane has remained unchanged for a bounded
 // period.  A selector cannot fabricate text: it returns a slice of the actual
 // captured screen, and an empty slice means "still working".
-func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error), stream *paneStream) (string, bool, bool, error) {
+func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error), stream *paneStream, submit submitResult) (string, bool, bool, error) {
 	interval := time.Duration(ppInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -991,14 +1055,17 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	captureFailures := 0
-	var lastScreen string
-	var screenChangedAt time.Time
+	var volatility screenVolatility
+	var rawScreen, stableKey string
+	var rawChangedAt, stableChangedAt time.Time
 	var fallbackAttemptedFor string
 	var goalDoneSeen bool
 	var goalDoneStopped bool
 	var goalDoneOutput string
 	var receiptWaitAnnounced bool
 	var completionSettle completionSettleState
+	var stall roundStallDiagnosis
+	pending := newPendingInputWatch(submit, time.Now())
 
 	// commitCompletion validates a detected completion marker and holds it in
 	// the settle window until the envelope is observed twice. ready=false means
@@ -1007,15 +1074,29 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 	// reports whether a usable envelope was recovered at all, so a caller that
 	// has weaker evidence can fall through to the remaining fallbacks instead
 	// of waiting out the round on a completion it cannot validate.
-	commitCompletion := func(content string, envelopeProtocol roundControlProtocol, stopped, compatible bool) (string, bool, bool, error) {
+	commitCompletion := func(content string, envelopeProtocol roundControlProtocol, stopped, compatible, allowFileReceiptRepair bool) (string, bool, bool, error) {
 		envelope, valid := extractCompletedProtocolEnvelope(content, envelopeProtocol)
 		if !valid {
+			stall.noteMissingEnvelope(content, envelopeProtocol)
 			// File transport may carry the receipt in the runner-owned outbox,
 			// which no terminal rendering can damage. Prefer the pane when it
 			// parses, and fall back to the file before declaring the receipt
 			// missing.
 			synthesized, ok := fileReceiptEnvelope(protocol)
 			if !ok {
+				// A file handoff which has explicitly printed DONE but has no
+				// parseable receipt is still recoverable: the next stage invokes
+				// the nonce-bound receipt-repair turn on this same pane. Keeping
+				// polling until the round timeout makes that repair path
+				// unreachable, and forces the user to restart the workflow just
+				// to correct a small JSON/schema mistake.
+				//
+				// Goal members remain stricter. Their receipt is part of the
+				// evidence required before the runner clears the native goal.
+				if allowFileReceiptRepair && hasUnusableStatusReceipt(content, envelopeProtocol) && envelopeProtocol.Transport == handoffTransportFile && envelopeProtocol.RequireStatus && !envelopeProtocol.GoalMode {
+					fmt.Printf("⚠️ Pane %s 已輸出完成標記，但 status receipt 無法驗證；將要求該 pane 修復 receipt\n", paneID)
+					return content, true, true, nil
+				}
 				return "", false, false, nil
 			}
 			envelope = synthesized
@@ -1025,7 +1106,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			verified = "相容的" + verified
 		}
 		if protocol.GoalMode {
-			if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+			if _, err := sendToPane(ctx, ex, paneID, "/goal clear", ""); err != nil {
 				return "", false, true, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
 			}
 			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
@@ -1033,6 +1114,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			return "", false, true, nil
 		}
 		if completionSettle.captures == 0 || completionSettle.envelope != envelope {
+			stall.noteEnvelopeChanged()
 			fmt.Printf("✅ Pane %s 已驗證 %s；等待完成 envelope 穩定 %s\n", paneID, verified, completionSettleDuration())
 		}
 		if completionSettle.observe(envelope, stopped, time.Now(), completionSettleDuration()) {
@@ -1050,10 +1132,8 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		}
 
 		if ppRoundTimeout > 0 && time.Now().After(deadline) {
-			if protocol.GoalDoneMarker != "" {
-				return "", false, false, fmt.Errorf("pane %s 在 %d 秒內未先輸出 goal completion marker %q，再輸出完成標記 %q", paneID, ppRoundTimeout, protocol.GoalDoneMarker, protocol.DoneMarker)
-			}
-			return "", false, false, fmt.Errorf("pane %s 在 %d 秒內未輸出完成標記 %q", paneID, ppRoundTimeout, protocol.DoneMarker)
+			stall.stableFor = time.Since(stableChangedAt)
+			return "", false, false, stall.err(paneID, protocol, ppRoundTimeout, rawScreen)
 		}
 
 		content, err := ex.CapturePaneClean(paneID, ppLines)
@@ -1075,15 +1155,23 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			controlContent = stripTextFrame(content, protocol.TextBeginMarker, protocol.TextEndMarker)
 			controlNewContent = stripTextFrame(newContent, protocol.TextBeginMarker, protocol.TextEndMarker)
 		}
-		if screenChangedAt.IsZero() || content != lastScreen {
-			lastScreen, screenChangedAt = content, time.Now()
+		stability := volatility.observe(content, protocol)
+		if rawChangedAt.IsZero() || content != rawScreen {
+			rawScreen, rawChangedAt = content, time.Now()
+		}
+		if stableChangedAt.IsZero() || stability.Key != stableKey {
+			stableKey, stableChangedAt = stability.Key, time.Now()
+		}
+		if stability.Excluded > 0 && !volatility.announced {
+			volatility.announced = true
+			fmt.Printf("💤 Pane %s 有 %d 行持續重繪的 UI chrome，判斷閒置時將忽略這些行\n", paneID, stability.Excluded)
 		}
 		// A managed Codex goal must be cleared immediately after its verified
 		// receipt, then remain idle before the runner may hand it off. This keeps
 		// Codex's native goal lifecycle ahead of the next pane's task.
 		if protocol.GoalMode && goalDoneSeen {
 			idle := time.Duration(ppReceiptIdleTimeout) * time.Second
-			if time.Since(screenChangedAt) >= idle {
+			if time.Since(stableChangedAt) >= idle {
 				fmt.Printf("✅ Pane %s 已在 /goal clear 後連續穩定 %s，開始處理本輪結果\n", paneID, completionIdleDuration())
 				return goalDoneOutput, goalDoneStopped, false, nil
 			}
@@ -1094,13 +1182,15 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// when an alternate-screen TUI redraw means the old baseline is no longer
 		// a comparable prefix.
 		if done, stopped := completionMarkers(controlContent, protocol.DoneMarker, protocol.StopMarker); done {
+			stall.noteCompletionMarker(false)
 			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, protocol.DoneMarker, protocol.StopMarker) {
+				stall.goalMarkerMissing = true
 				continue
 			}
 			if !protocol.RequireStatus {
 				return newContent, stopped, false, nil
 			}
-			envelope, ready, _, err := commitCompletion(content, protocol, stopped, false)
+			envelope, ready, _, err := commitCompletion(content, protocol, stopped, false, true)
 			if err != nil {
 				return "", false, false, err
 			}
@@ -1114,7 +1204,9 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// instruction. This boundary prevents standalone markers quoted in old
 		// bootstrap or relay content from completing the new round.
 		if done, stopped := baseMarkersAfterRoundInstruction(controlNewContent, protocol.DoneMarker, protocol.StopMarker, ppDone, ppStop); done {
+			stall.noteCompletionMarker(false)
 			if !goalCompletionPrecedes(controlContent, protocol.GoalDoneMarker, ppDone, ppStop) {
+				stall.goalMarkerMissing = true
 				continue
 			}
 			if !protocol.RequireStatus {
@@ -1123,7 +1215,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 			baseProtocol := protocol
 			baseProtocol.DoneMarker = ppDone
 			baseProtocol.StopMarker = ppStop
-			envelope, ready, _, err := commitCompletion(content, baseProtocol, stopped, true)
+			envelope, ready, _, err := commitCompletion(content, baseProtocol, stopped, true, true)
 			if err != nil {
 				return "", false, false, err
 			}
@@ -1144,7 +1236,8 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				streamControl = stripTextFrame(streamText, protocol.TextBeginMarker, protocol.TextEndMarker)
 			}
 			if done, stopped := completionMarkers(streamControl, protocol.DoneMarker, protocol.StopMarker); done {
-				envelope, ready, found, err := commitCompletion(streamText, protocol, stopped, false)
+				stall.noteCompletionMarker(true)
+				envelope, ready, found, err := commitCompletion(streamText, protocol, stopped, false, false)
 				if err != nil {
 					return "", false, false, err
 				}
@@ -1167,7 +1260,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// same idle handoff path as a normal DONE completion.
 		receiptValid := hasValidStatusReceipt(controlContent, protocol)
 		if protocol.GoalMode && protocol.GoalDoneMarker == "" && receiptValid && goalModeNativeCompletionAfterReceipt(content, protocol.StatusMarker) {
-			if err := sendToPane(ctx, ex, paneID, "/goal clear"); err != nil {
+			if _, err := sendToPane(ctx, ex, paneID, "/goal clear", ""); err != nil {
 				return "", false, false, fmt.Errorf("clear receipt-completed goal in %s: %w", paneID, err)
 			}
 			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, false, content
@@ -1185,12 +1278,15 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		// If an agent omits DONE, normal members can use the configured idle
 		// fallback after a schema-valid receipt. Goal members additionally need
 		// the explicit native completion state checked above.
+		if receiptValid || fileReceipt {
+			stall.validReceipt = true
+		}
 		if ppReceiptIdleTimeout > 0 && (receiptValid || fileReceipt) {
 			if !receiptWaitAnnounced {
 				fmt.Printf("🧾 Pane %s 已偵測到有效 status receipt，但尚未偵測到完成標記；等待畫面連續穩定 %s\n", paneID, completionIdleDuration())
 				receiptWaitAnnounced = true
 			}
-			if !protocol.GoalMode && time.Since(screenChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
+			if !protocol.GoalMode && time.Since(stableChangedAt) >= time.Duration(ppReceiptIdleTimeout)*time.Second {
 				fmt.Printf("✅ Pane %s 已連續穩定 %s，使用 status receipt 處理本輪結果\n", paneID, completionIdleDuration())
 				if fileReceipt {
 					return fileEnvelope, false, false, nil
@@ -1198,17 +1294,47 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				return newContent, false, false, nil
 			}
 		}
+		// A prompt that never reached the agent leaves the pane showing exactly
+		// what it showed while the paste sat unsubmitted in the input area, with
+		// only repainting chrome differing. That is a delivery failure, not a
+		// slow agent, and it must be resolved before the screen-idle selector
+		// runs: an unconsumed prompt produces a permanently idle screen, and
+		// spending LLM calls asking whether that screen finished a round can
+		// only produce a wrong answer.
+		if pending.stillPending(ex, paneID) {
+			if !pending.announced {
+				pending.announced = true
+				fmt.Printf("🕳️ Pane %s 的畫面自 prompt 送出後只有 chrome 在重繪；若 %s 內仍無變化，將判定 Enter 未生效\n", paneID, time.Duration(ppPendingInputTimeout)*time.Second)
+			}
+			if pending.expired(time.Now()) {
+				if pending.exhausted() {
+					return "", false, false, pending.err(paneID, time.Now())
+				}
+				fmt.Printf("⚠️ Pane %s 的 prompt 仍留在輸入區未被提交，補送一次 Enter\n", paneID)
+				if err := pending.nudge(ex, paneID, time.Now()); err != nil {
+					return "", false, false, err
+				}
+				stall.pendingNudges = pending.nudges
+			}
+			continue
+		}
+		// Unlike the receipt fallback, the selector has no receipt to check its
+		// verdict against, so it keeps comparing whole captures by default:
+		// filtering chrome would only lower the bar for entering an LLM
+		// judgement that is itself the safeguard.
+		idleKey, idleChangedAt := content, rawChangedAt
+		if ppScreenIdleNormalize {
+			idleKey, idleChangedAt = stability.Key, stableChangedAt
+		}
 		// A screen-idle selector cannot prove that a strict /goal completion was
 		// closed, so it remains unavailable when that explicit mode is enabled.
 		if fallback != nil && protocol.GoalDoneMarker == "" && ppScreenIdleTimeout > 0 && content != baseline {
-			if screenChangedAt.IsZero() || content != lastScreen {
-				lastScreen, screenChangedAt = content, time.Now()
-			} else if content != fallbackAttemptedFor && time.Since(screenChangedAt) >= time.Duration(ppScreenIdleTimeout)*time.Second {
+			if idleKey != fallbackAttemptedFor && time.Since(idleChangedAt) >= time.Duration(ppScreenIdleTimeout)*time.Second {
 				fmt.Printf("💤 Pane %s 畫面已連續 %s 無變化，正在判斷是否已完成本輪\n", paneID, time.Duration(ppScreenIdleTimeout)*time.Second)
 				selected, fallbackErr := fallback(ctx, content)
 				// Do not repeatedly spend LLM calls on an unchanged screen. A new
 				// render receives a fresh fingerprint and can be considered again.
-				fallbackAttemptedFor = content
+				fallbackAttemptedFor = idleKey
 				if fallbackErr != nil {
 					return "", false, false, fmt.Errorf("screen-idle completion fallback for %s: %w", paneID, fallbackErr)
 				}
@@ -1264,6 +1390,22 @@ func hasValidStatusReceipt(output string, protocol roundControlProtocol) bool {
 	}
 	_, err := parseProtocolStatus(output, protocol)
 	return err == nil
+}
+
+// hasUnusableStatusReceipt distinguishes a malformed receipt from no receipt
+// at all. A file turn with the former has completed enough of the protocol to
+// repair in place; a bare DONE marker remains insufficient evidence and must
+// keep waiting. This is deliberately capture-only: a stream can lose or
+// reorder visual rows, so it cannot authorize a repair prompt by itself.
+func hasUnusableStatusReceipt(output string, protocol roundControlProtocol) bool {
+	if !protocol.RequireStatus || protocol.Transport != handoffTransportFile {
+		return false
+	}
+	if _, err := extractProtocolStatusBlock(output, protocol); err != nil {
+		return false
+	}
+	_, err := parseProtocolStatus(output, protocol)
+	return err != nil
 }
 
 // goalCompletionPrecedes keeps a /goal pane from handing off merely because
@@ -1420,63 +1562,105 @@ func completionMarkers(output, doneMarker, stopMarker string) (done, stopped boo
 // paste-buffer (which handles newlines correctly), then explicitly submits
 // it. A configurable delay lets interactive TUI agents finish processing a
 // large pasted prompt before the Enter key arrives.
-func sendToPane(ctx context.Context, ex tmux.Executor, paneID, content string) error {
+//
+// The returned submitResult carries what the pane looked like with the prompt
+// still sitting unsubmitted in its input area, which is what lets the round
+// tell a prompt that never arrived from an agent that is working on it.
+func sendToPane(ctx context.Context, ex tmux.Executor, paneID, content, echo string) (submitResult, error) {
+	result := submitResult{}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("send to %s canceled before paste: %w", paneID, err)
+		return result, fmt.Errorf("send to %s canceled before paste: %w", paneID, err)
+	}
+	// Check before pasting, not after: a pane in copy-mode discards the paste
+	// itself, so afterwards there is nothing left to recover or diagnose.
+	if err := ensurePaneAcceptsInput(ex, paneID); err != nil {
+		return result, err
+	}
+	if ppInputEchoCheck == inputEchoOff {
+		echo = ""
+	}
+	beforePaste := ""
+	if echo != "" {
+		// Captured before the paste so an unrendered echo marker can still be
+		// told apart from a paste that never arrived.
+		if screen, err := ex.CaptureScreenClean(paneID); err == nil {
+			beforePaste = screen
+		}
 	}
 	if err := ex.SendLinesContext(ctx, paneID, content); err != nil {
-		return err
+		return result, err
 	}
 	if ppSubmitDelay > 0 {
 		timer := time.NewTimer(time.Duration(ppSubmitDelay) * time.Millisecond)
 		defer timer.Stop()
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("send to %s canceled after paste; Enter was not sent: %w", paneID, ctx.Err())
+			return result, fmt.Errorf("send to %s canceled after paste; Enter was not sent: %w", paneID, ctx.Err())
 		case <-timer.C:
 		}
 	}
 	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("send to %s canceled before Enter: %w", paneID, err)
+		return result, fmt.Errorf("send to %s canceled before Enter: %w", paneID, err)
 	}
-	if ppSubmitConfirmTimeout <= 0 {
-		_, err := ex.Exec("send-keys", "-t", paneID, "Enter")
-		return err
-	}
-	before, err := ex.CapturePaneClean(paneID, ppLines)
+	// Verify the paste itself before committing to Enter. Pressing Enter into a
+	// pane that never received the text would submit whatever else is sitting in
+	// that input area.
+	echoState, echoScreen, err := verifyPromptEcho(ctx, ex, paneID, echo, beforePaste)
 	if err != nil {
-		return fmt.Errorf("capture %s before Enter: %w", paneID, err)
+		return result, fmt.Errorf("verify paste in %s: %w", paneID, err)
 	}
+	switch echoState {
+	case echoAbsent:
+		return result, promptEchoAbsentError(paneID, echo)
+	case echoUnverifiable:
+		if ppInputEchoCheck == inputEchoStrict {
+			return result, fmt.Errorf("%w（--input-echo-check=strict）", promptEchoAbsentError(paneID, echo))
+		}
+		fmt.Printf("⚠️ Pane %s 沒有顯示本輪 prompt 的送達標記（可能把大段 paste 摺成佔位符），改以畫面變化判斷已收到內容\n", paneID)
+	}
+	// The pending capture is taken even when confirmation is disabled: it is the
+	// reference the round-long pending-input watch compares against. Reuse the
+	// echo check's last capture so a repaint cannot slip in between.
+	pending := echoScreen
+	if pending == "" {
+		var captureErr error
+		pending, captureErr = ex.CaptureScreenClean(paneID)
+		if captureErr != nil {
+			if ppSubmitConfirmTimeout > 0 {
+				return result, fmt.Errorf("capture %s before Enter: %w", paneID, captureErr)
+			}
+			fmt.Fprintf(os.Stderr, "warn: capture %s before Enter: %v\n", paneID, captureErr)
+		}
+	}
+	result.PendingScreen = pending
+	if ppSubmitConfirmTimeout <= 0 {
+		result.Attempts = 1
+		_, err := ex.Exec("send-keys", "-t", paneID, "Enter")
+		return result, err
+	}
+	window := time.Duration(ppSubmitConfirmTimeout) * time.Millisecond
+	observation := submitObservation{}
 	for attempt := 0; attempt <= ppSubmitRetries; attempt++ {
 		if _, err := ex.Exec("send-keys", "-t", paneID, "Enter"); err != nil {
-			return err
+			return result, err
 		}
-		deadline := time.NewTimer(time.Duration(ppSubmitConfirmTimeout) * time.Millisecond)
-		ticker := time.NewTicker(200 * time.Millisecond)
-		changed := false
-		for !changed {
-			select {
-			case <-ctx.Done():
-				deadline.Stop()
-				ticker.Stop()
-				return fmt.Errorf("submit to %s canceled after Enter: %w", paneID, ctx.Err())
-			case <-deadline.C:
-				changed = true // timeout; retry below after final check
-			case <-ticker.C:
-				after, captureErr := ex.CapturePaneClean(paneID, ppLines)
-				if captureErr == nil && after != before {
-					deadline.Stop()
-					changed = true
-				}
-			}
+		result.Attempts = attempt + 1
+		var err error
+		observation, err = observeSubmission(ctx, ex, paneID, pending, window)
+		if err != nil {
+			return result, fmt.Errorf("submit to %s canceled after Enter: %w", paneID, err)
 		}
-		ticker.Stop()
-		after, captureErr := ex.CapturePaneClean(paneID, ppLines)
-		if captureErr == nil && after != before {
-			return nil
+		// Without enough samples to identify chrome, the only honest verdict is
+		// the one the runner used before this filter existed: any change counts.
+		if observation.NonChromeChange || (!observation.Conclusive && observation.RawChange) {
+			result.Confirmed = true
+			return result, nil
+		}
+		if observation.Conclusive && observation.RawChange {
+			fmt.Printf("⚠️ Pane %s 在第 %d 次 Enter 後只有 UI chrome 在重繪，輸入區的 prompt 沒有被消化\n", paneID, result.Attempts)
 		}
 	}
-	return fmt.Errorf("submit to %s not confirmed after %d Enter attempt(s); stopping for safety", paneID, ppSubmitRetries+1)
+	return result, submitNotConfirmedError(paneID, result.Attempts, observation)
 }
 
 // filterMarkerLines removes standalone control-marker lines so they are not
