@@ -1060,6 +1060,8 @@ pingpong 靠兩個標記運作：
 
 > Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行；兩者之間的 JSON 必須是 compact 的單一實體行，且 JSON 字串內不得有未跳脫的換行（需要換行時寫 `\\n`）。`summary` 只放簡短控制摘要，詳細結果放 artifact，避免 TUI 強制換行。JSON 為 `{"version":1,"outcome":…,"summary":…,"tests":[],"prompt_head":…}`；`prompt_head` 由 runner 驗證，見下方送達檢查。runner 對畫面捕捉到的 JSON 字串內硬換行會做受限復原，但 outbox receipt 始終採嚴格 JSON 驗證。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
 >
+> file preset 可設 `completion_mode: helper`。runner 會在 outbox 建立 task manifest，agent 完成工作後只需在其 TUI 內執行 prompt 提供的 `tmux-ai handoff complete --task … --prompt-head … --outcome … --summary …`；helper 會原子發布 receipt，並印出相同的 status frame 與 completion marker。helper 的 receipt 已通過 schema 和 prompt-head 驗證後，非 `/goal` round 會直接交接，不必等待畫面 marker 或 `--receipt-idle-timeout`。`manual` 仍是預設，保留既有手工 receipt 相容性。
+>
 > file transport 的 receipt repair 失敗，或 round timeout 明確顯示「畫面已連續…沒有非 chrome 變化」但尚未出現 completion marker 時，互動提示可輸入 `l`。runner 只讀取目前 pane 畫面，讓 LLM 明確判定 `completed`、`still_working` 或 `needs_human`，再由 runner 在本地驗證替代 receipt；這不會重送原任務或傳送訊息給 agent。receipt repair 仍會驗證原本的 `prompt_head`；靜止畫面只能在 LLM 明確判定完成時建立強制 `needs_followup` receipt，交由 coordinator 複核，絕不直接停止 workflow。`still_working`、`needs_human` 或證據不足會拒絕交接。`y` 仍只會繼續等待。
 >
 > Round 失敗提示也可輸入 `r` 重送本輪原始 prompt。這是明確的人工覆寫：agent 可能因此再次執行工作，請只在確認 prompt 沒有送達或沒有被處理時使用。runner 每輪最多重送兩次，保留 relay byte budget，並改用新的送達 marker 重新確認 paste，而不是把畫面上既有的舊 marker 誤判為新送達。
@@ -1101,8 +1103,24 @@ pingpong 靠兩個標記運作：
 | `auto`（預設） | LLM 根據 `--initial` + `--pane1-role` / `--pane2-role` 判斷最適合的起始 pane |
 | `pane1` | 固定由 pane1 開始 |
 | `pane2` | 固定由 pane2 開始 |
+| preset `routing.mode: state_machine` | 由 `routing.initial_member` 固定開始，不呼叫 LLM |
 
 `auto` 模式下，LLM 會收到初始指令和兩個角色描述，回傳 JSON `{"start": 1 或 2, "reason": "理由"}`。若未設定任何 role 或 LLM 無法判斷，預設由 pane1 開始。
+
+固定 reviewer/fixer 閉環可用 preset 的 state machine，不需 coordinator：
+
+```yaml
+routing:
+  mode: state_machine
+  initial_member: pane1
+  transitions:
+    pane1:
+      success: {action: stop}
+      needs_followup: {action: send, target: pane2}
+      blocked: {action: needs_human}
+```
+
+每位 member 都必須定義 `success`、`needs_followup`、`blocked`；`stop` 仍受 `stop_members` 限制。state machine 只使用已驗證 receipt outcome，不會判讀 agent 自由文字，也不會呼叫 coordinator。
 
 > 例如 `--initial "修復 main.go 的 bug"` 搭配 pane2 角色「工程師，負責修改程式碼」，LLM 可能判斷直接由 pane2 開始，跳過 pane1 的規劃階段。
 
