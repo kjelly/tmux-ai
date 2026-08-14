@@ -90,6 +90,7 @@ var (
 	ppNewSession              bool
 	ppPaneStream              bool
 	ppPresetHandoff           handoffPresetConfig
+	ppRouting                 stateMachineRoutingPreset
 
 	// Role-based division of labour
 	ppPane1Role                  string // prepended to every message sent to pane1
@@ -452,65 +453,83 @@ func runPingPong(ctx context.Context, manualRoundPrompt <-chan os.Signal, cancel
 	if err != nil {
 		return fmt.Errorf("invalid --stop-members: %w", err)
 	}
-	router := func(ctx context.Context, round int, current handoffMember, result turnResult, stopRequested bool) (handoffRoute, error) {
-		nextID, nextNumber := "pane2", 2
-		if current.ID == "pane2" {
-			nextID, nextNumber = "pane1", 1
+	var router handoffRouter
+	stateMachine := strings.EqualFold(strings.TrimSpace(ppRouting.Mode), "state_machine")
+	if stateMachine {
+		if ppCoordinator {
+			return fmt.Errorf("routing.mode=state_machine cannot be combined with --coordinator")
 		}
-		instruction := promptForPane(nextNumber, toPane1Prompt, toPane2Prompt)
-		if !ppCoordinator {
-			return handoffRoute{NextID: nextID, Instruction: instruction, Confidence: 1}, nil
-		}
-		payloadInfo := textPayloadMetadata(result.Payload.Text)
-		decision, err := decideHandoffAction(ctx, handoffCoordinatorRequest{
-			Initial: ppInitial, Policy: ppCoordinatorPolicy, Round: round,
-			CurrentID: current.ID, CurrentOutput: result.Narrative, StopRequested: stopRequested, StopMembers: stopMembers,
-			Transport: transport.Transport, CurrentStatus: result.Status, TextPayloadBytes: payloadInfo.Bytes, TextPayloadLines: payloadInfo.Lines, TextPayloadSHA256: payloadInfo.SHA256,
-			IncomingArtifacts: result.Incoming, ProducedArtifacts: result.Produced, AvailableArtifacts: result.AvailableArtifacts(),
-			Members: coordinatorMembers, PayloadBytes: len([]byte(result.Narrative)),
-			PayloadLines: responseLineCount(result.Narrative), TotalBytes: guard.totalBytes, LLMCalls: guard.llmCalls,
-		}, guard)
+		startID, router, err = newStateMachineRouter(ppRouting, members, stopMembers, func(target string) string {
+			if target == "pane1" {
+				return toPane1Prompt
+			}
+			return toPane2Prompt
+		})
 		if err != nil {
-			return handoffRoute{}, fmt.Errorf("coordinator gate failed: %w", err)
+			return fmt.Errorf("invalid state-machine routing: %w", err)
 		}
-		return routeFromCoordinatorDecision(decision)
+	} else {
+		router = func(ctx context.Context, round int, current handoffMember, result turnResult, stopRequested bool) (handoffRoute, error) {
+			nextID, nextNumber := "pane2", 2
+			if current.ID == "pane2" {
+				nextID, nextNumber = "pane1", 1
+			}
+			instruction := promptForPane(nextNumber, toPane1Prompt, toPane2Prompt)
+			if !ppCoordinator {
+				return handoffRoute{NextID: nextID, Instruction: instruction, Confidence: 1}, nil
+			}
+			payloadInfo := textPayloadMetadata(result.Payload.Text)
+			decision, err := decideHandoffAction(ctx, handoffCoordinatorRequest{
+				Initial: ppInitial, Policy: ppCoordinatorPolicy, Round: round,
+				CurrentID: current.ID, CurrentOutput: result.Narrative, StopRequested: stopRequested, StopMembers: stopMembers,
+				Transport: transport.Transport, CurrentStatus: result.Status, TextPayloadBytes: payloadInfo.Bytes, TextPayloadLines: payloadInfo.Lines, TextPayloadSHA256: payloadInfo.SHA256,
+				IncomingArtifacts: result.Incoming, ProducedArtifacts: result.Produced, AvailableArtifacts: result.AvailableArtifacts(),
+				Members: coordinatorMembers, PayloadBytes: len([]byte(result.Narrative)),
+				PayloadLines: responseLineCount(result.Narrative), TotalBytes: guard.totalBytes, LLMCalls: guard.llmCalls,
+			}, guard)
+			if err != nil {
+				return handoffRoute{}, fmt.Errorf("coordinator gate failed: %w", err)
+			}
+			return routeFromCoordinatorDecision(decision)
+		}
 	}
 
 	return handoffEngine{
 		Executor: ex, Guard: guard, Members: members, StartID: startID,
 		InitialInstruction: initialInstruction, InitialFingerprint: initialInstruction,
 		ResetBeforeStart: []handoffMember{members["pane1"], members["pane2"]},
-		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator, Transport: transport, Compaction: compaction, Route: router,
+		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator || stateMachine, Transport: transport, Compaction: compaction, Route: router,
 		ManualRoundPrompt: manualRoundPrompt, CancelWorkflow: cancelWorkflow,
 	}.Run(ctx)
 }
 
 type pingPongPreset struct {
 	handoffPresetConfig `yaml:",inline"`
-	Initial             string   `yaml:"initial"`
-	InitialPane1        string   `yaml:"initial_pane1"`
-	InitialPane2        string   `yaml:"initial_pane2"`
-	Pane1Role           string   `yaml:"pane1_role"`
-	Pane2Role           string   `yaml:"pane2_role"`
-	Pane1GoalMode       bool     `yaml:"pane1_goal_mode"`
-	Pane2GoalMode       bool     `yaml:"pane2_goal_mode"`
-	ToPane1Prompt       string   `yaml:"to_pane1_prompt"`
-	ToPane2Prompt       string   `yaml:"to_pane2_prompt"`
-	Coordinator         bool     `yaml:"coordinator"`
-	CoordinatorPolicy   string   `yaml:"coordinator_policy"`
-	StopMembers         []string `yaml:"stop_members"`
-	CoordinatorTimeout  int      `yaml:"coordinator_timeout"`
-	MaxSelectionRetries int      `yaml:"max_selection_retries"`
-	RoundTimeout        int      `yaml:"round_timeout"`
-	ScreenIdleTimeout   int      `yaml:"screen_idle_timeout"`
-	ScreenIdleNormalize bool     `yaml:"screen_idle_normalize"`
-	CompletionSettleMS  *int     `yaml:"completion_settle_ms"`
-	SubmitDelay         int      `yaml:"submit_delay"`
-	PasteChunkSize      int      `yaml:"paste_chunk_size"`
-	PasteChunkDelayMS   *int     `yaml:"paste_chunk_delay_ms"`
-	Lines               int      `yaml:"lines"`
-	NewSession          bool     `yaml:"new_session"`
-	PaneStream          bool     `yaml:"pane_stream"`
+	Initial             string                    `yaml:"initial"`
+	InitialPane1        string                    `yaml:"initial_pane1"`
+	InitialPane2        string                    `yaml:"initial_pane2"`
+	Pane1Role           string                    `yaml:"pane1_role"`
+	Pane2Role           string                    `yaml:"pane2_role"`
+	Pane1GoalMode       bool                      `yaml:"pane1_goal_mode"`
+	Pane2GoalMode       bool                      `yaml:"pane2_goal_mode"`
+	ToPane1Prompt       string                    `yaml:"to_pane1_prompt"`
+	ToPane2Prompt       string                    `yaml:"to_pane2_prompt"`
+	Coordinator         bool                      `yaml:"coordinator"`
+	CoordinatorPolicy   string                    `yaml:"coordinator_policy"`
+	StopMembers         []string                  `yaml:"stop_members"`
+	CoordinatorTimeout  int                       `yaml:"coordinator_timeout"`
+	MaxSelectionRetries int                       `yaml:"max_selection_retries"`
+	RoundTimeout        int                       `yaml:"round_timeout"`
+	ScreenIdleTimeout   int                       `yaml:"screen_idle_timeout"`
+	ScreenIdleNormalize bool                      `yaml:"screen_idle_normalize"`
+	CompletionSettleMS  *int                      `yaml:"completion_settle_ms"`
+	SubmitDelay         int                       `yaml:"submit_delay"`
+	PasteChunkSize      int                       `yaml:"paste_chunk_size"`
+	PasteChunkDelayMS   *int                      `yaml:"paste_chunk_delay_ms"`
+	Lines               int                       `yaml:"lines"`
+	NewSession          bool                      `yaml:"new_session"`
+	PaneStream          bool                      `yaml:"pane_stream"`
+	Routing             stateMachineRoutingPreset `yaml:"routing"`
 }
 
 func resolvePingPongPresetInitial(preset pingPongPreset, start string) (string, error) {
@@ -550,6 +569,7 @@ func applyPingPongPreset() error {
 		return appendYAMLCommandHint(fmt.Errorf("parse pingpong preset %q: %w", path, err), data, "pingpong preset")
 	}
 	ppPresetHandoff = preset.handoffPresetConfig
+	ppRouting = preset.Routing
 
 	if strings.TrimSpace(ppInitial) == "" {
 		initial, err := resolvePingPongPresetInitial(preset, ppStart)
@@ -1175,6 +1195,19 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		if ppRoundTimeout > 0 && time.Now().After(deadline) {
 			stall.stableFor = time.Since(stableChangedAt)
 			return "", false, false, stall.err(paneID, protocol, ppRoundTimeout, rawScreen)
+		}
+
+		// A file receipt lives in this member/round's runner-created outbox and
+		// does not depend on terminal rendering. Once it is schema-valid and
+		// proves the prompt head, a non-goal round has committed: the caller will
+		// immediately collect and verify the artifacts. Keep goal rounds on their
+		// native completion/clear path and retain pane/stream handling as legacy
+		// and text-transport fallbacks.
+		if protocol.Transport == handoffTransportFile && !protocol.GoalMode {
+			if envelope, ok := validatedFileReceiptEnvelope(protocol, paneID); ok {
+				fmt.Printf("✅ Pane %s 的 outbox receipt 已驗證，開始處理本輪結果\n", paneID)
+				return envelope, false, false, nil
+			}
 		}
 
 		content, err := ex.CapturePaneClean(paneID, ppLines)
