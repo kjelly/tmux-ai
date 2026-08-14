@@ -7,6 +7,10 @@ package artifact
 // control plane, so Collect never turns it into a forwardable artifact.
 const ReceiptFileName = "_handoff_receipt.json"
 
+// TaskFileName is runner-owned per-round control data used by the optional
+// handoff-complete helper. Like the receipt, it is never a forwardable artifact.
+const TaskFileName = "_handoff_task.json"
+
 type Limits struct {
 	MaxFilesPerTurn int
 	MaxFileBytes    int64

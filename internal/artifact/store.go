@@ -119,7 +119,7 @@ func (s *fileStore) Collect(memberID string, round int, outbox string, claims []
 		}
 		// The receipt is control-plane state the runner asked for; it must not
 		// be snapshotted, counted against artifact limits, or relayed onwards.
-		if rel == ReceiptFileName {
+		if rel == ReceiptFileName || rel == TaskFileName {
 			return nil
 		}
 		info, err := d.Info()
