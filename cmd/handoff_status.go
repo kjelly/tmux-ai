@@ -349,6 +349,24 @@ func fileReceiptEnvelope(p roundControlProtocol) (string, bool) {
 	return p.StatusMarker + " " + string(encoded), true
 }
 
+// validatedFileReceiptEnvelope is the receipt-first completion boundary for a
+// normal file handoff. Unlike fileReceiptEnvelope's compatibility helper, it
+// also proves that the receipt belongs to the full prompt currently in flight.
+func validatedFileReceiptEnvelope(p roundControlProtocol, label string) (string, bool) {
+	if !p.RequireStatus || p.StatusMarker == "" {
+		return "", false
+	}
+	status, err := readFileReceipt(p)
+	if err != nil || validatePromptDelivery(status, p, label) != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(status)
+	if err != nil {
+		return "", false
+	}
+	return p.StatusMarker + " " + string(encoded), true
+}
+
 // receiptRepairProtocol bounds a replacement receipt after a completed file
 // handoff. Its token is fresh, so a repair cannot accidentally consume an
 // earlier prompt or completion rendered in the pane scrollback.
