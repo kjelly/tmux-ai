@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -243,4 +244,51 @@ func TestLiveDeliveryPasteVerification(t *testing.T) {
 			t.Fatalf("sendToPane() error = %v, want a submit-confirmation verdict rather than a paste verdict", err)
 		}
 	})
+}
+
+func TestLiveDeliveryConcurrentNamedBuffers(t *testing.T) {
+	liveDefaults(t)
+	firstExecutor, first := livePane(t, "submit")
+	secondExecutor, second := livePane(t, "alternate")
+	firstNonce := "TMUXAI-LIVE-FIRST-UNIQUE"
+	secondNonce := "TMUXAI-LIVE-SECOND-UNIQUE"
+	firstPayload := strings.Repeat("a", 64*1024) + "\n" + firstNonce
+	secondPayload := strings.Repeat("b", 64*1024) + "\n" + secondNonce
+	var wg sync.WaitGroup
+	var firstErr, secondErr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		firstErr = firstExecutor.SendTextContext(context.Background(), first, firstPayload)
+	}()
+	go func() {
+		defer wg.Done()
+		secondErr = secondExecutor.SendTextContext(context.Background(), second, secondPayload)
+	}()
+	wg.Wait()
+	if firstErr != nil || secondErr != nil {
+		t.Fatalf("concurrent paste errors: first=%v second=%v", firstErr, secondErr)
+	}
+	time.Sleep(time.Second)
+	firstScreen, err := firstExecutor.CaptureScreenClean(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondScreen, err := secondExecutor.CaptureScreenClean(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(firstScreen, firstNonce) || strings.Contains(firstScreen, secondNonce) {
+		t.Fatalf("first pane received crossed payload:\n%s", firstScreen)
+	}
+	if !strings.Contains(secondScreen, secondNonce) || strings.Contains(secondScreen, firstNonce) {
+		t.Fatalf("second pane received crossed payload:\n%s", secondScreen)
+	}
+	buffers, err := firstExecutor.Exec("list-buffers", "-F", "#{buffer_name}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(buffers, "tmux-ai-") {
+		t.Fatalf("named buffers were not removed: %q", buffers)
+	}
 }
