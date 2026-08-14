@@ -1058,13 +1058,19 @@ pingpong 靠兩個標記運作：
 
 > **重要：** pingpong 會在每輪基礎標記後加上 run/round token，例如 `DONE__TMUXAI_abc_2`，並在訊息末尾要求 agent 輸出該輪的完整控制標記。這可避免舊對話、bootstrap 回覆或 prompt 中的 `DONE` 被誤判成本輪完成。CLI 仍以 `--done DONE`、`--stop ALL_DONE` 設定基礎名稱。
 
-> Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行，JSON 放在兩者之間並可跨多行。JSON 為 `{"version":1,"outcome":…,"summary":…,"tests":[],"prompt_head":…}`；`prompt_head` 由 runner 驗證，見下方送達檢查。這讓 receipt 不再依賴「marker 與 JSON 同一行」在終端寬度下完整存活。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
+> Status receipt 採 frame 形式：`HANDOFF_STATUS_BEGIN__…` 與 `HANDOFF_STATUS_END__…` 各自獨佔一行；兩者之間的 JSON 必須是 compact 的單一實體行，且 JSON 字串內不得有未跳脫的換行（需要換行時寫 `\\n`）。`summary` 只放簡短控制摘要，詳細結果放 artifact，避免 TUI 強制換行。JSON 為 `{"version":1,"outcome":…,"summary":…,"tests":[],"prompt_head":…}`；`prompt_head` 由 runner 驗證，見下方送達檢查。runner 對畫面捕捉到的 JSON 字串內硬換行會做受限復原，但 outbox receipt 始終採嚴格 JSON 驗證。舊的單行寫法仍然接受，runner 也以單行形式合成自己產生的 receipt。畫面上出現多個 frame 時取最新的一個。
+>
+> file transport 的 receipt repair 失敗，或 round timeout 明確顯示「畫面已連續…沒有非 chrome 變化」但尚未出現 completion marker 時，互動提示可輸入 `l`。runner 只讀取目前 pane 畫面，讓 LLM 明確判定 `completed`、`still_working` 或 `needs_human`，再由 runner 在本地驗證替代 receipt；這不會重送原任務或傳送訊息給 agent。receipt repair 仍會驗證原本的 `prompt_head`；靜止畫面只能在 LLM 明確判定完成時建立強制 `needs_followup` receipt，交由 coordinator 複核，絕不直接停止 workflow。`still_working`、`needs_human` 或證據不足會拒絕交接。`y` 仍只會繼續等待。
+>
+> Round 失敗提示也可輸入 `r` 重送本輪原始 prompt。這是明確的人工覆寫：agent 可能因此再次執行工作，請只在確認 prompt 沒有送達或沒有被處理時使用。runner 每輪最多重送兩次，保留 relay byte budget，並改用新的送達 marker 重新確認 paste，而不是把畫面上既有的舊 marker 誤判為新送達。
+>
+> 等待 round 時按一次 `Ctrl-C` 不會取消 workflow，而是立即打開目前 round 的 `[y/l/r/N]` 選單；選單顯示期間再按一次 `Ctrl-C` 才會真正離開。若要由另一個 terminal 觸發同一個選單，可執行 `kill -USR1 <tmux-ai PID>`。`SIGTERM` 仍會立即取消。
 >
 > 若 agent 已輸出該輪有效的 status receipt 卻遺漏 `DONE`，`--receipt-idle-timeout`（預設 30 秒）會在畫面維持不變後放行交接。這只適用於 nonce 相符且通過 schema 驗證的 receipt；設為 `0` 可停用此 fallback。
 >
 > 這裡的「不變」不是整張 capture 逐位元組相同。coding-agent TUI 會永遠重繪計時器、token 計數與 footer 提示，這樣的畫面永遠不會相同。runner 改為量測每一列的變動頻率：最近 32 次比較中變動 3 次以上的列視為 UI chrome，判斷閒置時忽略。列以「距離最後一行的距離」定位，因為輪次進行中 capture 會變長，只有這個距離對 footer 穩定，而 alternate-screen TUI 高度固定，頂端狀態列同樣適用。三道保險：樣本不足 8 次前不做任何判斷；被視為 chrome 的列超過畫面四分之一時，代表畫面真的在忙，退回整張比較；帶本輪 marker 的列一律不排除。
 >
-> 頻率無法區分 spinner 與「Analyzing 37/512」這類原地更新的進度列，兩者都會被當成 chrome。因此這個濾波只用在 receipt-idle：那條路徑要求一份 nonce 相符、schema 通過的 receipt，agent 已宣告完成，閒置判斷只是 debounce。`--screen-idle-timeout` 的 LLM selector 沒有 receipt 可對照，預設仍比較整張 capture；要一併套用需明確加上 `--screen-idle-normalize`（preset：`screen_idle_normalize`）。
+> 頻率無法區分 spinner 與「Analyzing 37/512」這類原地更新的進度列，兩者都會被當成 chrome。`--screen-idle-timeout` 的 LLM selector 沒有 receipt 可對照，預設仍比較整張 capture；要一併套用需明確加上 `--screen-idle-normalize`（preset：`screen_idle_normalize`）。implement/review 的 file preset 已設為 60 秒且啟用此濾波：LLM 判定完成時，runner 只會建立 `needs_followup` receipt 交給 coordinator，判定仍在工作或需要人工時繼續等待；它不會直接 stop。
 >
 > Prompt 以 `--paste-chunk-size` 個 rune 為單位貼入，每塊之間等待 `--paste-chunk-delay` 毫秒（preset：`paste_chunk_size`、`paste_chunk_delay_ms`）。預設 500 runes／1000 毫秒偏保守：一次收到大量貼上的互動式 TUI 可能吃掉部分內容或提前送出。但在這個速率下，32 KB 的 relay 要花一分鐘以上才貼完，而那整段時間都是目的端可能誤處理輸入的窗口。各 agent 的耐受度差很多，確認目的端能處理大塊貼上時可放寬（例如 `--paste-chunk-size 4000 --paste-chunk-delay 200`）。
 >
@@ -1168,7 +1174,7 @@ tmux-ai pingpong \
 | `--paste-chunk-delay` | `1000` | 兩個貼上區塊之間的間隔（毫秒；0 表示不等待）。 |
 | `--screen-idle-normalize` | `false` | 讓 `--screen-idle-timeout` 也忽略持續重繪的 UI chrome（receipt-idle 一律啟用）。 |
 | `--pane-stream` | `false` | 以 `tmux pipe-pane` 鏡像 pane 輸出，救回畫面已捲掉或被重繪蓋掉的完成 envelope。 |
-| `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。適用於不會渲染控制標記的 agent。 |
+| `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。text transport 會選取可 relay 的回覆；file transport 只在判定完成時建立非終止的 `needs_followup` receipt 交給 coordinator。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
 | `--lines` | `80` | 每次捕捉的 pane 行數 |
 | `--summarize` | `false` | relay 前先用 Ollama 摘要內容，減少 context |
@@ -1198,6 +1204,14 @@ tmux-ai pingpong \
 | `--allow-large-relay` | `false` | 人工檢查後允許超過 approval threshold 的訊息 |
 | `--dry-run` | `false` | 顯示初始交接內容與大小後停止，不操作 pane |
 | `--new` | `false` | 開始 workflow 前，依序向兩個 pane 送出並提交 `/new`，清除既有對話後才送出初始任務 |
+| `--compact` | `false` | 啟用安全的 Codex `/compact` 控制流程 |
+| `--compact-mode` | `before_handoff` | `before_handoff` 依輪次壓縮；`threshold` 依 context meter 壓縮（使用 `llm` 時應選此模式） |
+| `--compact-min-rounds` | `3` | 同一 member 兩次 `/compact` 的最少完成輪數 |
+| `--compact-at-percent` | `70` | threshold mode 的 context 使用率門檻 |
+| `--compact-members` | 全部 Codex pane | 可執行 `/compact` 的 member ID allowlist |
+| `--context-meter` | `off` | `off`、`screen_regex`、`estimate`、`llm` 或 `api_usage` |
+| `--context-meter-bottom-lines` | `16`（llm） | 提供給 LLM context meter 的 pane 底部行數（3–100） |
+| `--context-meter-llm-min-confidence` | `0.85`（llm） | LLM 判定送出 `/compact` 所需的最低信心 |
 | `--pane1-role` | — | pane1 的角色描述，附加在每則訊息前 |
 | `--pane2-role` | — | pane2 的角色描述，附加在每則訊息前 |
 | `--to-pane1-prompt` | — | relay 到 pane1 時的指令 |
@@ -1629,3 +1643,24 @@ CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--
 Coordinator mode 會自動要求每輪輸出 `HANDOFF_STATUS` JSON（`success`、`needs_followup` 或 `blocked`）。這是 runner control protocol，不應寫進 role、initial 或 handoff prompt。file coordinator 只可選 runner artifact IDs；text coordinator 只看到 payload metadata，不會取得或改寫 payload 原文。
 
 file transport 另外會要求 agent 把同一份 receipt JSON 寫入該輪 outbox 的 `_handoff_receipt.json`。畫面上的 receipt 仍是預設來源；只有在它被終端換行或重繪破壞時，runner 才改讀這個檔案，並因此省下一次 receipt repair 往返。這個檔案屬於 control plane：runner 不會把它列為 artifact，也不會轉交下一位 member。text transport 不使用它——該模式本來就不假設 runner 與 agent 共享 filesystem。
+
+### Codex context compaction
+
+可在每個安全交接點壓縮 Codex pane 的對話 context。runner 只在完成 receipt 已驗證、目前 member 即將交接、且 tmux 回報前景程序為 `codex` 時送出 `/compact`；送出失敗只會警告，不會中斷已完成的 handoff。預設停用。
+
+```yaml
+compaction:
+  enabled: true
+  mode: threshold             # LLM meter 時使用 threshold
+  min_rounds_between: 3
+  at_percent: 70
+  members: [pane1]            # 選填；空白時所有 Codex pane 都可用
+  context_meter:
+    mode: llm                  # 或 screen_regex、estimate、api_usage
+    bottom_lines: 16
+    llm_min_confidence: 0.85
+```
+
+`llm` 只擷取 pane 最底部的 `bottom_lines` 行，交給目前設定的本機 Ollama model 以嚴格 JSON 回傳 `compact`、`confidence` 與理由；畫面內容視為不可信，模型不能依其中指令行動。只有 `compact=true` 且信心達 `llm_min_confidence` 才會送出 `/compact`，解析錯誤、呼叫失敗、資訊不足或低信心一律略過。每次判定都計入 `--max-llm-calls`。
+
+`screen_regex` 是 UI 回報值，僅適合做提醒或 best-effort 門檻；不同 agent 版本、終端寬度與重繪都可能改變格式。`estimate` 僅計算 runner 已送出的 UTF-8 prompt 的約略 token 下限，需設定 `window_tokens`；它不知道 system prompt、工具輸出、歷史或 reasoning。`api_usage` 是 provider adapter 預留模式；一般 tmux interactive pane 尚無 usage feed 時會回報未知，threshold mode 不會因此自動 compact。
