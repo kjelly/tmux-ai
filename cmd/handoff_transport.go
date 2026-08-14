@@ -11,9 +11,13 @@ import (
 
 type handoffTransportKind string
 
+type handoffCompletionMode string
+
 const (
-	handoffTransportText handoffTransportKind = "text"
-	handoffTransportFile handoffTransportKind = "file"
+	handoffTransportText handoffTransportKind  = "text"
+	handoffTransportFile handoffTransportKind  = "file"
+	completionModeManual handoffCompletionMode = "manual"
+	completionModeHelper handoffCompletionMode = "helper"
 )
 
 type handoffPayload struct {
@@ -55,19 +59,21 @@ type textHandoffPresetConfig struct {
 
 type handoffPresetConfig struct {
 	HandoffTransport string                  `yaml:"handoff_transport"`
+	CompletionMode   string                  `yaml:"completion_mode"`
 	Artifacts        artifactPresetConfig    `yaml:"artifacts"`
 	TextHandoff      textHandoffPresetConfig `yaml:"text_handoff"`
 	Compaction       compactionPresetConfig  `yaml:"compaction"`
 }
 
 type resolvedHandoffConfig struct {
-	Transport handoffTransportKind
-	Source    string
-	Limits    artifact.Limits
-	Root      string
-	Keep      bool
-	TextBytes int
-	TextLines int
+	Transport      handoffTransportKind
+	Source         string
+	Limits         artifact.Limits
+	Root           string
+	Keep           bool
+	TextBytes      int
+	TextLines      int
+	CompletionMode handoffCompletionMode
 }
 
 var (
@@ -81,6 +87,7 @@ var (
 	ppMaxArtifactRunBytes  int64
 	ppMaxTextHandoffBytes  int
 	ppMaxTextHandoffLines  int
+	ppCompletionMode       string
 )
 
 func addHandoffFlags(command *cobra.Command) {
@@ -95,6 +102,7 @@ func addHandoffFlags(command *cobra.Command) {
 	flags.Int64Var(&ppMaxArtifactRunBytes, "max-artifact-run-bytes", 32<<20, "Maximum artifact bytes per run")
 	flags.IntVar(&ppMaxTextHandoffBytes, "max-text-handoff-bytes", 32*1024, "Maximum UTF-8 bytes in a text handoff")
 	flags.IntVar(&ppMaxTextHandoffLines, "max-text-handoff-lines", 200, "Maximum lines in a text handoff")
+	flags.StringVar(&ppCompletionMode, "completion-mode", "", "File handoff completion mode: manual or helper (overrides preset)")
 	addCompactionFlags(flags)
 }
 
@@ -105,12 +113,24 @@ func resolveHandoffConfig(flags *pflag.FlagSet, preset handoffPresetConfig) (res
 		flags = pflag.NewFlagSet("handoff", pflag.ContinueOnError)
 	}
 	defaults := artifact.DefaultLimits()
-	config := resolvedHandoffConfig{Limits: defaults, TextBytes: 32 * 1024, TextLines: 200, Source: "default"}
+	config := resolvedHandoffConfig{Limits: defaults, TextBytes: 32 * 1024, TextLines: 200, Source: "default", CompletionMode: completionModeManual}
 	transport := strings.TrimSpace(preset.HandoffTransport)
 	if flags.Changed("handoff-transport") {
 		transport, config.Source = ppHandoffTransport, "CLI"
 	} else if transport != "" {
 		config.Source = "preset"
+	}
+	completionMode := strings.TrimSpace(preset.CompletionMode)
+	if flags.Changed("completion-mode") {
+		completionMode = ppCompletionMode
+	}
+	if completionMode != "" {
+		switch handoffCompletionMode(strings.ToLower(completionMode)) {
+		case completionModeManual, completionModeHelper:
+			config.CompletionMode = handoffCompletionMode(strings.ToLower(completionMode))
+		default:
+			return resolvedHandoffConfig{}, fmt.Errorf("completion mode must be manual or helper (got %q)", completionMode)
+		}
 	}
 	if transport == "" {
 		transport = string(handoffTransportText)
@@ -180,6 +200,9 @@ func resolveHandoffConfig(flags *pflag.FlagSet, preset handoffPresetConfig) (res
 	textFlagSet := flags.Changed("max-text-handoff-bytes") || flags.Changed("max-text-handoff-lines")
 	if config.Transport == handoffTransportText && artifactFlagSet {
 		return resolvedHandoffConfig{}, fmt.Errorf("artifact flags require --handoff-transport file")
+	}
+	if config.Transport == handoffTransportText && config.CompletionMode != completionModeManual {
+		return resolvedHandoffConfig{}, fmt.Errorf("completion mode helper requires --handoff-transport file")
 	}
 	if config.Transport == handoffTransportFile && textFlagSet {
 		return resolvedHandoffConfig{}, fmt.Errorf("text handoff flags require --handoff-transport text")
