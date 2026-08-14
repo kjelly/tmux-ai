@@ -37,8 +37,21 @@ coordinator_policy: |-
   只有 pane2 reviewer 回報 outcome=success 且證據充分時才能 stop。
   outcome=blocked 時使用 needs_human。
 
-coordinator_timeout: 300
+coordinator_timeout: 600
 max_selection_retries: 2
 round_timeout: 1800
+screen_idle_timeout: 60
+screen_idle_normalize: true
 submit_delay: 3000
 lines: 1000
+
+# LLM meter only examines the bottom terminal rows at validated handoff
+# boundaries. It fails closed on uncertain or unavailable context readings.
+compaction:
+  enabled: true
+  mode: threshold
+  min_rounds_between: 3
+  context_meter:
+    mode: llm
+    bottom_lines: 16
+    llm_min_confidence: 0.85

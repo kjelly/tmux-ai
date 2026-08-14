@@ -157,6 +157,10 @@ func runCoordinate() error {
 	if err != nil {
 		return err
 	}
+	compaction, err := resolveCompactionConfig(ppHandoffFlagSet, preset.Compaction)
+	if err != nil {
+		return err
+	}
 	initial := strings.TrimSpace(coordInitial)
 	policy := strings.TrimSpace(ppCoordinatorPolicy)
 	if policy == "" {
@@ -272,7 +276,7 @@ func runCoordinate() error {
 		Executor: ex, Guard: guard, Members: engineMembers, StartID: strings.ToLower(current.Name),
 		InitialInstruction: decision.Instruction, InitialFingerprint: initial,
 		ResetBeforeStart: resetMembers,
-		SelectResponses:  true, CoordinatorControlsStop: true, Transport: transport, Route: router,
+		SelectResponses:  true, CoordinatorControlsStop: true, Transport: transport, Compaction: compaction, Route: router,
 	}.Run(ctx)
 }
 

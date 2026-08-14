@@ -1,5 +1,4 @@
 handoff_transport: file
-
 artifacts:
   forward: produced_or_incoming
   max_files_per_turn: 8
@@ -45,8 +44,21 @@ coordinator_policy: |-
   初始工作交給 pane1 reviewer。pane1 回報 outcome=needs_followup 時交給 pane2；
   pane2 完成後一律交回 pane1 複查。只有 pane1 回報 outcome=success 且證據充分時
   才能 stop。outcome=blocked 時使用 needs_human。
-coordinator_timeout: 300
+coordinator_timeout: 600
 max_selection_retries: 2
 round_timeout: 1800
+screen_idle_timeout: 60
+screen_idle_normalize: true
 submit_delay: 3000
 lines: 1000
+
+# LLM meter only examines the bottom terminal rows at validated handoff
+# boundaries. It fails closed on uncertain or unavailable context readings.
+compaction:
+  enabled: true
+  mode: threshold
+  min_rounds_between: 3
+  context_meter:
+    mode: llm
+    bottom_lines: 16
+    llm_min_confidence: 0.85

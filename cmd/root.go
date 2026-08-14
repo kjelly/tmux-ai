@@ -104,11 +104,15 @@ func loadAndApplyUserConfig(_ *cobra.Command, _ []string) error {
 		return err
 	}
 	config, found, err := loadUserConfig(path)
-	if err != nil || !found {
+	if err != nil {
 		return err
 	}
-	flags := rootCmd.PersistentFlags()
-	applyUserConfig(config, flags.Changed, os.Getenv)
+	if found {
+		flags := rootCmd.PersistentFlags()
+		applyUserConfig(config, flags.Changed, os.Getenv)
+	}
+
+	fmt.Fprintf(os.Stderr, "🧠 LLM 設定：endpoint=%s/api/chat model=%s\n", ollamaHost, model)
 	return nil
 }
 

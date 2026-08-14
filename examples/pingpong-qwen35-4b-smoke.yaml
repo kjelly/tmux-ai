@@ -1,0 +1,55 @@
+# Pingpong smoke test for a small local coordinator model.
+#
+# Supply --pane1 and --pane2 on the command line. For a self-contained test,
+# run examples/pingpong-demo-agent.py in each pane:
+#
+#   python3 examples/pingpong-demo-agent.py planner
+#   python3 examples/pingpong-demo-agent.py reviewer
+
+initial: >-
+  這是一個快速 pingpong smoke test。不要修改檔案，也不要執行耗時指令。
+  pane1 先提出一個三點檢查計畫；pane2 檢查計畫是否完整，最後回報通過或需要修正。
+  目標是驗證兩個 agent 之間的交接與 coordinator 路由，不是完成實際產品工作。
+
+# Keep this copy so the smoke test can explicitly start at pane1 without
+# spending another local-model call on the start-pane selector.
+initial_pane1: >-
+  這是一個快速 pingpong smoke test。不要修改檔案，也不要執行耗時指令。
+  pane1 先提出一個三點檢查計畫；pane2 檢查計畫是否完整，最後回報通過或需要修正。
+  目標是驗證兩個 agent 之間的交接與 coordinator 路由，不是完成實際產品工作。
+
+pane1_role: >-
+  你是 planner。只負責提出簡短、可驗證的三點檢查計畫，不修改檔案。
+
+pane2_role: >-
+  你是 reviewer。只檢查 planner 的三點計畫是否完整、清楚、可執行；不修改檔案。
+
+to_pane1_prompt: >-
+  請根據最新的 reviewer 結果修正或確認三點檢查計畫，保持簡短；若已完整，明確說明理由。
+
+to_pane2_prompt: >-
+  請檢查 planner 的最新計畫，逐點確認是否完整且可執行；若沒有問題，回報 success，否則指出需要修正的項目。
+
+coordinator: true
+stop_members:
+  - pane2
+coordinator_timeout: 90
+max_selection_retries: 2
+round_timeout: 180
+screen_idle_timeout: 0
+# Must be at least the text handoff line limit (200 by default), otherwise
+# tmux-ai rejects the configuration before starting the first turn.
+lines: 256
+
+coordinator_policy: |-
+  這是一個短時間 smoke test，不涉及檔案修改或實際產品變更。
+
+  初始路由：固定把任務交給 pane1 planner。
+
+  路由規則：
+  1. pane1 完成本輪計畫後，交給 pane2 reviewer。
+  2. pane2 若 outcome=success，且明確表示三點計畫完整可執行，停止 workflow。
+  3. pane2 若 outcome=needs_followup，交回 pane1 修正；修正後再交給 pane2。
+  4. 若結果不清楚、缺少實質計畫或無法判斷，使用 needs_human，不要猜測。
+  5. 只有 pane2 可以核准停止；pane1 的停止要求不得直接採納。
+  6. 不要要求任何 pane 修改檔案、執行耗時指令或產生 artifact。
