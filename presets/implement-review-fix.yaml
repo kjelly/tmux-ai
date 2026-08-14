@@ -1,5 +1,6 @@
 ---
 handoff_transport: file
+completion_mode: helper
 
 artifacts:
   forward: produced_or_incoming
@@ -27,7 +28,19 @@ to_pane2_prompt: >-
   讀取 incoming implementation artifact，重新依照原始規格 review 最新 git diff 與測試證據，
   發布本輪 review artifact；只有所有要求都滿足且證據充分時才回報 success。
 
-coordinator: true
+coordinator: false
+routing:
+  mode: state_machine
+  initial_member: pane1
+  transitions:
+    pane1:
+      success: {action: send, target: pane2}
+      needs_followup: {action: send, target: pane2}
+      blocked: {action: needs_human}
+    pane2:
+      success: {action: stop}
+      needs_followup: {action: send, target: pane1}
+      blocked: {action: needs_human}
 stop_members:
   - pane2
 coordinator_policy: |-

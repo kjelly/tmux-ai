@@ -1,4 +1,5 @@
 handoff_transport: file
+completion_mode: helper
 artifacts:
   forward: produced_or_incoming
   max_files_per_turn: 8
@@ -37,7 +38,19 @@ to_pane2_prompt: >-
   讀取 incoming artifacts，修正其中的有效 findings 並補足測試；artifact relpath 必須是
   相對於 outbox 的檔名，不要加上 outbox/ 前綴。
 
-coordinator: true
+coordinator: false
+routing:
+  mode: state_machine
+  initial_member: pane1
+  transitions:
+    pane1:
+      success: {action: stop}
+      needs_followup: {action: send, target: pane2}
+      blocked: {action: needs_human}
+    pane2:
+      success: {action: send, target: pane1}
+      needs_followup: {action: send, target: pane1}
+      blocked: {action: needs_human}
 stop_members:
   - pane1
 coordinator_policy: |-
