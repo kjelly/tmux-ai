@@ -66,7 +66,10 @@ func TestBuildMemberTurnMessageGoalMode(t *testing.T) {
 	protocol := newRoundControlProtocol(handoffTransportText, "token", 1, "", true)
 	member := handoffMember{ID: "implementer", Label: "implementer", Role: "implement work", GoalMode: true}
 
-	got := buildMemberTurnMessage(member, "fix the regression", "", handoffPayload{Transport: handoffTransportText}, nil, protocol)
+	got, _, err := buildMemberTurnMessage(member, "fix the regression", outboundRelay{}, protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.HasPrefix(got, "/goal implement work\n\nfix the regression") {
 		t.Fatalf("goal-mode message = %q, want /goal prefix before the task packet", got)
 	}
@@ -131,7 +134,10 @@ func TestBuildMemberTurnMessageLeavesNormalMembersUnchanged(t *testing.T) {
 	protocol := newRoundControlProtocol(handoffTransportText, "token", 1, "", true)
 	member := handoffMember{ID: "tester", Label: "tester", Role: "verify work"}
 
-	got := buildMemberTurnMessage(member, "run tests", "", handoffPayload{Transport: handoffTransportText}, nil, protocol)
+	got, _, err := buildMemberTurnMessage(member, "run tests", outboundRelay{}, protocol)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.HasPrefix(got, "/goal ") {
 		t.Fatalf("normal member unexpectedly received goal prefix: %q", got)
 	}
