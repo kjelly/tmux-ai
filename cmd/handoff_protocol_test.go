@@ -674,6 +674,21 @@ func TestResolveTransportPrecedenceAndConflicts(t *testing.T) {
 	}
 }
 
+func TestResolveCompletionMode(t *testing.T) {
+	oldLines, oldMax, oldTotal := ppLines, ppMaxRelayBytes, ppMaxTotalRelayBytes
+	defer func() { ppLines, ppMaxRelayBytes, ppMaxTotalRelayBytes = oldLines, oldMax, oldTotal }()
+	ppLines, ppMaxRelayBytes, ppMaxTotalRelayBytes = 256, 65536, 131072
+	command := &cobra.Command{Use: "test"}
+	addHandoffFlags(command)
+	config, err := resolveHandoffConfig(command.Flags(), handoffPresetConfig{HandoffTransport: "file", CompletionMode: "helper"})
+	if err != nil || config.CompletionMode != completionModeHelper {
+		t.Fatalf("file helper config = %#v, %v", config, err)
+	}
+	if _, err := resolveHandoffConfig(command.Flags(), handoffPresetConfig{HandoffTransport: "text", CompletionMode: "helper"}); err == nil || !strings.Contains(err.Error(), "requires") {
+		t.Fatalf("text helper config error = %v", err)
+	}
+}
+
 func TestCoordinatorDecisionRejectsArtifactIDsForText(t *testing.T) {
 	ids := []string{}
 	err := validateCoordinatorTransportDecision(handoffCoordinatorDecision{Action: "send", ArtifactIDs: &ids}, handoffCoordinatorRequest{Transport: handoffTransportText})
@@ -1194,7 +1209,10 @@ func TestReceiptHeadNonceProvesTheWholePromptArrived(t *testing.T) {
 func TestTurnMessageBracketsThePromptWithDeliveryMarkers(t *testing.T) {
 	p := newRoundControlProtocol(handoffTransportText, "run", 2, "", true)
 	p.HeadNonce = "abc123"
-	message := buildMemberTurnMessage(handoffMember{ID: "pane1", Label: "reviewer"}, "review the diff", "", handoffPayload{Transport: handoffTransportText}, nil, p)
+	message, _, err := buildMemberTurnMessage(handoffMember{ID: "pane1", Label: "reviewer"}, "review the diff", outboundRelay{}, p)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if !strings.HasPrefix(message, p.HeadMarker+" abc123\n") {
 		t.Fatalf("prompt does not open with the head line: %q", firstLine(message))
@@ -1207,6 +1225,49 @@ func TestTurnMessageBracketsThePromptWithDeliveryMarkers(t *testing.T) {
 	}
 	if !strings.Contains(message, "最後一個空白後」nonce") {
 		t.Fatal("control protocol does not explain where prompt_head comes from")
+	}
+}
+
+func TestBuildTurnMessageSerializesInlineRelayOnlyOnce(t *testing.T) {
+	p := newRoundControlProtocol(handoffTransportText, "once", 1, "", true)
+	const payload = "UNIQUE-PAYLOAD-SENTINEL"
+	message, metrics, err := buildTurnMessage("reviewer", "review it", outboundRelay{Inline: payload}, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(message, payload); got != 1 {
+		t.Fatalf("payload appears %d times in outbound message: %q", got, message)
+	}
+	if metrics.DuplicatedPayloadBytes != 0 {
+		t.Fatalf("duplicated payload bytes = %d", metrics.DuplicatedPayloadBytes)
+	}
+	if got, want := metrics.TotalBytes, metrics.RoleBytes+metrics.InstructionBytes+metrics.StaticProtocolBytes+metrics.SummaryBytes+metrics.InlinePayloadBytes+metrics.ArtifactReferenceBytes+metrics.DeliveryMarkerBytes; got != want {
+		t.Fatalf("metrics total = %d, components = %d (%#v)", got, want, metrics)
+	}
+}
+
+func TestBuildTurnMessageRejectsDuplicatedRelaySections(t *testing.T) {
+	p := newRoundControlProtocol(handoffTransportText, "duplicate", 1, "", true)
+	if _, _, err := buildTurnMessage("", "work", outboundRelay{Summary: "same", Inline: "same"}, p); err == nil || !strings.Contains(err.Error(), "duplicates") {
+		t.Fatalf("duplicate summary error = %v", err)
+	}
+	if _, _, err := buildTurnMessage("", "work", outboundRelay{Inline: "text", Artifacts: []artifact.Ref{{ID: "a"}}}, p); err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("mixed relay error = %v", err)
+	}
+}
+
+func TestArtifactPromptOmitsRunnerOnlyIntegrityMetadata(t *testing.T) {
+	ref := artifact.Ref{ID: "a-1", Kind: "review", Title: "findings", RuntimePath: "/tmp/object", SizeBytes: 1234, SHA256: "0123456789abcdef"}
+	message := renderArtifactIO([]artifact.Ref{ref}, "/tmp/outbox")
+	for _, forbidden := range []string{"size_bytes", "sha256", "1234", "01234567"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("artifact prompt leaked %q: %s", forbidden, message)
+		}
+	}
+	for _, required := range []string{ref.ID, ref.Kind, ref.Title, ref.RuntimePath} {
+		if !strings.Contains(message, required) {
+			t.Fatalf("artifact prompt omitted %q: %s", required, message)
+		}
 	}
 }
 
