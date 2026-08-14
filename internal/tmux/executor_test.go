@@ -25,7 +25,7 @@ func TestSplitTextChunksUsesUnicodeCharacters(t *testing.T) {
 	}
 }
 
-func TestSendTextChunksWaitsAfterEveryTenCharacters(t *testing.T) {
+func TestSendTextChunksWaitsOnlyBetweenChunks(t *testing.T) {
 	var got []string
 	started := time.Now()
 	err := sendTextChunksWith(context.Background(), "1234567890abcdefghij", 10, 5*time.Millisecond, func(chunk string) error {
@@ -38,9 +38,79 @@ func TestSendTextChunksWaitsAfterEveryTenCharacters(t *testing.T) {
 	if len(got) != 2 || got[0] != "1234567890" || got[1] != "abcdefghij" {
 		t.Fatalf("sent chunks = %#v", got)
 	}
-	if elapsed := time.Since(started); elapsed < 10*time.Millisecond {
-		t.Fatalf("elapsed = %s, want at least one delay per chunk", elapsed)
+	if elapsed := time.Since(started); elapsed < 5*time.Millisecond || elapsed >= 10*time.Millisecond {
+		t.Fatalf("elapsed = %s, want one inter-chunk delay", elapsed)
 	}
+}
+
+func TestSendTextChunksDoesNotDelayAfterSingleChunk(t *testing.T) {
+	started := time.Now()
+	err := sendTextChunksWith(context.Background(), "123", 10, 50*time.Millisecond, func(string) error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 40*time.Millisecond {
+		t.Fatalf("elapsed = %s, single chunk should not wait", elapsed)
+	}
+}
+
+func TestPasteTextChunkUsesUniqueNamedBuffer(t *testing.T) {
+	var calls [][]string
+	e := &executorImpl{command: func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		return "", nil
+	}}
+	if err := e.pasteTextChunk("%42", "first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.pasteTextChunk("%42", "second"); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 4 {
+		t.Fatalf("calls = %#v", calls)
+	}
+	first, second := calls[0], calls[1]
+	if first[0] != "load-buffer" || first[1] != "-b" || strings.HasPrefix(first[2], "tmux-ai-") == false {
+		t.Fatalf("load call = %#v", first)
+	}
+	if strings.Contains(strings.Join(first, " "), "-t %42") {
+		t.Fatalf("load-buffer targeted pane: %#v", first)
+	}
+	if want := []string{"paste-buffer", "-b", first[2], "-d", "-p", "-r", "-t", "%42"}; !equalStrings(second, want) {
+		t.Fatalf("paste call = %#v, want %#v", second, want)
+	}
+	if calls[2][2] == first[2] {
+		t.Fatalf("buffer name reused: %#v", calls)
+	}
+}
+
+func TestPasteTextChunkCleansUpNamedBufferOnPasteFailure(t *testing.T) {
+	var calls [][]string
+	e := &executorImpl{command: func(args ...string) (string, error) {
+		calls = append(calls, append([]string(nil), args...))
+		if args[0] == "paste-buffer" {
+			return "", errors.New("paste failed")
+		}
+		return "", nil
+	}}
+	if err := e.pasteTextChunk("%42", "body"); err == nil {
+		t.Fatal("pasteTextChunk() error = nil")
+	}
+	if len(calls) != 3 || calls[2][0] != "delete-buffer" || calls[2][1] != "-b" || calls[2][2] != calls[0][2] {
+		t.Fatalf("calls = %#v", calls)
+	}
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSendTextChunksStopsAfterCancellation(t *testing.T) {

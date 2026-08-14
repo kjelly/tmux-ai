@@ -2,6 +2,8 @@ package tmux
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/exec"
@@ -25,6 +27,7 @@ type PaneInfo struct {
 
 type executorImpl struct {
 	options Options
+	command func(args ...string) (string, error)
 }
 
 // Options tunes how a prompt is pasted into a pane. The defaults are
@@ -67,6 +70,9 @@ func NewExecutorWithOptions(options Options) Executor {
 }
 
 func (e *executorImpl) exec(args ...string) (string, error) {
+	if e.command != nil {
+		return e.command(args...)
+	}
 	cmd := exec.Command("tmux", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -163,12 +169,16 @@ func (e *executorImpl) sendTextChunks(ctx context.Context, paneID, content strin
 }
 
 func sendTextChunksWith(ctx context.Context, content string, size int, delay time.Duration, send func(string) error) error {
-	for _, chunk := range splitTextChunks(content, size) {
+	chunks := splitTextChunks(content, size)
+	for i, chunk := range chunks {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if err := send(chunk); err != nil {
 			return err
+		}
+		if i == len(chunks)-1 || delay == 0 {
+			continue
 		}
 		timer := time.NewTimer(delay)
 		select {
@@ -222,23 +232,45 @@ func (e *executorImpl) pasteTextChunk(paneID, content string) error {
 		return fmt.Errorf("create temp file: %w", err)
 	}
 	defer os.Remove(tmpfile.Name())
-	defer tmpfile.Close()
 
 	if _, err := tmpfile.WriteString(content); err != nil {
 		return fmt.Errorf("write temp file: %w", err)
 	}
-	tmpfile.Close()
+	if err := tmpfile.Close(); err != nil {
+		return fmt.Errorf("close temp file: %w", err)
+	}
 
-	if _, err := e.exec("load-buffer", "-t", paneID, tmpfile.Name()); err != nil {
+	bufferName, err := newBufferName()
+	if err != nil {
+		return fmt.Errorf("create buffer name: %w", err)
+	}
+	loaded := false
+	defer func() {
+		if loaded {
+			_, _ = e.exec("delete-buffer", "-b", bufferName)
+		}
+	}()
+
+	if _, err := e.exec("load-buffer", "-b", bufferName, tmpfile.Name()); err != nil {
 		return fmt.Errorf("load buffer: %w", err)
 	}
+	loaded = true
 	// Preserve newlines and use bracketed-paste mode when the destination TUI
 	// requests it. Agent editors can otherwise treat a large multi-line relay as
 	// individually typed lines and swallow the subsequent submit key.
-	if _, err := e.exec("paste-buffer", "-t", paneID, "-p", "-r"); err != nil {
+	if _, err := e.exec("paste-buffer", "-b", bufferName, "-d", "-p", "-r", "-t", paneID); err != nil {
 		return fmt.Errorf("paste buffer: %w", err)
 	}
+	loaded = false // paste-buffer -d removed the named buffer.
 	return nil
+}
+
+func newBufferName() (string, error) {
+	bytes := make([]byte, 12)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return "tmux-ai-" + hex.EncodeToString(bytes), nil
 }
 
 func splitTextChunks(content string, size int) []string {
