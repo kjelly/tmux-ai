@@ -149,9 +149,6 @@ func (s *fileStore) Collect(memberID string, round int, outbox string, claims []
 		return nil, err
 	}
 	sort.Strings(files)
-	if len(files) > s.limits.MaxFilesPerTurn {
-		return nil, fmt.Errorf("artifact count %d exceeds per-turn limit %d", len(files), s.limits.MaxFilesPerTurn)
-	}
 	for path := range claimByPath {
 		found := false
 		for _, file := range files {
@@ -163,6 +160,19 @@ func (s *fileStore) Collect(memberID string, round int, outbox string, claims []
 		if !found {
 			return nil, fmt.Errorf("claimed artifact %q was not found", path)
 		}
+	}
+	// A caller may need to retry transport after a source turn completed. The
+	// source outbox is immutable evidence at that point, so collecting the
+	// exact same turn again must reuse the original snapshots rather than try
+	// to create the same object names a second time.
+	if existing := s.refsForTurn(memberID, round); len(existing) > 0 {
+		if err := verifyCollectedTurn(abs, files, existing); err != nil {
+			return nil, err
+		}
+		return existing, nil
+	}
+	if len(files) > s.limits.MaxFilesPerTurn {
+		return nil, fmt.Errorf("artifact count %d exceeds per-turn limit %d", len(files), s.limits.MaxFilesPerTurn)
 	}
 	var refs []Ref
 	var turnBytes int64
@@ -211,6 +221,37 @@ func (s *fileStore) Collect(memberID string, round int, outbox string, claims []
 		return nil, err
 	}
 	return refs, nil
+}
+
+func (s *fileStore) refsForTurn(memberID string, round int) []Ref {
+	var refs []Ref
+	for _, ref := range s.manifest.Artifacts {
+		if ref.ProducerID == memberID && ref.Round == round {
+			ref.RuntimePath = filepath.Join(s.root, "objects", ref.ObjectName)
+			refs = append(refs, ref)
+		}
+	}
+	return refs
+}
+
+func verifyCollectedTurn(outbox string, files []string, refs []Ref) error {
+	sort.Strings(files)
+	if len(files) != len(refs) {
+		return fmt.Errorf("artifact outbox changed after snapshot")
+	}
+	for i, ref := range refs {
+		if files[i] != ref.OriginalName {
+			return fmt.Errorf("artifact outbox changed after snapshot")
+		}
+		sum, n, err := hashFile(filepath.Join(outbox, files[i]))
+		if err != nil {
+			return err
+		}
+		if n != ref.SizeBytes || sum != ref.SHA256 {
+			return fmt.Errorf("artifact %s changed after snapshot", ref.ID)
+		}
+	}
+	return nil
 }
 
 func (s *fileStore) Resolve(ids []string) ([]Ref, error) {

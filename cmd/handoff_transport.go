@@ -57,6 +57,7 @@ type handoffPresetConfig struct {
 	HandoffTransport string                  `yaml:"handoff_transport"`
 	Artifacts        artifactPresetConfig    `yaml:"artifacts"`
 	TextHandoff      textHandoffPresetConfig `yaml:"text_handoff"`
+	Compaction       compactionPresetConfig  `yaml:"compaction"`
 }
 
 type resolvedHandoffConfig struct {
@@ -94,6 +95,7 @@ func addHandoffFlags(command *cobra.Command) {
 	flags.Int64Var(&ppMaxArtifactRunBytes, "max-artifact-run-bytes", 32<<20, "Maximum artifact bytes per run")
 	flags.IntVar(&ppMaxTextHandoffBytes, "max-text-handoff-bytes", 32*1024, "Maximum UTF-8 bytes in a text handoff")
 	flags.IntVar(&ppMaxTextHandoffLines, "max-text-handoff-lines", 200, "Maximum lines in a text handoff")
+	addCompactionFlags(flags)
 }
 
 var ppHandoffFlagSet *pflag.FlagSet

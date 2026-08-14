@@ -97,3 +97,38 @@ func TestStoreDoesNotCollectTheControlPlaneReceipt(t *testing.T) {
 		t.Fatalf("receipt file was not left in place for the runner: %v", err)
 	}
 }
+
+func TestStoreCollectIsIdempotentForAnUnchangedTurn(t *testing.T) {
+	store, err := New(t.TempDir(), true, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := store.NewOutbox("reviewer", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(outbox, "review.md")
+	if err := os.WriteFile(path, []byte("finding"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.Collect("reviewer", 5, outbox, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.Collect("reviewer", 5, outbox, nil)
+	if err != nil {
+		t.Fatalf("second collect = %v", err)
+	}
+	if len(first) != 1 || len(second) != 1 || first[0].ID != second[0].ID || first[0].RuntimePath != second[0].RuntimePath {
+		t.Fatalf("collect refs differ: first=%#v second=%#v", first, second)
+	}
+	if got := len(store.Manifest().Artifacts); got != 1 {
+		t.Fatalf("manifest contains %d artifacts, want 1", got)
+	}
+	if err := os.WriteFile(path, []byte("mutated"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Collect("reviewer", 5, outbox, nil); err == nil || !strings.Contains(err.Error(), "changed after snapshot") {
+		t.Fatalf("mutated second collect error = %v, want snapshot mutation failure", err)
+	}
+}

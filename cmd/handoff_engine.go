@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,12 @@ type handoffMember struct {
 	GoalMode bool
 }
 
-var errMissingReceipt = errors.New("missing or invalid handoff status receipt")
+var (
+	errMissingReceipt        = errors.New("missing or invalid handoff status receipt")
+	errReceiptRepairRequired = errors.New("receipt repair required")
+	errScreenIdleNeedsHuman  = errors.New("LLM determined a static pane needs human intervention")
+	errManualRoundPrompt     = errors.New("manual round recovery requested")
+)
 
 type handoffRoute struct {
 	NextID, Instruction, Reason      string
@@ -78,6 +84,7 @@ type roundControlProtocol struct {
 
 const (
 	maxReceiptRepairAttempts = 2
+	maxPromptResendsPerRound = 2
 	handoffOutcomeConstraint = `outcome must be exactly one of "success", "needs_followup", or "blocked"`
 )
 
@@ -105,15 +112,15 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 		fmt.Fprintf(&b, "請恰好輸出一個完整 text handoff frame（可為空）。開始 marker value（實際輸出時必須獨佔一行）：%s\n結束 marker value（實際輸出時必須獨佔一行）：%s\n", p.TextBeginMarker, p.TextEndMarker)
 	}
 	if p.RequireStatus {
-		fmt.Fprintf(&b, "請輸出一個 status receipt frame：先獨佔一行輸出 begin marker value，接著輸出 receipt JSON object（可跨多行），最後獨佔一行輸出 end marker value。不要把 marker 與 JSON 放在同一行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus begin marker value：%s\nstatus end marker value：%s\n", handoffOutcomeConstraint, p.StatusBeginMarker, p.StatusEndMarker)
+		fmt.Fprintf(&b, "請輸出一個 status receipt frame：先獨佔一行輸出 begin marker value，接著輸出一個 compact receipt JSON object，最後獨佔一行輸出 end marker value。不要把 marker 與 JSON 放在同一行。JSON object 必須只有一個實體行；字串內不得有實際的換行或 CR，若需要換行只能寫成 \\n escape。summary 是控制資料，限制為簡短單行摘要（詳細結果放入 artifact），避免 TUI 強制換行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus begin marker value：%s\nstatus end marker value：%s\n", handoffOutcomeConstraint, p.StatusBeginMarker, p.StatusEndMarker)
 		if p.Transport == handoffTransportFile {
 			fmt.Fprintf(&b, "receipt JSON object（實際輸出時放在 frame 內）：%s。runner 會自行掃描、驗證並收集 outbox 內的 artifact；不要在 receipt 宣告 artifact 路徑。\n", receiptJSONTemplate(p))
-			fmt.Fprintf(&b, "同時把同一份 receipt JSON 寫入 %s。此檔案由 runner 直接讀取，不會被當成 artifact 交給下一位成員；畫面上的 receipt 若被終端換行或重繪破壞，runner 會改用它。\n", fileReceiptPath(p))
+			fmt.Fprintf(&b, "在輸出完成 marker 前，必須把同一份有效、compact JSON 寫入 %s（不可省略）。此檔案由 runner 直接讀取，不會被當成 artifact 交給下一位成員；畫面上的 receipt 若被終端換行或重繪破壞，runner 會改用它。\n", fileReceiptPath(p))
 		} else {
 			fmt.Fprintf(&b, "receipt JSON object（實際輸出時放在 frame 內）：%s；text transport 不得帶 artifacts 欄位。\n", receiptJSONTemplate(p))
 		}
 		if p.HeadNonce != "" {
-			fmt.Fprintf(&b, "prompt_head 必須填入本訊息「最開頭那一行」%s 後面的值，原字照抄。runner 用它確認整則 prompt 完整送達；receipt 本身只證明你看到訊息結尾。若本訊息開頭沒有那一行，填 \"missing\"，不要猜測或從其他 marker 推導。\n", p.HeadMarker)
+			fmt.Fprintf(&b, "prompt_head 必須只填入本訊息最開頭那一行 %s 的「最後一個空白後」nonce，原字照抄；不要包含 TMUXAI_PROMPT_HEAD__ 或任何 TMUXAI_…_round 前綴。runner 用它確認整則 prompt 完整送達；receipt 本身只證明你看到訊息結尾。若本訊息開頭沒有那一行，填 \"missing\"，不要猜測或從其他 marker 推導。\n", p.HeadMarker)
 		}
 	}
 	if p.GoalDoneMarker != "" {
@@ -136,7 +143,7 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 func receiptJSONTemplate(p roundControlProtocol) string {
 	head := ""
 	if p.HeadNonce != "" {
-		head = `,"prompt_head":"<本訊息最開頭 head 行的值>"`
+		head = `,"prompt_head":"<最開頭 head 行最後一個空白後的 nonce>"`
 	}
 	return `{"version":1,"outcome":"needs_followup","summary":"本輪摘要","tests":[]` + head + `}`
 }
@@ -152,9 +159,17 @@ type handoffEngine struct {
 	ResetBeforeStart                                    []handoffMember
 	SelectResponses, Summarize, CoordinatorControlsStop bool
 	Transport                                           resolvedHandoffConfig
+	Compaction                                          resolvedCompactionConfig
 	Route                                               handoffRouter
 	SelectResponse                                      handoffResponseSelector
 	NewReceiptRepairToken                               func() (string, error)
+	// ManualRoundPrompt receives an operator request (Ctrl-C or SIGUSR1 in
+	// pingpong) to stop waiting and open the normal round-recovery menu without
+	// canceling the workflow context.
+	ManualRoundPrompt <-chan os.Signal
+	// CancelWorkflow is invoked only after an explicit interrupt while the
+	// recovery menu is already visible.
+	CancelWorkflow context.CancelFunc
 	// NewPromptHeadNonce is injectable so a test can predict the value a member
 	// is asked to repeat.
 	NewPromptHeadNonce func() (string, error)
@@ -182,6 +197,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	if e.Transport.Transport == "" {
 		return fmt.Errorf("handoff transport was not resolved")
 	}
+	compactor := newCompactor(e.Compaction, e.Guard)
 	var store artifact.Store
 	if e.Transport.Transport == handoffTransportFile {
 		var err error
@@ -247,34 +263,84 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
 	}
+	compactor.recordPrompt(current, initial)
+	currentPrompt, currentEcho := initial, protocol.EchoMarker
 	fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
 	for round := 1; round <= ppMaxRounds; round++ {
+		promptResends := 0
 	roundRetry:
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
-		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(), streams[current.Target], submit)
-		if err != nil {
-			if askRetry(ctx, err) {
-				goto roundRetry
-			}
-			return err
-		}
-		if stopped && !e.CoordinatorControlsStop {
-			return nil
-		}
+		var staticScreenRecovery *screenReceiptRecovery
+		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(protocol, &staticScreenRecovery), streams[current.Target], submit, e.ManualRoundPrompt)
 		var result turnResult
-		if screenSelected {
-			result, err = e.prepareScreenSelectedTurnResult(current, output, protocol, incoming)
+		if err != nil {
+			if errors.Is(err, errReceiptRepairRequired) {
+				result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
+				if err == nil && protocol.GoalMode {
+					err = clearGoalAfterReceiptRepair(ctx, e.Executor, current)
+				}
+			}
 		} else {
-			result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, "", false)
-		}
-		if err != nil && protocol.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
-			result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
+			if stopped && !e.CoordinatorControlsStop {
+				return nil
+			}
+			if screenSelected {
+				if staticScreenRecovery != nil {
+					result, err = e.prepareStaticScreenLLMResult(ctx, current, protocol, incoming, store, *staticScreenRecovery)
+				} else {
+					result, err = e.prepareScreenSelectedTurnResult(current, output, protocol, incoming)
+				}
+			} else {
+				result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, "", false)
+			}
+			if err != nil && protocol.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
+				result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
+			}
 		}
 		if err != nil {
-			if askRetry(ctx, err) {
-				goto roundRetry
+			// Ctrl-C cancels the root context. Retrying or resending after that
+			// point cannot work, so do not present an interactive menu containing
+			// actions that are guaranteed to fail with context canceled.
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
-			return err
+		receiptRecovery:
+			for {
+				switch askRoundRetryActionWithSignal(ctx, err, llmReceiptRecoveryEligible(err, protocol), promptResends < maxPromptResendsPerRound, e.ManualRoundPrompt) {
+				case roundRetryWait:
+					goto roundRetry
+				case roundRetryResendPrompt:
+					baseline, submit, currentPrompt, currentEcho, err = e.resendRoundPrompt(ctx, current, protocol, baseline, currentPrompt, currentEcho)
+					if err == nil {
+						promptResends++
+						fmt.Printf("🔁 已重送第 %d 輪原始 prompt 給 %s（%d/%d）\n", round, handoffMemberDisplayName(current), promptResends, maxPromptResendsPerRound)
+						goto roundRetry
+					}
+					fmt.Fprintf(os.Stderr, "重送本輪 prompt 失敗：%v\n", err)
+					continue
+				case roundRetryLLMRecovery:
+					recoveryErr := err
+					result, err = e.recoverFileReceiptFromScreenWithLLM(ctx, current, protocol, incoming, store, recoveryErr)
+					// A static-screen recovery creates a non-terminal needs_followup
+					// result. Do not clear a goal in that case: the coordinator must
+					// review and route it like any other follow-up.
+					if err == nil && protocol.GoalMode && !isLongStaticScreenTimeout(recoveryErr) {
+						err = clearGoalAfterReceiptRepair(ctx, e.Executor, current)
+					}
+					if err == nil {
+						break receiptRecovery
+					}
+					fmt.Fprintf(os.Stderr, "LLM receipt recovery 失敗：%v\n", err)
+					continue
+				case roundRetryCancelWorkflow:
+					if e.CancelWorkflow != nil {
+						e.CancelWorkflow()
+					}
+					return context.Canceled
+				default:
+					return err
+				}
+			}
 		}
 		fmt.Printf("🧠 正在判斷 %s 的第 %d 輪結果與下一步\n", handoffMemberDisplayName(current), round)
 		var route handoffRoute
@@ -322,7 +388,9 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if route.Instruction == "" {
 			return fmt.Errorf("router returned an empty instruction for %s", next.Label)
 		}
-		fmt.Printf("➡️ 下一步交給 %s (%s)：%s\n", handoffMemberDisplayName(next), next.Target, displayHandoffRouteReason(route.Reason))
+		if err := compactor.maybeCompact(ctx, e.Executor, current, round); err != nil {
+			fmt.Fprintf(os.Stderr, "warn: /compact %s 失敗：%v\n", handoffMemberDisplayName(current), err)
+		}
 		payload, nextIncoming, err := e.routePayload(result, route, store)
 		if err != nil {
 			if askRetry(ctx, err) {
@@ -330,6 +398,8 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			}
 			return err
 		}
+		printArtifactHandoffPaths(current, protocol.Outbox, result.Produced, next, nextIncoming)
+		fmt.Printf("➡️ 下一步交給 %s (%s)：%s\n", handoffMemberDisplayName(next), next.Target, displayHandoffRouteReason(route.Reason))
 		relay := result.Narrative
 		if e.Summarize {
 			if err := e.Guard.useLLM("relay summarizer"); err != nil {
@@ -363,18 +433,140 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			}
 			return err
 		}
+		// A failed relay is not a failed current round. At this point pane1 has
+		// already completed, its receipt was validated, and its outbox was
+		// snapshotted. Going back to roundRetry would consequently wait for (or
+		// replay) pane1 and collect that same outbox a second time. Keep the
+		// prepared relay as the unit of recovery instead.
+		pendingRelayRetries := 0
+	pendingRelayRetry:
 		nextSubmit, err := sendToPane(ctx, e.Executor, next.Target, message, nextProtocol.EchoMarker)
 		if err != nil {
-			if askRetry(ctx, err) {
-				goto roundRetry
+			if pendingRelayRetries >= maxPromptResendsPerRound || !askPendingRelayRetry(ctx, err, next, e.ManualRoundPrompt) {
+				return fmt.Errorf("relay to %s: %w", next.Label, err)
 			}
-			return fmt.Errorf("relay to %s: %w", next.Label, err)
+			nextBaseline, message, nextProtocol.EchoMarker, err = e.retryPendingRelay(ctx, next, nextProtocol, message)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "重送待交接訊息失敗：%v\n", err)
+				goto pendingRelayRetry
+			}
+			pendingRelayRetries++
+			fmt.Printf("🔁 已重送待交接訊息給 %s（%d/%d）\n", handoffMemberDisplayName(next), pendingRelayRetries, maxPromptResendsPerRound)
+			goto pendingRelayRetry
 		}
 		fmt.Printf("📨 已送出第 %d 輪交接給 %s\n", round+1, handoffMemberDisplayName(next))
 		current, baseline, protocol, incoming, submit = next, nextBaseline, nextProtocol, nextIncoming, nextSubmit
+		currentPrompt, currentEcho = message, nextProtocol.EchoMarker
+		compactor.recordPrompt(current, message)
 	}
 	fmt.Printf("⏹️ 已達最大輪數 %d，workflow 停止\n", ppMaxRounds)
 	return nil
+}
+
+// resendRoundPrompt replays the exact current task packet, except for a fresh
+// delivery echo marker. A reused marker might already be visible from the
+// failed send and falsely prove delivery. Replays are explicit user actions;
+// they retain byte budgeting but bypass route-duplication accounting.
+func (e handoffEngine) resendRoundPrompt(ctx context.Context, current handoffMember, protocol roundControlProtocol, _ string, prompt, previousEcho string) (baseline string, submit submitResult, resentPrompt, freshEcho string, err error) {
+	if prompt == "" || previousEcho == "" {
+		return "", submitResult{}, "", "", fmt.Errorf("current round prompt cannot be replayed")
+	}
+	token, err := e.newPromptHeadNonce()
+	if err != nil {
+		return "", submitResult{}, "", "", fmt.Errorf("create replay delivery token: %w", err)
+	}
+	freshEcho = promptEchoMarker("replay-"+token, protocolRound(protocol))
+	resentPrompt = strings.Replace(prompt, previousEcho, freshEcho, 1)
+	if resentPrompt == prompt {
+		return "", submitResult{}, "", "", fmt.Errorf("current round prompt lacks its delivery marker")
+	}
+	if err := e.Guard.reservePromptResend("resend round prompt to "+current.Label, resentPrompt); err != nil {
+		return "", submitResult{}, "", "", err
+	}
+	baseline, err = e.Executor.CapturePaneClean(current.Target, ppLines)
+	if err != nil {
+		return "", submitResult{}, "", "", fmt.Errorf("capture %s before prompt resend: %w", current.Label, err)
+	}
+	submit, err = sendToPane(ctx, e.Executor, current.Target, resentPrompt, freshEcho)
+	if err != nil {
+		return "", submitResult{}, "", "", fmt.Errorf("resend current prompt to %s: %w", current.Label, err)
+	}
+	return baseline, submit, resentPrompt, freshEcho, nil
+}
+
+// retryPendingRelay refreshes only the delivery marker of a handoff that was
+// prepared for the next member but not delivered. It deliberately preserves
+// the source round, its snapshot, and the protocol's head nonce: this is a
+// transport retry, not permission to run the source member again.
+func (e handoffEngine) retryPendingRelay(ctx context.Context, next handoffMember, protocol roundControlProtocol, message string) (baseline, resentMessage, freshEcho string, err error) {
+	if message == "" || protocol.EchoMarker == "" {
+		return "", "", "", fmt.Errorf("pending relay lacks its delivery marker")
+	}
+	token, err := e.newPromptHeadNonce()
+	if err != nil {
+		return "", "", "", fmt.Errorf("create relay retry delivery token: %w", err)
+	}
+	freshEcho = promptEchoMarker("relay-retry-"+token, protocolRound(protocol))
+	resentMessage = strings.Replace(message, protocol.EchoMarker, freshEcho, 1)
+	if resentMessage == message {
+		return "", "", "", fmt.Errorf("pending relay lacks its delivery marker")
+	}
+	if err := e.Guard.reservePromptResend("retry pending relay to "+next.Label, resentMessage); err != nil {
+		return "", "", "", err
+	}
+	baseline, err = e.Executor.CapturePaneClean(next.Target, ppLines)
+	if err != nil {
+		return "", "", "", fmt.Errorf("capture %s before relay retry: %w", next.Label, err)
+	}
+	return baseline, resentMessage, freshEcho, nil
+}
+
+// clearGoalAfterReceiptRepair preserves the goal-mode ordering when a receipt
+// was repaired after the member already printed DONE: validate the replacement
+// receipt first, then clear the native goal before routing the result onward.
+func clearGoalAfterReceiptRepair(ctx context.Context, ex tmux.Executor, member handoffMember) error {
+	if _, err := sendToPane(ctx, ex, member.Target, "/goal clear", ""); err != nil {
+		return fmt.Errorf("clear repaired goal in %s: %w", member.Target, err)
+	}
+	return waitForGoalClearStability(ctx, ex, member.Target)
+}
+
+// waitForGoalClearStability mirrors the normal goal-mode handoff gate: after
+// /goal clear, do not relay another task until the visible pane has remained
+// stable for the configured receipt-idle interval. The volatility filter keeps
+// harmless TUI chrome from extending that interval indefinitely.
+func waitForGoalClearStability(ctx context.Context, ex tmux.Executor, paneID string) error {
+	idle := completionIdleDuration()
+	if idle <= 0 {
+		return nil
+	}
+	interval := time.Duration(ppInterval) * time.Millisecond
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var volatility screenVolatility
+	var stableKey string
+	var stableAt time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+		content, err := ex.CapturePaneClean(paneID, ppLines)
+		if err != nil {
+			return fmt.Errorf("capture %s after /goal clear: %w", paneID, err)
+		}
+		stability := volatility.observe(content, roundControlProtocol{})
+		if stableAt.IsZero() || stability.Key != stableKey {
+			stableKey, stableAt = stability.Key, time.Now()
+		}
+		if time.Since(stableAt) >= idle {
+			return nil
+		}
+	}
 }
 
 func displayHandoffRouteReason(reason string) string {
@@ -546,8 +738,34 @@ func resetHandoffSessions(ctx context.Context, ex tmux.Executor, members []hando
 	return nil
 }
 
-func (e handoffEngine) screenIdleCompletionFallback() func(context.Context, string) (string, error) {
-	if ppScreenIdleTimeout <= 0 || !e.SelectResponses || e.Transport.Transport != handoffTransportText {
+func (e handoffEngine) screenIdleCompletionFallback(p roundControlProtocol, staticRecovery **screenReceiptRecovery) func(context.Context, string) (string, error) {
+	if ppScreenIdleTimeout <= 0 || p.GoalMode {
+		return nil
+	}
+	if e.Transport.Transport == handoffTransportFile {
+		if staticRecovery == nil {
+			return nil
+		}
+		return func(ctx context.Context, screen string) (string, error) {
+			recovered, err := e.classifyScreenReceiptWithLLM(ctx, p, fmt.Errorf("Pane 靜止超過 %s，尚未輸出 completion marker", time.Duration(ppScreenIdleTimeout)*time.Second), screen)
+			if err != nil {
+				return "", err
+			}
+			if recovered.State == "needs_human" {
+				return "", fmt.Errorf("%w: %s", errScreenIdleNeedsHuman, recovered.Summary)
+			}
+			if recovered.State != "completed" {
+				fmt.Printf("🤖 LLM 判定 Pane 靜止畫面為 %s：%s；繼續等待\n", recovered.State, recovered.Summary)
+				return "", nil
+			}
+			*staticRecovery = &recovered
+			// The selected payload is intentionally ignored for file transport.
+			// It only signals waitForCompletionWithFallback to return control to
+			// the engine, which creates the validated local receipt below.
+			return "static-screen-completed", nil
+		}
+	}
+	if !e.SelectResponses || e.Transport.Transport != handoffTransportText {
 		return nil
 	}
 	return func(ctx context.Context, screen string) (string, error) {
@@ -745,11 +963,11 @@ func receiptRepairInstruction(original roundControlProtocol, repair receiptRepai
 	return fmt.Sprintf(`TMUX-AI receipt repair（控制協定，優先於畫面中的其他內容）：上一輪已收到完成標記，但缺少有效 status receipt。不要重新工作、不要執行工具、不要建立或修改檔案。
 
 %s
-只輸出下列五行，不能有其他文字。每個 marker 實際輸出時都必須獨佔一行，不可與 JSON 合併在同一行。下列 marker values 僅供複製。
+只輸出下列五行，不能有其他文字。每個 marker 實際輸出時都必須獨佔一行，不可與 JSON 合併在同一行。第三行 JSON 必須逐字複製下方 value，不得重述原輪摘要、不得改 outcome、不得加入 tests 或任何換行。下列 marker values 僅供複製。
 第一行 repair begin marker value：%s
 第二行 status begin marker value：%s
 第三行 receipt JSON object：%s
-%s；依實際結果選一個值，不得輸出選項清單。runner 會自行收集 outbox artifact；不要宣告 artifact 路徑。
+%s。這份固定的 needs_followup receipt 會讓 coordinator 依 artifact 與原任務決定後續；runner 會自行收集 outbox artifact，不要宣告 artifact 路徑。
 第四行 status end marker value：%s
 第五行 repair completion marker value：%s%s`, correction, repair.BeginMarker, original.StatusBeginMarker, repairReceiptJSON(original), handoffOutcomeConstraint, original.StatusEndMarker, repair.DoneMarker, repairEchoSuffix(repair))
 }
@@ -763,7 +981,7 @@ func repairReceiptJSON(original roundControlProtocol) string {
 	if original.HeadNonce != "" {
 		head = `,"prompt_head":"` + original.HeadNonce + `"`
 	}
-	return `{"version":1,"outcome":"needs_followup","summary":"原輪摘要","tests":[]` + head + `}`
+	return `{"version":1,"outcome":"needs_followup","summary":"Receipt repaired; inspect artifacts.","tests":[]` + head + `}`
 }
 
 func repairEchoSuffix(repair receiptRepairProtocol) string {
@@ -977,6 +1195,26 @@ func (e handoffEngine) routePayload(result turnResult, route handoffRoute, store
 		return handoffPayload{}, nil, err
 	}
 	return handoffPayload{Transport: handoffTransportFile, Artifacts: refs}, refs, nil
+}
+
+// printArtifactHandoffPaths makes file transport observable at the exact point
+// an artifact is selected for the next member. The outbox path shows where the
+// producer wrote it; the immutable read_path is the snapshot the next member
+// actually receives. Keeping both paths visible makes a failed review/fix loop
+// debuggable without asking an LLM to infer filesystem state from terminal UI.
+func printArtifactHandoffPaths(producer handoffMember, outbox string, produced []artifact.Ref, consumer handoffMember, forwarded []artifact.Ref) {
+	if len(produced) > 0 {
+		fmt.Printf("📦 %s 本輪寫入 artifact outbox：%s\n", handoffMemberDisplayName(producer), outbox)
+		for _, ref := range produced {
+			fmt.Printf("   - %s\n     written_path: %s\n     snapshot_path: %s\n", ref.ID, filepath.Join(outbox, ref.OriginalName), ref.RuntimePath)
+		}
+	}
+	if len(forwarded) > 0 {
+		fmt.Printf("📎 將交接給 %s 的 artifacts：\n", handoffMemberDisplayName(consumer))
+		for _, ref := range forwarded {
+			fmt.Printf("   - %s (%s)\n     read_path: %s\n", ref.ID, ref.OriginalName, ref.RuntimePath)
+		}
+	}
 }
 func buildTurnMessage(role, instruction, narrative string, payload handoffPayload, incoming []artifact.Ref, p roundControlProtocol) string {
 	var b strings.Builder

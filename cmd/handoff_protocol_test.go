@@ -1,13 +1,16 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/llmore/tmux-ai/internal/artifact"
+	"github.com/llmore/tmux-ai/internal/ollama"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -38,6 +41,43 @@ func TestHandoffMemberDisplayNameAvoidsRepeatingTarget(t *testing.T) {
 	}
 	if got := handoffMemberDisplayName(handoffMember{ID: "pane2", Label: "reviewer", Target: "hufu:1"}); got != "reviewer" {
 		t.Fatalf("display name = %q, want reviewer", got)
+	}
+}
+
+func TestPrintArtifactHandoffPathsShowsProducerAndConsumerPaths(t *testing.T) {
+	oldStdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	printArtifactHandoffPaths(
+		handoffMember{ID: "pane1", Label: "implementer"}, "/tmp/artifacts/rounds/0008-pane1/outbox",
+		[]artifact.Ref{{ID: "a-r0008-01-deadbeef", OriginalName: "reports/fix.md", RuntimePath: "/tmp/artifacts/objects/a-r0008-01-deadbeef"}},
+		handoffMember{ID: "pane2", Label: "reviewer"},
+		[]artifact.Ref{{ID: "a-r0008-01-deadbeef", OriginalName: "reports/fix.md", RuntimePath: "/tmp/artifacts/objects/a-r0008-01-deadbeef"}},
+	)
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = oldStdout
+	var output bytes.Buffer
+	if _, err := output.ReadFrom(reader); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"implementer 本輪寫入 artifact outbox：/tmp/artifacts/rounds/0008-pane1/outbox",
+		"written_path: /tmp/artifacts/rounds/0008-pane1/outbox/reports/fix.md",
+		"snapshot_path: /tmp/artifacts/objects/a-r0008-01-deadbeef",
+		"將交接給 reviewer 的 artifacts",
+		"read_path: /tmp/artifacts/objects/a-r0008-01-deadbeef",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Errorf("output missing %q:\n%s", want, output.String())
+		}
 	}
 }
 
@@ -153,6 +193,28 @@ func TestReceiptRepairExtractsOnlyFreshBoundedReceipt(t *testing.T) {
 	}, "\n")
 	if _, err := parseReceiptRepair(stale, original, repair); err == nil {
 		t.Fatal("stale receipt marker was accepted")
+	}
+}
+
+func TestFramedReceiptRecoversTUIBreakInsideJSONString(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "wrapped", 9, t.TempDir(), true)
+	output := strings.Join([]string{
+		protocol.StatusBeginMarker,
+		`{"version":1,"outcome":"success","summary":"Fixed write isolation,`,
+		`  added regression tests","tests":[]}`,
+		protocol.StatusEndMarker,
+		protocol.DoneMarker,
+	}, "\n")
+
+	status, err := parseProtocolStatus(output, protocol)
+	if err != nil {
+		t.Fatalf("parseProtocolStatus() error = %v", err)
+	}
+	if status.Summary != "Fixed write isolation, added regression tests" {
+		t.Fatalf("summary = %q", status.Summary)
+	}
+	if _, ok := extractCompletedProtocolEnvelope(output, protocol); !ok {
+		t.Fatal("wrapped receipt did not produce a completed envelope")
 	}
 }
 
@@ -279,6 +341,65 @@ func TestFileTurnRepairsMissingStatusFromSamePane(t *testing.T) {
 	}
 	if len(executor.SendLinesCalls) != 1 || !strings.Contains(executor.SendLinesCalls[0].Content, repair.BeginMarker) {
 		t.Fatalf("repair prompt = %#v", executor.SendLinesCalls)
+	}
+}
+
+func TestGoalFileTurnRepairsMalformedReceiptBeforeClearingGoal(t *testing.T) {
+	oldInterval, oldTimeout, oldClearTimeout, oldReceiptIdle := ppInterval, ppRoundTimeout, codexGoalClearTimeout, ppReceiptIdleTimeout
+	oldDelay, oldConfirm, oldPendingTimeout := ppSubmitDelay, ppSubmitConfirmTimeout, ppPendingInputTimeout
+	defer func() {
+		ppInterval, ppRoundTimeout, codexGoalClearTimeout, ppReceiptIdleTimeout = oldInterval, oldTimeout, oldClearTimeout, oldReceiptIdle
+		ppSubmitDelay, ppSubmitConfirmTimeout, ppPendingInputTimeout = oldDelay, oldConfirm, oldPendingTimeout
+	}()
+	ppInterval, ppRoundTimeout, codexGoalClearTimeout, ppReceiptIdleTimeout = 1, 1, 0, 0
+	ppSubmitDelay, ppSubmitConfirmTimeout, ppPendingInputTimeout = 0, 0, 0
+
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane1", 9)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := newRoundControlProtocol(handoffTransportFile, "run", 9, outbox, true)
+	original.GoalMode = true
+	repair := newReceiptRepairProtocol(original, "repair")
+	executor := &receiptRepairExecutor{FakeExecutor: tmux.NewFakeExecutor()}
+	executor.Captures["pane:1"] = strings.Join([]string{
+		original.StatusBeginMarker,
+		`{"version":2,"outcome":"needs_followup","summary":"broken receipt","tests":[]}`,
+		original.StatusEndMarker,
+		original.DoneMarker,
+	}, "\n")
+	executor.afterRepair = strings.Join([]string{
+		repair.EchoMarker,
+		repair.BeginMarker,
+		original.StatusMarker + ` {"version":1,"outcome":"needs_followup","summary":"corrected","tests":[]}`,
+		repair.DoneMarker,
+	}, "\n")
+
+	_, _, _, err = waitForCompletionWithFallback(context.Background(), executor, "pane:1", "before", original, nil, nil, submitResult{})
+	if !errors.Is(err, errReceiptRepairRequired) {
+		t.Fatalf("waitForCompletionWithFallback() error = %v, want receipt repair", err)
+	}
+
+	engine := handoffEngine{
+		Executor:              executor,
+		Guard:                 newHandoffGuard(),
+		Transport:             resolvedHandoffConfig{Transport: handoffTransportFile},
+		NewReceiptRepairToken: func() (string, error) { return "repair", nil },
+	}
+	result, err := engine.repairMissingFileReceipt(context.Background(), handoffMember{ID: "pane1", Label: "implementer", Target: "pane:1", GoalMode: true}, original, nil, store, err)
+	if err != nil || result.Status == nil || result.Status.Summary != "corrected" {
+		t.Fatalf("repairMissingFileReceipt() = (%#v, %v)", result, err)
+	}
+	if err := clearGoalAfterReceiptRepair(context.Background(), executor, handoffMember{ID: "pane1", Target: "pane:1", GoalMode: true}); err != nil {
+		t.Fatalf("clearGoalAfterReceiptRepair() error = %v", err)
+	}
+	if len(executor.SendLinesCalls) != 2 || executor.SendLinesCalls[1].Content != "/goal clear" {
+		t.Fatalf("send calls = %#v, want repair followed by /goal clear", executor.SendLinesCalls)
 	}
 }
 
@@ -650,6 +771,12 @@ func TestFileReceiptEnvelopeRejectsInvalidAndForeignTransports(t *testing.T) {
 	if _, ok := fileReceiptEnvelope(protocol); ok {
 		t.Fatal("receipt file with an invalid outcome was accepted")
 	}
+	if err := os.WriteFile(fileReceiptPath(protocol), []byte("{\"version\":1,\"outcome\":\"success\",\"summary\":\"broken\nreceipt\"}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := fileReceiptEnvelope(protocol); ok {
+		t.Fatal("receipt file with a raw string newline was accepted")
+	}
 
 	text := newRoundControlProtocol(handoffTransportText, "invalid-receipt", 1, "", true)
 	if path := fileReceiptPath(text); path != "" {
@@ -686,6 +813,176 @@ func TestRepairPrefersOutboxReceiptOverAskingTheAgent(t *testing.T) {
 	}
 	if len(executor.SendLinesCalls) != 0 {
 		t.Fatalf("outbox receipt still cost a repair round trip: %d sends", len(executor.SendLinesCalls))
+	}
+}
+
+func TestLLMReceiptRecoveryBuildsAndValidatesLocalReceipt(t *testing.T) {
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane1", 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outbox+"/implementation.md", []byte("implementation details"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	protocol := newRoundControlProtocol(handoffTransportFile, "recover", 4, outbox, true)
+	protocol.HeadNonce = "head-nonce"
+	executor := tmux.NewFakeExecutor()
+	executor.Captures["pane:1"] = strings.Join([]string{
+		"implementation complete; all tests passed",
+		protocol.DoneMarker,
+	}, "\n")
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"completed","outcome":"success","summary":"Implementation and tests completed."}`}}}
+	engine := handoffEngine{Executor: executor, Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+
+	result, err := recoverFileReceiptFromScreenWithClient(context.Background(), engine, handoffMember{ID: "pane1", Label: "implementer", Target: "pane:1"}, protocol, nil, store, errReceiptRepairRequired, client)
+	if err != nil {
+		t.Fatalf("recoverFileReceiptFromScreenWithClient() error = %v", err)
+	}
+	if result.Status == nil || result.Status.Outcome != "success" || result.Status.Summary != "Implementation and tests completed." || result.Status.PromptHead != "head-nonce" {
+		t.Fatalf("recovered status = %#v", result.Status)
+	}
+	if len(result.Produced) != 1 || result.Produced[0].OriginalName != "implementation.md" {
+		t.Fatalf("produced artifacts = %#v", result.Produced)
+	}
+	if len(client.Calls) != 1 || !strings.Contains(client.Calls[0].Messages[1].Content, protocol.DoneMarker) {
+		t.Fatalf("LLM recovery calls = %#v", client.Calls)
+	}
+}
+
+func TestLLMReceiptRecoveryRefusesPromptDeliveryFailure(t *testing.T) {
+	protocol := newRoundControlProtocol(handoffTransportFile, "recover", 4, t.TempDir(), true)
+	if llmReceiptRecoveryEligible(errIncompletePrompt, protocol) {
+		t.Fatal("prompt delivery failure was eligible for LLM receipt recovery")
+	}
+}
+
+func TestLLMStaticScreenRecoveryCreatesOnlyNeedsFollowupResult(t *testing.T) {
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outbox+"/fix-summary.md", []byte("fixed and tested"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	protocol := newRoundControlProtocol(handoffTransportFile, "static", 6, outbox, true)
+	protocol.HeadNonce = "must-not-be-forged"
+	executor := tmux.NewFakeExecutor()
+	executor.Captures["pane:2"] = "All requested fixes are complete. go test ./... passed.\n>"
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"completed","outcome":"success","summary":"Fixes and tests completed."}`}}}
+	engine := handoffEngine{Executor: executor, Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	err = fmt.Errorf("pane pane:2 在 1800 秒內未輸出完成標記 %q（畫面已連續 20m0s 沒有非 chrome 變化）", protocol.DoneMarker)
+	if !llmReceiptRecoveryEligible(err, protocol) {
+		t.Fatal("static no-DONE timeout was not eligible for LLM recovery")
+	}
+
+	result, err := recoverFileReceiptFromScreenWithClient(context.Background(), engine, handoffMember{ID: "pane2", Label: "fixer", Target: "pane:2"}, protocol, nil, store, err, client)
+	if err != nil {
+		t.Fatalf("recoverFileReceiptFromScreenWithClient() error = %v", err)
+	}
+	if result.Status == nil || result.Status.Outcome != "needs_followup" || result.Status.PromptHead != "" {
+		t.Fatalf("static recovery status = %#v", result.Status)
+	}
+	if len(result.Produced) != 1 || result.Produced[0].OriginalName != "fix-summary.md" {
+		t.Fatalf("produced artifacts = %#v", result.Produced)
+	}
+}
+
+func TestLLMStaticScreenRecoveryRefusesUnfinishedVerdict(t *testing.T) {
+	store, err := artifact.New(t.TempDir(), true, artifact.DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	outbox, err := store.NewOutbox("pane2", 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	protocol := newRoundControlProtocol(handoffTransportFile, "static", 6, outbox, true)
+	executor := tmux.NewFakeExecutor()
+	executor.Captures["pane:2"] = "Waiting for approval"
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"needs_human","outcome":"blocked","summary":"Waiting for approval."}`}}}
+	engine := handoffEngine{Executor: executor, Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	err = fmt.Errorf("pane pane:2 在 1800 秒內未輸出完成標記 %q（畫面已連續 20m0s 沒有非 chrome 變化）", protocol.DoneMarker)
+	_, err = recoverFileReceiptFromScreenWithClient(context.Background(), engine, handoffMember{ID: "pane2", Label: "fixer", Target: "pane:2"}, protocol, nil, store, err, client)
+	if err == nil || !strings.Contains(err.Error(), "尚不可交接") || !strings.Contains(err.Error(), "needs_human") {
+		t.Fatalf("static unfinished recovery error = %v", err)
+	}
+}
+
+func TestFileScreenIdleFallbackUsesLLMAndReturnsOnlyCompletedState(t *testing.T) {
+	oldIdle, oldClient := ppScreenIdleTimeout, newScreenReceiptRecoveryClient
+	ppScreenIdleTimeout = 60
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"completed","outcome":"success","summary":"Fixes and tests completed."}`}}}
+	newScreenReceiptRecoveryClient = func(_, _ string) ollama.Client { return client }
+	t.Cleanup(func() {
+		ppScreenIdleTimeout, newScreenReceiptRecoveryClient = oldIdle, oldClient
+	})
+
+	protocol := newRoundControlProtocol(handoffTransportFile, "idle", 3, t.TempDir(), true)
+	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	var recovery *screenReceiptRecovery
+	fallback := engine.screenIdleCompletionFallback(protocol, &recovery)
+	if fallback == nil {
+		t.Fatal("file screen-idle fallback was not enabled")
+	}
+	selected, err := fallback(context.Background(), "Fix complete. go test ./... passed.\n>")
+	if err != nil || selected == "" || recovery == nil || recovery.State != "completed" {
+		t.Fatalf("fallback = (%q, %#v, %v)", selected, recovery, err)
+	}
+	if len(client.Calls) != 1 {
+		t.Fatalf("LLM calls = %d, want 1", len(client.Calls))
+	}
+}
+
+func TestFileScreenIdleFallbackKeepsWaitingWhenLLMSeesPendingWork(t *testing.T) {
+	oldIdle, oldClient := ppScreenIdleTimeout, newScreenReceiptRecoveryClient
+	ppScreenIdleTimeout = 60
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"still_working","outcome":"needs_followup","summary":"Tool execution is still visible."}`}}}
+	newScreenReceiptRecoveryClient = func(_, _ string) ollama.Client { return client }
+	t.Cleanup(func() {
+		ppScreenIdleTimeout, newScreenReceiptRecoveryClient = oldIdle, oldClient
+	})
+
+	protocol := newRoundControlProtocol(handoffTransportFile, "idle", 3, t.TempDir(), true)
+	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	var recovery *screenReceiptRecovery
+	selected, err := engine.screenIdleCompletionFallback(protocol, &recovery)(context.Background(), "running tests…")
+	if err != nil || selected != "" || recovery != nil {
+		t.Fatalf("fallback = (%q, %#v, %v)", selected, recovery, err)
+	}
+}
+
+func TestFileScreenIdleFallbackStopsForHumanIntervention(t *testing.T) {
+	oldIdle, oldClient := ppScreenIdleTimeout, newScreenReceiptRecoveryClient
+	ppScreenIdleTimeout = 60
+	client := ollama.NewFakeClient()
+	client.Responses = []ollama.ChatResponse{{Message: ollama.Message{Content: `{"state":"needs_human","outcome":"blocked","summary":"Individual quota reached, agent stopped."}`}}}
+	newScreenReceiptRecoveryClient = func(_, _ string) ollama.Client { return client }
+	t.Cleanup(func() {
+		ppScreenIdleTimeout, newScreenReceiptRecoveryClient = oldIdle, oldClient
+	})
+
+	protocol := newRoundControlProtocol(handoffTransportFile, "idle", 3, t.TempDir(), true)
+	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
+	var recovery *screenReceiptRecovery
+	selected, err := engine.screenIdleCompletionFallback(protocol, &recovery)(context.Background(), "Individual quota reached, agent stopped.")
+	if selected != "" || !errors.Is(err, errScreenIdleNeedsHuman) || recovery != nil {
+		t.Fatalf("fallback = (%q, %#v, %v)", selected, recovery, err)
 	}
 }
 
@@ -832,6 +1129,22 @@ func TestReceiptHeadNonceProvesTheWholePromptArrived(t *testing.T) {
 		}
 	})
 
+	t.Run("marker suffix plus matching nonce is accepted", func(t *testing.T) {
+		p := newProtocol()
+		receipt := `{"version":1,"outcome":"needs_followup","summary":"done","prompt_head":"TMUXAI_run_4 9f2c11ab"}`
+		if _, err := engine.prepareTurnResult(context.Background(), member, screen(p, receipt), p, nil, nil, "", false); err != nil {
+			t.Fatalf("prepareTurnResult() error = %v", err)
+		}
+	})
+
+	t.Run("full head line is accepted", func(t *testing.T) {
+		p := newProtocol()
+		receipt := `{"version":1,"outcome":"needs_followup","summary":"done","prompt_head":"TMUXAI_PROMPT_HEAD__TMUXAI_run_4 9f2c11ab"}`
+		if _, err := engine.prepareTurnResult(context.Background(), member, screen(p, receipt), p, nil, nil, "", false); err != nil {
+			t.Fatalf("prepareTurnResult() error = %v", err)
+		}
+	})
+
 	for _, tt := range []struct {
 		name, receipt, want string
 	}{
@@ -889,10 +1202,10 @@ func TestTurnMessageBracketsThePromptWithDeliveryMarkers(t *testing.T) {
 	if !strings.HasSuffix(message, "\n"+p.EchoMarker) {
 		t.Fatalf("prompt does not end with the delivery marker: %q", message)
 	}
-	if !strings.Contains(message, `"prompt_head":"<本訊息最開頭 head 行的值>"`) {
+	if !strings.Contains(message, `"prompt_head":"<最開頭 head 行最後一個空白後的 nonce>"`) {
 		t.Fatal("receipt template does not ask for prompt_head")
 	}
-	if !strings.Contains(message, p.HeadMarker+" 後面的值") {
+	if !strings.Contains(message, "最後一個空白後」nonce") {
 		t.Fatal("control protocol does not explain where prompt_head comes from")
 	}
 }

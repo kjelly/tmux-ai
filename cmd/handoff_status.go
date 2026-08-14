@@ -88,7 +88,7 @@ func parseProtocolStatus(output string, p roundControlProtocol) (*handoffStatus,
 	if err != nil {
 		return nil, err
 	}
-	return decodeHandoffStatus([]byte(block.JSON))
+	return decodeRenderedHandoffStatus([]byte(block.JSON))
 }
 
 func extractProtocolStatusBlock(output string, p roundControlProtocol) (handoffStatusBlock, error) {
@@ -159,7 +159,62 @@ func parseHandoffStatus(output, marker string) (*handoffStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	return decodeHandoffStatus([]byte(block.JSON))
+	return decodeRenderedHandoffStatus([]byte(block.JSON))
+}
+
+// decodeRenderedHandoffStatus keeps file receipts strict while recovering the
+// one malformed shape terminal UIs commonly create: a hard line break inside a
+// JSON string they rendered. That break is presentation damage, not a JSON
+// value supplied by the member, so turn it into a space and retry decoding.
+// Raw JSON read from the outbox deliberately never takes this path.
+func decodeRenderedHandoffStatus(data []byte) (*handoffStatus, error) {
+	status, err := decodeHandoffStatus(data)
+	if err == nil {
+		return status, nil
+	}
+	normalized, changed := normalizeRenderedJSONStringBreaks(data)
+	if !changed {
+		return nil, err
+	}
+	return decodeHandoffStatus(normalized)
+}
+
+// normalizeRenderedJSONStringBreaks removes a terminal-inserted line break
+// and its visual indentation only while scanning a JSON string literal. A
+// newline outside a string remains normal JSON whitespace. The normalizer is
+// intentionally used only for captured pane output; accepting malformed bytes
+// from a receipt file would weaken the file transport's validation boundary.
+func normalizeRenderedJSONStringBreaks(data []byte) ([]byte, bool) {
+	var normalized strings.Builder
+	normalized.Grow(len(data))
+	inString, escaped, changed := false, false, false
+	for i := 0; i < len(data); i++ {
+		ch := data[i]
+		if inString && (ch == '\n' || ch == '\r') {
+			changed = true
+			if ch == '\r' && i+1 < len(data) && data[i+1] == '\n' {
+				i++
+			}
+			for i+1 < len(data) && (data[i+1] == ' ' || data[i+1] == '\t') {
+				i++
+			}
+			normalized.WriteByte(' ')
+			continue
+		}
+		normalized.WriteByte(ch)
+		switch {
+		case escaped:
+			escaped = false
+		case inString && ch == '\\':
+			escaped = true
+		case ch == '"':
+			inString = !inString
+		}
+	}
+	if !changed {
+		return data, false
+	}
+	return []byte(normalized.String()), true
 }
 
 // decodeHandoffStatus applies the same schema validation to a receipt whether
@@ -192,14 +247,16 @@ var errIncompletePrompt = errors.New("prompt did not reach the member intact")
 // one the runner put at the top of the prompt. A member can only produce that
 // value by having received the beginning of the message, so a mismatch means the
 // paste was truncated, split into two submissions, or that the reply belongs to
-// a different round.
+// a different round.  Some agents report the dynamic marker suffix together
+// with the nonce; accept that exact spelling too, as it contains the same
+// unguessable nonce and therefore proves the same fact.
 func validatePromptDelivery(status *handoffStatus, p roundControlProtocol, label string) error {
 	if p.HeadNonce == "" || status == nil {
 		return nil
 	}
 	reported := strings.TrimSpace(status.PromptHead)
 	switch {
-	case reported == p.HeadNonce:
+	case promptHeadMatches(reported, p):
 		return nil
 	case reported == "":
 		return fmt.Errorf("%w: %s 的 receipt 沒有 prompt_head 欄位，無法確認本輪 prompt 是否完整送達", errIncompletePrompt, label)
@@ -208,6 +265,19 @@ func validatePromptDelivery(status *handoffStatus, p roundControlProtocol, label
 	default:
 		return fmt.Errorf("%w: %s 回報的 prompt_head 是 %q，本輪應為 %q；該回覆對應的不是本輪完整 prompt", errIncompletePrompt, label, truncate(reported, 40), p.HeadNonce)
 	}
+}
+
+func promptHeadMatches(reported string, p roundControlProtocol) bool {
+	if reported == p.HeadNonce {
+		return true
+	}
+	fullLine := p.HeadMarker + " " + p.HeadNonce
+	if reported == fullLine {
+		return true
+	}
+	const markerPrefix = "TMUXAI_PROMPT_HEAD__"
+	markerSuffix := strings.TrimPrefix(p.HeadMarker, markerPrefix)
+	return markerSuffix != p.HeadMarker && reported == markerSuffix+" "+p.HeadNonce
 }
 
 type handoffStatusBlock struct {

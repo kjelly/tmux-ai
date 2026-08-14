@@ -219,9 +219,17 @@ Examples:
 	Args: cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ppHandoffFlagSet = cmd.Flags()
-		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		// SIGINT is intentionally not part of the cancellation context. While a
+		// round is waiting, Ctrl-C opens its recovery menu; a second Ctrl-C at
+		// that menu is the explicit request to abort. SIGTERM remains immediate.
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 		defer stop()
-		return runWithInteractiveRetry(ctx, runPingPong)
+		manualRoundPrompt := make(chan os.Signal, 2)
+		signal.Notify(manualRoundPrompt, os.Interrupt, syscall.SIGUSR1)
+		defer signal.Stop(manualRoundPrompt)
+		return runWithInteractiveRetry(ctx, func() error {
+			return runPingPong(ctx, manualRoundPrompt, stop)
+		})
 	},
 }
 
@@ -295,11 +303,15 @@ func init() {
 
 // ── implementation ────────────────────────────────────────────────────
 
-func runPingPong() error {
+func runPingPong(ctx context.Context, manualRoundPrompt <-chan os.Signal, cancelWorkflow context.CancelFunc) error {
 	if err := applyPingPongPreset(); err != nil {
 		return err
 	}
 	transport, err := resolveHandoffConfig(ppHandoffFlagSet, ppPresetHandoff)
+	if err != nil {
+		return err
+	}
+	compaction, err := resolveCompactionConfig(ppHandoffFlagSet, ppPresetHandoff.Compaction)
 	if err != nil {
 		return err
 	}
@@ -360,8 +372,7 @@ func runPingPong() error {
 
 	ex := tmux.NewExecutorWithOptions(pasteOptions())
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	fmt.Fprintln(os.Stderr, "ℹ️ 等待 round 時按 Ctrl-C 可開啟 [y/l/r/N] 恢復選單；在選單再按 Ctrl-C 才會離開。也可用 kill -USR1 <tmux-ai PID> 開啟選單。")
 
 	// Optionally bootstrap from work that was completed before pingpong
 	// started. The LLM selects only line numbers; the relayed response is sliced
@@ -469,7 +480,8 @@ func runPingPong() error {
 		Executor: ex, Guard: guard, Members: members, StartID: startID,
 		InitialInstruction: initialInstruction, InitialFingerprint: initialInstruction,
 		ResetBeforeStart: []handoffMember{members["pane1"], members["pane2"]},
-		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator, Transport: transport, Route: router,
+		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator, Transport: transport, Compaction: compaction, Route: router,
+		ManualRoundPrompt: manualRoundPrompt, CancelWorkflow: cancelWorkflow,
 	}.Run(ctx)
 }
 
@@ -618,6 +630,25 @@ type handoffGuard struct {
 	lastTarget      string
 	sameTargetCount int
 	handoffCounts   map[[32]byte]int
+}
+
+// reservePromptResend charges a user-requested replay to the byte budgets but
+// deliberately does not count it as a coordinator handoff or duplicate route.
+// The caller separately bounds replays per round, and the operator explicitly
+// accepts that the receiving agent may execute the task twice.
+func (g *handoffGuard) reservePromptResend(label, outbound string) error {
+	size := len([]byte(outbound))
+	if size > ppMaxRelayBytes {
+		return fmt.Errorf("%s is %d bytes, exceeding --max-relay-bytes=%d; stopped without sending", label, size, ppMaxRelayBytes)
+	}
+	if g.totalBytes+size > ppMaxTotalRelayBytes {
+		return fmt.Errorf("%s would raise total relay bytes to %d, exceeding --max-total-relay-bytes=%d; stopped without sending", label, g.totalBytes+size, ppMaxTotalRelayBytes)
+	}
+	if ppApprovalThresholdBytes > 0 && size > ppApprovalThresholdBytes && !ppAllowLargeRelay {
+		return fmt.Errorf("%s is %d bytes, above --approval-threshold-bytes=%d; inspect it and rerun with --allow-large-relay", label, size, ppApprovalThresholdBytes)
+	}
+	g.totalBytes += size
+	return nil
 }
 
 func newHandoffGuard() *handoffGuard {
@@ -1041,7 +1072,7 @@ func (s *completionSettleState) observe(envelope string, stopped bool, now time.
 // selector only after the entire pane has remained unchanged for a bounded
 // period.  A selector cannot fabricate text: it returns a slice of the actual
 // captured screen, and an empty slice means "still working".
-func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error), stream *paneStream, submit submitResult) (string, bool, bool, error) {
+func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID, baseline string, protocol roundControlProtocol, fallback func(context.Context, string) (string, error), stream *paneStream, submit submitResult, manualPrompt ...<-chan os.Signal) (string, bool, bool, error) {
 	interval := time.Duration(ppInterval) * time.Millisecond
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -1054,6 +1085,10 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var promptSignal <-chan os.Signal
+	if len(manualPrompt) > 0 {
+		promptSignal = manualPrompt[0]
+	}
 	captureFailures := 0
 	var volatility screenVolatility
 	var rawScreen, stableKey string
@@ -1091,17 +1126,20 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				// unreachable, and forces the user to restart the workflow just
 				// to correct a small JSON/schema mistake.
 				//
-				// Goal members remain stricter. Their receipt is part of the
-				// evidence required before the runner clears the native goal.
-				if allowFileReceiptRepair && hasUnusableStatusReceipt(content, envelopeProtocol) && envelopeProtocol.Transport == handoffTransportFile && envelopeProtocol.RequireStatus && !envelopeProtocol.GoalMode {
+				// Repair creates fresh, locally-validated evidence before a goal is
+				// cleared, so goal members may use it too.  Do not overload the
+				// screen-selected return value here: that recovery only supports text
+				// transport and previously made this file-transport repair unreachable.
+				if allowFileReceiptRepair && hasUnusableStatusReceipt(content, envelopeProtocol) && envelopeProtocol.Transport == handoffTransportFile && envelopeProtocol.RequireStatus {
 					fmt.Printf("⚠️ Pane %s 已輸出完成標記，但 status receipt 無法驗證；將要求該 pane 修復 receipt\n", paneID)
-					return content, true, true, nil
+					return "", false, false, fmt.Errorf("%w: %v", errReceiptRepairRequired, stall.receiptErr)
 				}
 				return "", false, false, nil
 			}
 			envelope = synthesized
 		}
 		verified := detectedCompletionMarker(stopped)
+		stall.noteValidatedEnvelope()
 		if compatible {
 			verified = "相容的" + verified
 		}
@@ -1110,6 +1148,7 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				return "", false, true, fmt.Errorf("clear completed goal in %s: %w", paneID, err)
 			}
 			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, stopped, envelope
+			stall.noteGoalClearPending()
 			fmt.Printf("✅ Pane %s 已驗證 %s；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, verified, completionIdleDuration())
 			return "", false, true, nil
 		}
@@ -1128,6 +1167,8 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 		select {
 		case <-ctx.Done():
 			return "", false, false, ctx.Err()
+		case <-promptSignal:
+			return "", false, false, fmt.Errorf("%w (SIGUSR1)", errManualRoundPrompt)
 		case <-ticker.C:
 		}
 
@@ -1264,6 +1305,8 @@ func waitForCompletionWithFallback(ctx context.Context, ex tmux.Executor, paneID
 				return "", false, false, fmt.Errorf("clear receipt-completed goal in %s: %w", paneID, err)
 			}
 			goalDoneSeen, goalDoneStopped, goalDoneOutput = true, false, content
+			stall.noteValidatedEnvelope()
+			stall.noteGoalClearPending()
 			fmt.Printf("✅ Pane %s 已驗證有效 status receipt 與 native goal 完成狀態；已送出 /goal clear，等待畫面連續穩定 %s 再交接\n", paneID, completionIdleDuration())
 			continue
 		}

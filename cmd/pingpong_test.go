@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -384,6 +385,59 @@ func TestSendToPaneSubmitsPastedPrompt(t *testing.T) {
 	}
 }
 
+func TestResendRoundPromptUsesFreshDeliveryMarker(t *testing.T) {
+	oldDelay, oldConfirm := ppSubmitDelay, ppSubmitConfirmTimeout
+	ppSubmitDelay, ppSubmitConfirmTimeout = 0, 0
+	defer func() { ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm }()
+
+	executor := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 6, t.TempDir(), true)
+	prompt := "task details\n" + protocol.EchoMarker
+	engine := handoffEngine{
+		Executor: executor,
+		Guard:    newHandoffGuard(),
+		NewPromptHeadNonce: func() (string, error) {
+			return "fresh", nil
+		},
+	}
+	baseline, _, resent, freshEcho, err := engine.resendRoundPrompt(context.Background(), handoffMember{Label: "worker", Target: "pane:1"}, protocol, "", prompt, protocol.EchoMarker)
+	if err != nil {
+		t.Fatalf("resendRoundPrompt() error = %v", err)
+	}
+	if baseline != "" || freshEcho == protocol.EchoMarker || !strings.Contains(resent, freshEcho) || strings.Contains(resent, protocol.EchoMarker) {
+		t.Fatalf("replayed prompt = %q, fresh echo = %q, baseline = %q", resent, freshEcho, baseline)
+	}
+	if len(executor.SendLinesCalls) != 1 || executor.SendLinesCalls[0].Content != resent {
+		t.Fatalf("replay sends = %#v", executor.SendLinesCalls)
+	}
+}
+
+func TestRetryPendingRelayKeepsTheDestinationAndSourceProtocol(t *testing.T) {
+	executor := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "run", 7, t.TempDir(), true)
+	message := "relay payload\n" + protocol.EchoMarker
+	engine := handoffEngine{
+		Executor: executor,
+		Guard:    newHandoffGuard(),
+		NewPromptHeadNonce: func() (string, error) {
+			return "fresh", nil
+		},
+	}
+	baseline, resent, echo, err := engine.retryPendingRelay(context.Background(), handoffMember{Label: "fixer", Target: "hufu:2"}, protocol, message)
+	if err != nil {
+		t.Fatalf("retryPendingRelay() error = %v", err)
+	}
+	if baseline != "" || echo == protocol.EchoMarker || !strings.Contains(resent, echo) || strings.Contains(resent, protocol.EchoMarker) {
+		t.Fatalf("retry result baseline=%q message=%q echo=%q", baseline, resent, echo)
+	}
+	if len(executor.SendLinesCalls) != 0 {
+		t.Fatalf("retryPendingRelay sent a prompt itself: %#v", executor.SendLinesCalls)
+	}
+	if got := engine.Guard.totalBytes; got != len([]byte(resent)) {
+		t.Fatalf("retry byte accounting = %d, want %d", got, len([]byte(resent)))
+	}
+}
+
 func TestResetHandoffSessionsSendsNewToEachPaneInOrder(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	oldDelay, oldConfirm := ppSubmitDelay, ppSubmitConfirmTimeout
@@ -654,6 +708,18 @@ func TestWaitForCompletionUsesScreenIdleFallbackWithoutMarker(t *testing.T) {
 	}
 }
 
+func TestWaitForCompletionOpensRecoveryOnManualPromptSignal(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	ex.Captures["trec:2"] = "agent is still working"
+	signal := make(chan os.Signal, 1)
+	signal <- syscall.SIGUSR1
+
+	_, _, _, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", roundControlProtocol{}, nil, nil, submitResult{}, signal)
+	if !errors.Is(err, errManualRoundPrompt) {
+		t.Fatalf("waitForCompletionWithFallback() error = %v, want manual recovery request", err)
+	}
+}
+
 func TestWaitForCompletionUsesIdleValidReceiptWithoutDone(t *testing.T) {
 	ex := tmux.NewFakeExecutor()
 	protocol := newRoundControlProtocol(handoffTransportFile, "receipt", 1, "/tmp/outbox", true)
@@ -917,15 +983,10 @@ func TestWaitForCompletionDefersMalformedFileReceiptToRepairAfterDone(t *testing
 	}()
 
 	output, stopped, selected, err := waitForCompletionWithFallback(context.Background(), ex, "trec:2", "old prompt", protocol, nil, nil, submitResult{})
-	if err != nil {
-		t.Fatalf("waitForCompletionWithFallback() error = %v", err)
+	if !errors.Is(err, errReceiptRepairRequired) {
+		t.Fatalf("waitForCompletionWithFallback() error = %v, want receipt repair", err)
 	}
-	if output != completed || stopped || selected {
+	if output != "" || stopped || selected {
 		t.Fatalf("output=%q stopped=%t selected=%t", output, stopped, selected)
-	}
-
-	engine := handoffEngine{Guard: newHandoffGuard(), Transport: resolvedHandoffConfig{Transport: handoffTransportFile}}
-	if _, err := engine.prepareTurnResult(context.Background(), handoffMember{ID: "pane2", Label: "reviewer", Target: "trec:2"}, output, protocol, nil, nil, "", false); !errors.Is(err, errMissingReceipt) {
-		t.Fatalf("prepareTurnResult() error = %v, want errMissingReceipt for receipt repair", err)
 	}
 }
