@@ -69,6 +69,7 @@ func TestProtocolForHelperWritesTaskWithoutLeakingHeadNonce(t *testing.T) {
 	engine := handoffEngine{
 		Transport:          resolvedHandoffConfig{Transport: handoffTransportFile, CompletionMode: completionModeHelper},
 		NewPromptHeadNonce: func() (string, error) { return "secret-head", nil },
+		CompletionCommand:  "/runner/current/tmux-ai",
 	}
 	p, err := engine.protocolFor(store, handoffMember{ID: "pane1"}, "run", 1)
 	if err != nil {
@@ -85,8 +86,14 @@ func TestProtocolForHelperWritesTaskWithoutLeakingHeadNonce(t *testing.T) {
 		t.Fatalf("task manifest leaked head nonce: %s", data)
 	}
 	instruction := controlProtocolInstruction(p)
-	if !strings.Contains(instruction, "tmux-ai handoff complete") || strings.Contains(instruction, "receipt JSON object") {
+	if !strings.Contains(instruction, "'/runner/current/tmux-ai' handoff complete") || strings.Contains(instruction, "receipt JSON object") {
 		t.Fatalf("helper instruction = %q", instruction)
+	}
+}
+
+func TestShellQuote(t *testing.T) {
+	if got := shellQuote("/tmp/runner's tmux-ai"); got != "'/tmp/runner'\\''s tmux-ai'" {
+		t.Fatalf("shellQuote() = %q", got)
 	}
 }
 

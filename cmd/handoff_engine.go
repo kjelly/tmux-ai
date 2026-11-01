@@ -123,6 +123,9 @@ type roundControlProtocol struct {
 	// running workflow.
 	HeadMarker, HeadNonce, EchoMarker string
 	TaskID, TaskPath                  string
+	// CompletionCommand is the runner executable that owns this handoff. It
+	// must be used instead of resolving `tmux-ai` from an agent pane's PATH.
+	CompletionCommand string
 }
 
 const (
@@ -156,7 +159,7 @@ func controlProtocolInstruction(p roundControlProtocol) string {
 	}
 	if p.RequireStatus {
 		if p.CompletionMode == completionModeHelper {
-			fmt.Fprintf(&b, "完成後請在本 TUI 內執行 tmux-ai handoff complete；它會原子寫入 receipt 並輸出 status frame 與 completion marker。%s。請將本訊息最開頭 head 行最後一個空白後的 nonce 原字填入 --prompt-head；若未看到 head 行，填 missing，helper 會拒絕完成。\n命令：tmux-ai handoff complete --task %s --prompt-head '<head nonce>' --outcome success|needs_followup|blocked --summary '<短單行摘要>'\n", handoffOutcomeConstraint, p.TaskPath)
+			fmt.Fprintf(&b, "完成後請在本 TUI 內執行 runner 提供的 handoff helper；它會原子寫入 receipt 並輸出 status frame 與 completion marker。不可改用 PATH 中的 tmux-ai，因為它可能不是本 runner 的版本。%s。請將本訊息最開頭 head 行最後一個空白後的 nonce 原字填入 --prompt-head；若未看到 head 行，填 missing，helper 會拒絕完成。\n命令：%s handoff complete --task %s --prompt-head '<head nonce>' --outcome success|needs_followup|blocked --summary '<短單行摘要>'\n", handoffOutcomeConstraint, shellQuote(p.CompletionCommand), shellQuote(p.TaskPath))
 		} else {
 			fmt.Fprintf(&b, "請輸出一個 status receipt frame：先獨佔一行輸出 begin marker value，接著輸出一個 compact receipt JSON object，最後獨佔一行輸出 end marker value。不要把 marker 與 JSON 放在同一行。JSON object 必須只有一個實體行；字串內不得有實際的換行或 CR，若需要換行只能寫成 \\n escape。summary 是控制資料，限制為簡短單行摘要（詳細結果放入 artifact），避免 TUI 強制換行。%s；依實際結果選一個值，不得輸出選項清單。\nstatus begin marker value：%s\nstatus end marker value：%s\n", handoffOutcomeConstraint, p.StatusBeginMarker, p.StatusEndMarker)
 			if p.Transport == handoffTransportFile {
@@ -220,6 +223,9 @@ type handoffEngine struct {
 	// NewPromptHeadNonce is injectable so a test can predict the value a member
 	// is asked to repeat.
 	NewPromptHeadNonce func() (string, error)
+	// CompletionCommand identifies this runner's executable for helper-mode
+	// receipts. It is injectable for tests; Run resolves it from os.Executable.
+	CompletionCommand string
 }
 
 func (e handoffEngine) newPromptHeadNonce() (string, error) {
@@ -243,6 +249,13 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	}
 	if e.Transport.Transport == "" {
 		return fmt.Errorf("handoff transport was not resolved")
+	}
+	if e.Transport.CompletionMode == completionModeHelper {
+		command, err := e.completionCommand()
+		if err != nil {
+			return fmt.Errorf("resolve handoff completion helper: %w", err)
+		}
+		e.CompletionCommand = command
 	}
 	if e.Summarize && e.Transport.Transport == handoffTransportFile {
 		return fmt.Errorf("--summarize is only supported with text handoff transport")
@@ -890,6 +903,11 @@ func (e handoffEngine) protocolFor(store artifact.Store, member handoffMember, t
 			return roundControlProtocol{}, fmt.Errorf("completion helper requires file transport")
 		}
 		protocol.TaskID = fmt.Sprintf("%s:%d:%s", token, round, member.ID)
+		command, err := e.completionCommand()
+		if err != nil {
+			return roundControlProtocol{}, fmt.Errorf("resolve handoff completion helper: %w", err)
+		}
+		protocol.CompletionCommand = command
 		path, err := writeHandoffTaskManifest(protocol, member)
 		if err != nil {
 			return roundControlProtocol{}, err

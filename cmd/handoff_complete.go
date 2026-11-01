@@ -88,6 +88,32 @@ func init() {
 	_ = handoffCompleteCmd.MarkFlagRequired("outcome")
 }
 
+// completionCommand returns the exact executable running the workflow. Agent
+// panes commonly have a different PATH from the runner (and can therefore
+// resolve an older tmux-ai that lacks the helper command). Do not silently
+// fall back to PATH: helper mode is a versioned control-plane contract.
+func (e handoffEngine) completionCommand() (string, error) {
+	if command := strings.TrimSpace(e.CompletionCommand); command != "" {
+		return command, nil
+	}
+	command, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate runner executable: %w", err)
+	}
+	command, err = filepath.Abs(command)
+	if err != nil {
+		return "", fmt.Errorf("make runner executable path absolute: %w", err)
+	}
+	info, err := os.Stat(command)
+	if err != nil {
+		return "", fmt.Errorf("stat runner executable %q: %w", command, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("runner executable %q is not executable", command)
+	}
+	return command, nil
+}
+
 func writeHandoffTaskManifest(p roundControlProtocol, member handoffMember) (string, error) {
 	if p.Outbox == "" || p.TaskID == "" || p.HeadNonce == "" {
 		return "", fmt.Errorf("incomplete handoff task protocol")
