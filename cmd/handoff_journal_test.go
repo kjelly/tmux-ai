@@ -99,6 +99,54 @@ func TestHandoffJournalAmbiguousRelayNeverAutoResends(t *testing.T) {
 	}
 }
 
+func TestHandoffJournalAmbiguousRelayObserveShowsTargetWithoutSending(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	protocol.HeadNonce = "head"
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	engine.ResumeRelayAction = "observe"
+	writeJournalState(t, engine, statePath, journalRelaySubmitStarted, protocol, nil, "ambiguous\n"+protocol.EchoMarker)
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "ambiguous relay observed") {
+		t.Fatalf("resume error = %v", err)
+	}
+	if len(ex.SendLinesCalls) != 0 {
+		t.Fatalf("observe resent the relay: %#v", ex.SendLinesCalls)
+	}
+}
+
+func TestHandoffJournalAmbiguousRelayResendSendsSavedMessage(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	oldDelay, oldConfirm := ppSubmitDelay, ppSubmitConfirmTimeout
+	ppSubmitDelay, ppSubmitConfirmTimeout = 0, 0
+	defer func() { ppSubmitDelay, ppSubmitConfirmTimeout = oldDelay, oldConfirm }()
+
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	protocol.HeadNonce = "head"
+	if err := os.MkdirAll(protocol.Outbox, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileReceiptPath(protocol), []byte(`{"version":1,"outcome":"success","summary":"done","prompt_head":"head"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	message := "resend this relay\n" + protocol.EchoMarker
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true, Reason: "done"}, nil
+	})
+	engine.ResumeRelayAction = "resend"
+	writeJournalState(t, engine, statePath, journalRelaySubmitStarted, protocol, nil, message)
+	if err := engine.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != message {
+		t.Fatalf("resumed sends = %#v", ex.SendLinesCalls)
+	}
+}
+
 func TestHandoffJournalRejectsConfigurationMismatch(t *testing.T) {
 	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
 	ex := tmux.NewFakeExecutor()
