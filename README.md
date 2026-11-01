@@ -1185,7 +1185,7 @@ tmux-ai pingpong \
 | `--pane2-goal-mode` | `false` | 對 pane2 的一般任務前加上 `/goal ` |
 | `--strict-goal-completion-marker` | `false` | 只有 agent 能可靠輸出 runner 的 `GOAL_DONE__...` marker 時才啟用；要求該 marker 先於完成 marker。 |
 | `--max-rounds` | `20` | 最大交替輪數（安全上限） |
-| `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制） |
+| `--round-timeout` | `600` | 每輪超時秒數（0 = 不限制）。preset 可用 `round_timeout` 設定同一上限；preset 設 `0` 表示只以 receipt/marker 判定完成，不設 wall-clock 上限。命令列 flag 優先於 preset。 |
 | `--completion-settle-timeout` | `1000` | 完整且有效的完成 envelope 必須維持不變多久才換手（毫秒；0 停用）。此驗證完全在 runner 本地進行。 |
 | `--receipt-idle-timeout` | `30` | 有效本輪 status receipt 出現後，畫面保持不變多久即可交接（秒；0 停用）。 |
 | `--paste-chunk-size` | `500` | 每次貼進 pane 的 rune 數。 |
