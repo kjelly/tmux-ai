@@ -506,21 +506,23 @@ func runPingPong(ctx context.Context, manualRoundPrompt <-chan os.Signal, cancel
 
 type pingPongPreset struct {
 	handoffPresetConfig `yaml:",inline"`
-	Initial             string                    `yaml:"initial"`
-	InitialPane1        string                    `yaml:"initial_pane1"`
-	InitialPane2        string                    `yaml:"initial_pane2"`
-	Pane1Role           string                    `yaml:"pane1_role"`
-	Pane2Role           string                    `yaml:"pane2_role"`
-	Pane1GoalMode       bool                      `yaml:"pane1_goal_mode"`
-	Pane2GoalMode       bool                      `yaml:"pane2_goal_mode"`
-	ToPane1Prompt       string                    `yaml:"to_pane1_prompt"`
-	ToPane2Prompt       string                    `yaml:"to_pane2_prompt"`
-	Coordinator         bool                      `yaml:"coordinator"`
-	CoordinatorPolicy   string                    `yaml:"coordinator_policy"`
-	StopMembers         []string                  `yaml:"stop_members"`
-	CoordinatorTimeout  int                       `yaml:"coordinator_timeout"`
-	MaxSelectionRetries int                       `yaml:"max_selection_retries"`
-	RoundTimeout        int                       `yaml:"round_timeout"`
+	Initial             string   `yaml:"initial"`
+	InitialPane1        string   `yaml:"initial_pane1"`
+	InitialPane2        string   `yaml:"initial_pane2"`
+	Pane1Role           string   `yaml:"pane1_role"`
+	Pane2Role           string   `yaml:"pane2_role"`
+	Pane1GoalMode       bool     `yaml:"pane1_goal_mode"`
+	Pane2GoalMode       bool     `yaml:"pane2_goal_mode"`
+	ToPane1Prompt       string   `yaml:"to_pane1_prompt"`
+	ToPane2Prompt       string   `yaml:"to_pane2_prompt"`
+	Coordinator         bool     `yaml:"coordinator"`
+	CoordinatorPolicy   string   `yaml:"coordinator_policy"`
+	StopMembers         []string `yaml:"stop_members"`
+	CoordinatorTimeout  int      `yaml:"coordinator_timeout"`
+	MaxSelectionRetries int      `yaml:"max_selection_retries"`
+	// A nil timeout leaves the command default unchanged; an explicit zero
+	// disables the deadline so receipt completion is the authority.
+	RoundTimeout        *int                      `yaml:"round_timeout"`
 	ScreenIdleTimeout   int                       `yaml:"screen_idle_timeout"`
 	ScreenIdleNormalize bool                      `yaml:"screen_idle_normalize"`
 	CompletionSettleMS  *int                      `yaml:"completion_settle_ms"`
@@ -612,8 +614,11 @@ func applyPingPongPreset() error {
 	if preset.MaxSelectionRetries > 0 {
 		ppMaxSelectionRetries = preset.MaxSelectionRetries
 	}
-	if preset.RoundTimeout > 0 {
-		ppRoundTimeout = preset.RoundTimeout
+	if preset.RoundTimeout != nil && (ppHandoffFlagSet == nil || !ppHandoffFlagSet.Changed("round-timeout")) {
+		if *preset.RoundTimeout < 0 {
+			return fmt.Errorf("preset round_timeout must not be negative")
+		}
+		ppRoundTimeout = *preset.RoundTimeout
 	}
 	if preset.ScreenIdleTimeout > 0 {
 		ppScreenIdleTimeout = preset.ScreenIdleTimeout

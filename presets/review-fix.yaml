@@ -59,7 +59,10 @@ coordinator_policy: |-
   才能 stop。outcome=blocked 時使用 needs_human。
 coordinator_timeout: 600
 max_selection_retries: 2
-round_timeout: 1800
+# Review/fix agents can legitimately run full test and race suites for longer
+# than a fixed budget. Completion is receipt-driven; zero disables only the
+# wall-clock cutoff, not the validated receipt/marker protocol.
+round_timeout: 0
 screen_idle_timeout: 60
 screen_idle_normalize: true
 submit_delay: 3000

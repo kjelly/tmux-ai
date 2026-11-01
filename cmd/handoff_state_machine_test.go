@@ -86,6 +86,9 @@ func TestReviewFixPresetsUseValidatedStateMachine(t *testing.T) {
 		if preset.Coordinator || preset.Routing.Mode != "state_machine" {
 			t.Fatalf("preset %s coordinator=%t routing=%#v", name, preset.Coordinator, preset.Routing)
 		}
+		if name == "review-fix.yaml" && (preset.RoundTimeout == nil || *preset.RoundTimeout != 0) {
+			t.Fatalf("preset %s should disable wall-clock timeout for receipt-driven review/fix rounds", name)
+		}
 		_, _, err = newStateMachineRouter(preset.Routing, stateMachineMembers(), preset.StopMembers, func(target string) string { return "work " + target })
 		if err != nil {
 			t.Fatalf("preset %s router: %v", name, err)
