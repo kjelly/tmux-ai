@@ -1217,7 +1217,7 @@ tmux-ai pingpong \
 | `--pane-stream` | `false` | 以 `tmux pipe-pane` 鏡像 pane 輸出，救回畫面已捲掉或被重繪蓋掉的完成 envelope。 |
 | `--screen-idle-timeout` | `0` | 畫面持續不變後，讓 LLM 從全螢幕判定是否已有完整回覆（秒；0 停用）。text transport 會選取可 relay 的回覆；file transport 只在判定完成時建立非終止的 `needs_followup` receipt 交給 coordinator。 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
-| `--lines` | `80` | 每次捕捉的 pane 行數 |
+| `--lines` | `256` | 每次捕捉的 pane 行數 |
 | `--summarize` | `false` | relay 前先用 Ollama 摘要內容，減少 context |
 | `--coordinator` | `false` | 每輪由 LLM 決定下一個 pane 與交接指令 |
 | `--coordinator-policy` | — | 可信的 workflow 控制規則；決定角色路由與停止條件 |
