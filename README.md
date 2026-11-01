@@ -26,6 +26,7 @@
   - [ask](#ask--直接問-pane-裡的-agent)
   - [template](#template--儲存常用指令範本)
   - [follow](#follow--即時串流-pane-輸出)
+  - [pr-loop](#pr-loop--依-pr-狀態執行原生-skill-指令)
   - [pingpong](#pingpong--兩個-agent-交替執行)
   - [coordinate](#coordinate--多-window-角色路由)
   - [handoff complete](#handoff-complete--原子提交-file-handoff-receipt)
@@ -1057,6 +1058,68 @@ tmux-ai follow %25 --from-start | tee build-$(date +%s).log
 ```
 
 > `follow` 與 `watch` 的差異：`follow` 輸出新增的行（streaming），`watch` 只在 pattern 出現時觸發動作（event-driven）。
+
+### `pr-loop` — 依 PR 狀態執行原生 Skill 指令
+
+```bash
+tmux-ai pr-loop 333 --repo owner/repo \
+  --draft-pane my-project:1 \
+  --ready-pane my-project:2 \
+  --draft-command '/pr-ready {pr}' \
+  --ready-command '$pr-review-merge {pr}'
+```
+
+`pr-loop` 使用 GitHub CLI `gh` 查詢 PR，依三種狀態循環執行：
+
+| PR 狀態 | 動作 |
+|---------|------|
+| `draft`（OPEN 且 isDraft=true） | 在 `--draft-pane` 送出 `--draft-command` |
+| `ready`（OPEN 且 isDraft=false） | 在 `--ready-pane` 送出 `--ready-command` |
+| `merged`（MERGED） | 成功結束，不再送出任何指令 |
+
+PR 一開始已 ready 時會直接執行審查 skill；審查轉回 draft 後會再次執行修正
+skill，再等 ready，如此循環到 merged。關閉但未合併的 PR 屬於異常，會以錯誤
+結束，不會當成 merged。啟用 auto-merge 或等待 CI 都仍是 ready。
+
+指令會原文貼入 agent，再送一次 Enter。**不加入角色、prompt wrapper、
+`/goal`、receipt 或完成標記**，因此可由 agent 原生辨識 `/command` 或 `$skill`。
+Skill 名稱與完整指令都可透過上述兩個 command flags 修改；`{pr}` 會代入 PR 編號。
+在 shell 中使用單引號包住 `$skill`，避免被 shell 當成變數展開。
+
+前置條件：`gh` 已登入且可讀取指定 repository；兩個 pane 已啟動對應 agent，
+並位於正確 repository，輸入區為空。目標支援 `%ID`、alias、`session:window`
+與 `session:window.pane`，啟動後固定到解析出的 pane ID；更換 pane 後需重新啟動。
+請在第三個 window 或其他 terminal 執行 runner，同一個 PR 同時只執行一個 runner。
+此指令不需要 Ollama。
+
+完成判定只依 PR 狀態，不判讀 agent 畫面是否 idle。Skill 應在完成該階段工作後才
+改變 PR 狀態，這就是交接訊號；狀態連續確認後，runner 即可啟動下一階段，即使
+前一個 agent 還在輸出收尾文字。同一階段等待期間只送出一次指令，狀態不變、
+畫面靜止或 head commit 更新都不會自動重送。
+
+| Flag | 預設 | 說明 |
+|------|------|------|
+| `--repo` | 必填 | `[HOST/]OWNER/REPO` |
+| `--draft-pane` / `--ready-pane` | 必填 | 草稿修正／ready 審查的不同 pane |
+| `--draft-command` | `/pr-ready {pr}` | 草稿階段的原生指令 |
+| `--ready-command` | `$pr-review-merge {pr}` | ready 階段的原生指令 |
+| `--poll-interval` | `10s` | GitHub 查詢間隔 |
+| `--stable-polls` | `2` | 送出指令前，連續觀察到相同狀態的次數；merged 立即停止 |
+| `--phase-timeout` | `1h` | 送出指令／開始 observe 後等待狀態變更的上限；`0` 不限制 |
+| `--submit-delay` | `1s` | 貼上後等待多久再送 Enter |
+| `--max-actions` | `20` | 原生指令送出次數上限，超過時以錯誤結束 |
+| `--observe` | `false` | 跳過起始階段的指令，等待下一次狀態變更 |
+| `--dry-run` | `false` | 查詢並印出初始動作後結束，不連線 tmux、不送指令 |
+
+GitHub 查詢每次最多等待 30 秒；連續失敗三次便停止，失敗期間不使用舊狀態送出
+指令。傳送失敗可能已部分貼上，runner 會停止，不會自動重送 Enter。Ctrl-C 或
+SIGTERM 可停止 runner；已送入 agent 的工作仍會繼續。
+
+Runner 不保存跨程序的送出紀錄。若重新啟動時 agent 正在工作，使用相同參數
+加上 `--observe`，可跳過起始狀態的指令；若需要重新執行該階段，則不加
+`--observe`。重新啟動前應先查看 pane，處理可能尚未送出的輸入。
+
+---
 
 ### `pingpong` — 兩個 Agent 交替執行
 
