@@ -97,6 +97,96 @@ func TestShellQuote(t *testing.T) {
 	}
 }
 
+func TestCompletionCommandUsesInjectedPath(t *testing.T) {
+	engine := handoffEngine{CompletionCommand: "  /runner/current/tmux-ai  "}
+	command, err := engine.completionCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command != "/runner/current/tmux-ai" {
+		t.Fatalf("completionCommand() = %q", command)
+	}
+}
+
+func TestCompletionCommandResolvesRunningExecutable(t *testing.T) {
+	command, err := handoffEngine{}.completionCommand()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(command) {
+		t.Fatalf("completionCommand() = %q, want an absolute path", command)
+	}
+	info, err := os.Stat(command)
+	if err != nil {
+		t.Fatalf("stat %q: %v", command, err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("resolved command %q is not an executable file", command)
+	}
+}
+
+func TestCompletionSummaryAcceptsOnlyOneSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary.txt")
+	if err := os.WriteFile(path, []byte("from file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := completionSummary("inline", path); err == nil || !strings.Contains(err.Error(), "only one of --summary and --summary-file") {
+		t.Fatalf("completionSummary() error = %v", err)
+	}
+}
+
+func TestCompletionSummaryReadsFileAndCollapsesWhitespace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "summary.txt")
+	if err := os.WriteFile(path, []byte("first line\r\nsecond line\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := completionSummary("", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary != "first line second line" {
+		t.Fatalf("summary = %q", summary)
+	}
+}
+
+func TestCompletionSummaryRejectsEmptyAndOversizedInput(t *testing.T) {
+	if _, err := completionSummary("   ", ""); err == nil || !strings.Contains(err.Error(), "summary is required") {
+		t.Fatalf("completionSummary() error = %v", err)
+	}
+	oversized := strings.Repeat("x", maxCompletionSummaryBytes+1)
+	if _, err := completionSummary(oversized, ""); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("completionSummary() error = %v", err)
+	}
+}
+
+func TestCompletionTestsParsesFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tests.json")
+	if err := os.WriteFile(path, []byte(`["go test ./...", {"name":"golangci-lint"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := completionTests(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != 2 || claims[0].Name != "go test ./..." || claims[1].Name != "golangci-lint" {
+		t.Fatalf("claims = %#v", claims)
+	}
+	empty, err := completionTests("")
+	if err != nil || empty != nil {
+		t.Fatalf("completionTests(\"\") = %#v, %v", empty, err)
+	}
+}
+
+func TestCompletionTestsRejectsInvalidFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tests.json")
+	if err := os.WriteFile(path, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := completionTests(path); err == nil || !strings.Contains(err.Error(), "parse tests file") {
+		t.Fatalf("completionTests() error = %v", err)
+	}
+}
+
 func TestCompleteHandoffRejectsWrongPromptHead(t *testing.T) {
 	p, taskPath := helperTask(t)
 	err := completeHandoff(handoffCompleteRequest{TaskPath: taskPath, PromptHead: "wrong", Outcome: "success", Summary: "done", Completion: "done"}, &bytes.Buffer{})
