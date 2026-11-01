@@ -1382,7 +1382,7 @@ members:
 
 若需從全新對話開始，可在任一模式加上 `--new`。runner 會依 preset 成員順序（pingpong 則 pane1、pane2）先向每個 participating pane 送出並提交 `/new`，再送出第一個任務；`--dry-run` 只顯示預計動作，不會送出 `/new`。在 YAML preset 也可設定 `new_session: true`，而命令列 `--new` 可明確啟用。
 
-`coordinate` 與 `pingpong` 共用同一個 handoff engine、coordinator prompt/JSON schema 與 action mapping，因此完成標記、兩階段 envelope 驗證、policy stop gate、response reselection、bytes/LLM call 限制、重複交接防護、送出確認及 Ctrl-C 取消行為一致。主要安全 flags 與 `pingpong` 相同；`--completion-settle-timeout` 也可由 coordinate preset 的 `completion_settle_ms` 設定。可先加 `--dry-run` 檢查第一個 coordinator 決策與實際 prompt，而不操作 tmux。
+`coordinate` 與 `pingpong` 共用同一個 handoff engine、coordinator prompt/JSON schema 與 action mapping，因此完成標記、兩階段 envelope 驗證、policy stop gate、response reselection、bytes/LLM call 限制、重複交接防護、送出確認及 Ctrl-C 取消行為一致。主要安全 flags 與 `pingpong` 相同；只有連續交接上限改用 member 語彙：coordinate 的 `--max-same-window-rounds` 等同 `pingpong` 的 `--max-same-pane-rounds`（預設 3，限制 coordinator 可連續交給同一 member 的次數）。`--completion-settle-timeout` 也可由 coordinate preset 的 `completion_settle_ms` 設定。可先加 `--dry-run` 檢查第一個 coordinator 決策與實際 prompt，而不操作 tmux。
 
 ---
 
