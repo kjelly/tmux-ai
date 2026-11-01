@@ -47,6 +47,43 @@ func TestStoreCollectsSnapshotsAndVerifies(t *testing.T) {
 	}
 }
 
+func TestOpenRestoresAndVerifiesExistingManifest(t *testing.T) {
+	root := t.TempDir()
+	store, err := New(root, true, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := store.NewOutbox("reviewer", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outbox, "review.md"), []byte("finding"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	refs, err := store.Collect("reviewer", 1, outbox, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(root, true, DefaultLimits())
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	defer reopened.Close()
+	resolved, err := reopened.Resolve([]string{refs[0].ID})
+	if err != nil || len(resolved) != 1 {
+		t.Fatalf("Resolve() = %#v, %v", resolved, err)
+	}
+	if err := os.WriteFile(resolved[0].RuntimePath, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(root, true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "verify artifact manifest") {
+		t.Fatalf("Open() after mutation error = %v", err)
+	}
+}
+
 func TestStoreRejectsUnsafeClaimsAndFiles(t *testing.T) {
 	store, err := New(t.TempDir(), true, DefaultLimits())
 	if err != nil {

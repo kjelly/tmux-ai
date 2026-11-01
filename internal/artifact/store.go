@@ -23,13 +23,17 @@ type fileStore struct {
 }
 
 func New(root string, keep bool, limits Limits) (Store, error) {
-	if limits.MaxFilesPerTurn <= 0 || limits.MaxFileBytes < 0 || limits.MaxTurnBytes < 0 || limits.MaxRunFiles <= 0 || limits.MaxRunBytes < 0 {
+	if !validLimits(limits) {
 		return nil, fmt.Errorf("invalid artifact limits")
 	}
 	var err error
 	if root == "" {
 		root, err = os.MkdirTemp("", "tmux-ai-artifacts-")
 	} else {
+		root, err = filepath.Abs(root)
+		if err != nil {
+			return nil, fmt.Errorf("resolve artifact root: %w", err)
+		}
 		err = os.MkdirAll(root, 0o700)
 	}
 	if err != nil {
@@ -48,7 +52,46 @@ func New(root string, keep bool, limits Limits) (Store, error) {
 	if _, err := rand.Read(b); err != nil {
 		return nil, err
 	}
-	return &fileStore{root: root, keep: keep, limits: limits, manifest: Manifest{Version: 1, RunID: hex.EncodeToString(b)}}, nil
+	store := &fileStore{root: root, keep: keep, limits: limits, manifest: Manifest{Version: 1, RunID: hex.EncodeToString(b)}}
+	if err := store.writeManifest(); err != nil {
+		return nil, fmt.Errorf("write initial artifact manifest: %w", err)
+	}
+	return store, nil
+}
+
+// Open restores an existing artifact store for a resumed handoff run. It
+// verifies every recorded immutable object before exposing the store.
+func Open(root string, keep bool, limits Limits) (Store, error) {
+	if !validLimits(limits) {
+		return nil, fmt.Errorf("invalid artifact limits")
+	}
+	if root == "" {
+		return nil, fmt.Errorf("artifact root is required")
+	}
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve artifact root: %w", err)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "manifest.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read artifact manifest: %w", err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		return nil, fmt.Errorf("parse artifact manifest: %w", err)
+	}
+	if manifest.Version != 1 || manifest.RunID == "" {
+		return nil, fmt.Errorf("invalid artifact manifest")
+	}
+	store := &fileStore{root: root, keep: keep, limits: limits, manifest: manifest}
+	if err := store.Verify(manifest.Artifacts); err != nil {
+		return nil, fmt.Errorf("verify artifact manifest: %w", err)
+	}
+	return store, nil
+}
+
+func validLimits(limits Limits) bool {
+	return limits.MaxFilesPerTurn > 0 && limits.MaxFileBytes >= 0 && limits.MaxTurnBytes >= 0 && limits.MaxRunFiles > 0 && limits.MaxRunBytes >= 0
 }
 
 func (s *fileStore) Root() string { return s.root }

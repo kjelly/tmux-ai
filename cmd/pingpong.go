@@ -500,6 +500,7 @@ func runPingPong(ctx context.Context, manualRoundPrompt <-chan os.Signal, cancel
 		ResetBeforeStart: []handoffMember{members["pane1"], members["pane2"]},
 		SelectResponses:  ppCoordinator, Summarize: ppSummarize, CoordinatorControlsStop: ppCoordinator || stateMachine, Transport: transport, Compaction: compaction, Route: router,
 		ManualRoundPrompt: manualRoundPrompt, CancelWorkflow: cancelWorkflow,
+		RunStatePath: ppRunStatePath, ResumeHandoffPath: ppResumeHandoffPath, ResumeRelayAction: ppResumeRelayAction, ResumeAllowConfigMismatch: ppResumeAllowConfigMismatch,
 	}.Run(ctx)
 }
 

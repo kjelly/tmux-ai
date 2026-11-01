@@ -226,6 +226,14 @@ type handoffEngine struct {
 	// CompletionCommand identifies this runner's executable for helper-mode
 	// receipts. It is injectable for tests; Run resolves it from os.Executable.
 	CompletionCommand string
+	// RunStatePath persists durable boundaries for this run. ResumeHandoffPath
+	// restores only boundaries that are proven safe to continue without replay.
+	RunStatePath, ResumeHandoffPath string
+	// ResumeRelayAction is required for the deliberately ambiguous boundary
+	// after paste/Enter begins but before submission is recorded as confirmed.
+	// It is either "observe" or "resend"; an empty value fails closed.
+	ResumeRelayAction         string
+	ResumeAllowConfigMismatch bool
 }
 
 func (e handoffEngine) newPromptHeadNonce() (string, error) {
@@ -240,6 +248,25 @@ func (e handoffEngine) newPromptHeadNonce() (string, error) {
 }
 
 func (e handoffEngine) Run(ctx context.Context) (runErr error) {
+	if e.RunStatePath != "" && e.ResumeHandoffPath != "" {
+		return fmt.Errorf("--run-state and --resume-handoff are mutually exclusive")
+	}
+	journalPath := e.RunStatePath
+	if journalPath == "" {
+		journalPath = e.ResumeHandoffPath
+	}
+	journal, err := newHandoffJournal(journalPath)
+	if err != nil {
+		return err
+	}
+	var resume *handoffRunState
+	if e.ResumeHandoffPath != "" {
+		state, err := loadHandoffRunState(e.ResumeHandoffPath)
+		if err != nil {
+			return fmt.Errorf("load handoff run state: %w", err)
+		}
+		resume = &state
+	}
 	current, ok := e.Members[e.StartID]
 	if !ok {
 		return fmt.Errorf("unknown initial handoff member %q", e.StartID)
@@ -260,13 +287,42 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	if e.Summarize && e.Transport.Transport == handoffTransportFile {
 		return fmt.Errorf("--summarize is only supported with text handoff transport")
 	}
+	if journal != nil && e.Transport.Transport != handoffTransportFile {
+		return fmt.Errorf("durable handoff journal requires --handoff-transport=file")
+	}
 	compactor := newCompactor(e.Compaction, e.Guard)
+	if resume != nil {
+		configDigest, err := e.journalConfigDigest()
+		if err != nil {
+			return fmt.Errorf("digest resume configuration: %w", err)
+		}
+		if configDigest != resume.ConfigSHA256 && !e.ResumeAllowConfigMismatch {
+			return fmt.Errorf("handoff resume configuration differs from saved state; use --resume-allow-config-mismatch only after reviewing member targets and preset changes")
+		}
+		if err := restoreGuard(e.Guard, resume.Guard); err != nil {
+			return fmt.Errorf("restore handoff guard: %w", err)
+		}
+		if err := restoreCompactor(compactor, resume.Compaction); err != nil {
+			return fmt.Errorf("restore compaction state: %w", err)
+		}
+	}
 	var store artifact.Store
 	if e.Transport.Transport == handoffTransportFile {
-		var err error
-		store, err = artifact.New(e.Transport.Root, e.Transport.Keep, e.Transport.Limits)
-		if err != nil {
-			return err
+		var storeErr error
+		if resume != nil {
+			if resume.ArtifactRoot == "" {
+				return fmt.Errorf("resume state has no artifact root")
+			}
+			store, storeErr = artifact.Open(resume.ArtifactRoot, true, e.Transport.Limits)
+		} else {
+			store, storeErr = artifact.New(e.Transport.Root, e.Transport.Keep || journal != nil, e.Transport.Limits)
+		}
+		if storeErr != nil {
+			return storeErr
+		}
+		if resume != nil && resume.ArtifactManifestSHA256 != artifactManifestDigest(store) {
+			_ = store.Close()
+			return fmt.Errorf("resume artifact manifest digest differs from saved state")
 		}
 		defer func() {
 			if err := store.Close(); err != nil {
@@ -291,7 +347,7 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 			_ = os.RemoveAll(streamRoot)
 		}
 	}()
-	if ppNewSession {
+	if ppNewSession && resume == nil {
 		if ppDryRun {
 			for _, member := range e.ResetBeforeStart {
 				fmt.Printf("🔎 Dry run: would send /new to %s\n", member.Label)
@@ -306,109 +362,260 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 	}
 	token := strconv.FormatInt(time.Now().UnixNano(), 36)
 	incoming := []artifact.Ref(nil)
-	protocol, err := e.protocolFor(store, current, token, 1)
-	if err != nil {
-		return err
+	var protocol roundControlProtocol
+	var currentPrompt string
+	var currentEcho string
+	var submit submitResult
+	roundStart := 1
+	var committedResult *turnResult
+	resumeRelay := false
+	if resume != nil {
+		current, ok = e.Members[resume.CurrentID]
+		if !ok {
+			return fmt.Errorf("resume state references unknown member %q", resume.CurrentID)
+		}
+		baseline, err = e.Executor.CapturePaneClean(current.Target, ppLines)
+		if err != nil {
+			return fmt.Errorf("capture resumed member %s: %w", current.Label, err)
+		}
+		token, protocol, roundStart = resume.RunToken, resume.Protocol, resume.Round
+		if store != nil && len(resume.IncomingIDs) > 0 {
+			incoming, err = store.Resolve(resume.IncomingIDs)
+			if err != nil {
+				return fmt.Errorf("resolve resumed incoming artifacts: %w", err)
+			}
+			if err := store.Verify(incoming); err != nil {
+				return fmt.Errorf("verify resumed incoming artifacts: %w", err)
+			}
+		}
+		switch resume.Phase {
+		case journalAwaitingMember, journalRelaySubmitConfirmed:
+			currentPrompt, currentEcho = resume.Message, protocol.EchoMarker
+			fmt.Printf("♻️ Resumed round %d while waiting for %s; prompt will not be resent\n", roundStart, handoffMemberDisplayName(current))
+		case journalSourceCommitted:
+			if protocol.Transport == handoffTransportFile {
+				receipt, receiptErr := readFileReceipt(protocol)
+				if receiptErr != nil {
+					return fmt.Errorf("revalidate committed source receipt: %w", receiptErr)
+				}
+				if receiptErr := validatePromptDelivery(receipt, protocol, current.Label); receiptErr != nil {
+					return fmt.Errorf("revalidate committed source receipt: %w", receiptErr)
+				}
+				if digestStatus(receipt) != resume.Source.StatusSHA256 {
+					return fmt.Errorf("committed source receipt differs from saved state")
+				}
+			}
+			result, err := resume.Source.restore(store, protocol.Transport)
+			if err != nil {
+				return err
+			}
+			if resume.Source.MemberID != current.ID {
+				return fmt.Errorf("committed source member %q does not match current member %q", resume.Source.MemberID, current.ID)
+			}
+			committedResult = &result
+			fmt.Printf("♻️ Resumed committed source round %d from %s; source will not be rerun\n", roundStart, handoffMemberDisplayName(current))
+		case journalRelayPrepared:
+			resumeRelay = true
+			fmt.Printf("♻️ Resuming prepared relay for round %d to %s\n", roundStart, handoffMemberDisplayName(current))
+		case journalRelaySubmitStarted:
+			action := strings.ToLower(strings.TrimSpace(e.ResumeRelayAction))
+			if action == "observe" {
+				screen, captureErr := e.Executor.CapturePaneClean(current.Target, ppLines)
+				if captureErr != nil {
+					return fmt.Errorf("observe ambiguous relay target %s: %w", current.Target, captureErr)
+				}
+				fmt.Printf("⚠️ Ambiguous relay to %s; message sha256=%s; head marker=%s\n%s\n", current.Target, resume.MessageSHA256, protocol.HeadMarker, screen)
+				return fmt.Errorf("ambiguous relay observed; rerun with --resume-relay-action=resend only if the target did not receive it")
+			}
+			if action != "resend" {
+				return fmt.Errorf("handoff relay submission is ambiguous for %s (message sha256=%s, head marker=%s); use --resume-relay-action=observe or --resume-relay-action=resend", current.Target, resume.MessageSHA256, protocol.HeadMarker)
+			}
+			resumeRelay = true
+			fmt.Printf("⚠️ Operator explicitly chose to resend ambiguous relay to %s\n", handoffMemberDisplayName(current))
+		case journalCompleted:
+			return fmt.Errorf("handoff run is already complete; it cannot be resumed")
+		default:
+			return fmt.Errorf("unsupported resume phase %s", resume.Phase)
+		}
+	} else {
+		protocol, err = e.protocolFor(store, current, token, 1)
+		if err != nil {
+			return err
+		}
+		initial, initialMetrics, err := buildMemberTurnMessage(current, e.InitialInstruction, outboundRelay{}, protocol)
+		if err != nil {
+			return err
+		}
+		fingerprint := e.InitialFingerprint
+		if fingerprint == "" {
+			fingerprint = e.InitialInstruction
+		}
+		if err := e.Guard.reserveOutbound("initial prompt", current.Target, e.InitialInstruction, initial, fingerprint); err != nil {
+			return err
+		}
+		if verbose {
+			fmt.Printf("📏 Outbound initial prompt metrics: %s\n", initialMetrics)
+		}
+		if ppDryRun {
+			fmt.Printf("🔎 Dry run: would send %d bytes to %s\n%s\n", len([]byte(initial)), current.Label, truncate(initial, 1000))
+			return nil
+		}
+		state, stateErr := e.journalState(journalRelaySubmitStarted, token, store, compactor, 1, current, handoffMember{}, protocol, nil, nil, initial)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(state); err != nil {
+			return err
+		}
+		submit, err = sendToPane(ctx, e.Executor, current.Target, initial, protocol.EchoMarker)
+		if err != nil {
+			return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
+		}
+		compactor.recordPrompt(current, initial)
+		currentPrompt, currentEcho = initial, protocol.EchoMarker
+		state, stateErr = e.journalState(journalRelaySubmitConfirmed, token, store, compactor, 1, current, handoffMember{}, protocol, nil, nil, initial)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(state); err != nil {
+			return err
+		}
+		state.Phase = journalAwaitingMember
+		if err := journal.save(state); err != nil {
+			return err
+		}
+		fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
 	}
-	initial, initialMetrics, err := buildMemberTurnMessage(current, e.InitialInstruction, outboundRelay{}, protocol)
-	if err != nil {
-		return err
+	if resumeRelay {
+		if resume.Message == "" {
+			return fmt.Errorf("prepared relay has no message")
+		}
+		baseline, err = e.Executor.CapturePaneClean(current.Target, ppLines)
+		if err != nil {
+			return fmt.Errorf("capture resumed relay target %s: %w", current.Label, err)
+		}
+		state, stateErr := e.journalState(journalRelaySubmitStarted, token, store, compactor, roundStart, current, current, protocol, incoming, nil, resume.Message)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(state); err != nil {
+			return err
+		}
+		submit, err = sendToPane(ctx, e.Executor, current.Target, resume.Message, protocol.EchoMarker)
+		if err != nil {
+			return fmt.Errorf("resume relay to %s: %w", current.Label, err)
+		}
+		currentPrompt, currentEcho = resume.Message, protocol.EchoMarker
+		compactor.recordPrompt(current, resume.Message)
+		state, stateErr = e.journalState(journalRelaySubmitConfirmed, token, store, compactor, roundStart, current, handoffMember{}, protocol, incoming, nil, resume.Message)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(state); err != nil {
+			return err
+		}
+		state.Phase = journalAwaitingMember
+		if err := journal.save(state); err != nil {
+			return err
+		}
 	}
-	fingerprint := e.InitialFingerprint
-	if fingerprint == "" {
-		fingerprint = e.InitialInstruction
-	}
-	if err := e.Guard.reserveOutbound("initial prompt", current.Target, e.InitialInstruction, initial, fingerprint); err != nil {
-		return err
-	}
-	if verbose {
-		fmt.Printf("📏 Outbound initial prompt metrics: %s\n", initialMetrics)
-	}
-	if ppDryRun {
-		fmt.Printf("🔎 Dry run: would send %d bytes to %s\n%s\n", len([]byte(initial)), current.Label, truncate(initial, 1000))
-		return nil
-	}
-	submit, err := sendToPane(ctx, e.Executor, current.Target, initial, protocol.EchoMarker)
-	if err != nil {
-		return fmt.Errorf("send initial instruction to %s: %w", current.Label, err)
-	}
-	compactor.recordPrompt(current, initial)
-	currentPrompt, currentEcho := initial, protocol.EchoMarker
-	fmt.Printf("📨 已將初始任務送給 %s (%s)\n", handoffMemberDisplayName(current), current.Target)
-	for round := 1; round <= ppMaxRounds; round++ {
+	for round := roundStart; round <= ppMaxRounds; round++ {
 		promptResends := 0
 	roundRetry:
 		fmt.Printf("━━━ Round %d: 等待 %s (%s) ━━━\n", round, handoffMemberDisplayName(current), current.Target)
-		var staticScreenRecovery *screenReceiptRecovery
-		output, stopped, screenSelected, err := waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(protocol, &staticScreenRecovery), streams[current.Target], submit, e.ManualRoundPrompt)
+		var output string
+		var stopped, screenSelected bool
 		var result turnResult
-		if err != nil {
-			if errors.Is(err, errReceiptRepairRequired) {
-				result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
-				if err == nil && protocol.GoalMode {
-					err = clearGoalAfterReceiptRepair(ctx, e.Executor, current)
-				}
-			}
+		if committedResult != nil && round == roundStart {
+			result = *committedResult
+			stopped = resume.Source.Stopped
 		} else {
-			if stopped && !e.CoordinatorControlsStop {
-				return nil
-			}
-			if screenSelected {
-				if staticScreenRecovery != nil {
-					result, err = e.prepareStaticScreenLLMResult(ctx, current, protocol, incoming, store, *staticScreenRecovery)
-				} else {
-					result, err = e.prepareScreenSelectedTurnResult(current, output, protocol, incoming)
-				}
-			} else {
-				result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, "", false)
-			}
-			if err != nil && protocol.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
-				result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
-			}
-		}
-		if err != nil {
-			// Ctrl-C cancels the root context. Retrying or resending after that
-			// point cannot work, so do not present an interactive menu containing
-			// actions that are guaranteed to fail with context canceled.
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-		receiptRecovery:
-			for {
-				switch askRoundRetryActionWithSignal(ctx, err, llmReceiptRecoveryEligible(err, protocol), promptResends < maxPromptResendsPerRound, e.ManualRoundPrompt) {
-				case roundRetryWait:
-					goto roundRetry
-				case roundRetryResendPrompt:
-					baseline, submit, currentPrompt, currentEcho, err = e.resendRoundPrompt(ctx, current, protocol, baseline, currentPrompt, currentEcho)
-					if err == nil {
-						promptResends++
-						fmt.Printf("🔁 已重送第 %d 輪原始 prompt 給 %s（%d/%d）\n", round, handoffMemberDisplayName(current), promptResends, maxPromptResendsPerRound)
-						goto roundRetry
-					}
-					fmt.Fprintf(os.Stderr, "重送本輪 prompt 失敗：%v\n", err)
-					continue
-				case roundRetryLLMRecovery:
-					recoveryErr := err
-					result, err = e.recoverFileReceiptFromScreenWithLLM(ctx, current, protocol, incoming, store, recoveryErr)
-					// A static-screen recovery creates a non-terminal needs_followup
-					// result. Do not clear a goal in that case: the coordinator must
-					// review and route it like any other follow-up.
-					if err == nil && protocol.GoalMode && !isLongStaticScreenTimeout(recoveryErr) {
+			var staticScreenRecovery *screenReceiptRecovery
+			output, stopped, screenSelected, err = waitForCompletionWithFallback(ctx, e.Executor, current.Target, baseline, protocol, e.screenIdleCompletionFallback(protocol, &staticScreenRecovery), streams[current.Target], submit, e.ManualRoundPrompt)
+			if err != nil {
+				if errors.Is(err, errReceiptRepairRequired) {
+					result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
+					if err == nil && protocol.GoalMode {
 						err = clearGoalAfterReceiptRepair(ctx, e.Executor, current)
 					}
-					if err == nil {
-						break receiptRecovery
-					}
-					fmt.Fprintf(os.Stderr, "LLM receipt recovery 失敗：%v\n", err)
-					continue
-				case roundRetryCancelWorkflow:
-					if e.CancelWorkflow != nil {
-						e.CancelWorkflow()
-					}
-					return context.Canceled
-				default:
-					return err
 				}
+			} else {
+				if stopped && !e.CoordinatorControlsStop {
+					state, stateErr := e.journalState(journalCompleted, token, store, compactor, round, current, handoffMember{}, protocol, incoming, nil, currentPrompt)
+					if stateErr != nil {
+						return stateErr
+					}
+					if err := journal.save(state); err != nil {
+						return err
+					}
+					return nil
+				}
+				if screenSelected {
+					if staticScreenRecovery != nil {
+						result, err = e.prepareStaticScreenLLMResult(ctx, current, protocol, incoming, store, *staticScreenRecovery)
+					} else {
+						result, err = e.prepareScreenSelectedTurnResult(current, output, protocol, incoming)
+					}
+				} else {
+					result, err = e.prepareTurnResult(ctx, current, output, protocol, incoming, store, "", false)
+				}
+				if err != nil && protocol.Transport == handoffTransportFile && errors.Is(err, errMissingReceipt) {
+					result, err = e.repairMissingFileReceipt(ctx, current, protocol, incoming, store, err)
+				}
+			}
+			if err != nil {
+				// Ctrl-C cancels the root context. Retrying or resending after that
+				// point cannot work, so do not present an interactive menu containing
+				// actions that are guaranteed to fail with context canceled.
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+			receiptRecovery:
+				for {
+					switch askRoundRetryActionWithSignal(ctx, err, llmReceiptRecoveryEligible(err, protocol), promptResends < maxPromptResendsPerRound, e.ManualRoundPrompt) {
+					case roundRetryWait:
+						goto roundRetry
+					case roundRetryResendPrompt:
+						baseline, submit, currentPrompt, currentEcho, err = e.resendRoundPrompt(ctx, current, protocol, baseline, currentPrompt, currentEcho)
+						if err == nil {
+							promptResends++
+							fmt.Printf("🔁 已重送第 %d 輪原始 prompt 給 %s（%d/%d）\n", round, handoffMemberDisplayName(current), promptResends, maxPromptResendsPerRound)
+							goto roundRetry
+						}
+						fmt.Fprintf(os.Stderr, "重送本輪 prompt 失敗：%v\n", err)
+						continue
+					case roundRetryLLMRecovery:
+						recoveryErr := err
+						result, err = e.recoverFileReceiptFromScreenWithLLM(ctx, current, protocol, incoming, store, recoveryErr)
+						// A static-screen recovery creates a non-terminal needs_followup
+						// result. Do not clear a goal in that case: the coordinator must
+						// review and route it like any other follow-up.
+						if err == nil && protocol.GoalMode && !isLongStaticScreenTimeout(recoveryErr) {
+							err = clearGoalAfterReceiptRepair(ctx, e.Executor, current)
+						}
+						if err == nil {
+							break receiptRecovery
+						}
+						fmt.Fprintf(os.Stderr, "LLM receipt recovery 失敗：%v\n", err)
+						continue
+					case roundRetryCancelWorkflow:
+						if e.CancelWorkflow != nil {
+							e.CancelWorkflow()
+						}
+						return context.Canceled
+					default:
+						return err
+					}
+				}
+			}
+		}
+		if committedResult == nil || round != roundStart {
+			state, stateErr := e.journalState(journalSourceCommitted, token, store, compactor, round, current, handoffMember{}, protocol, incoming, journalSourceFromResult(current, stopped, result), currentPrompt)
+			if stateErr != nil {
+				return stateErr
+			}
+			if err := journal.save(state); err != nil {
+				return err
 			}
 		}
 		fmt.Printf("🧠 正在判斷 %s 的第 %d 輪結果與下一步\n", handoffMemberDisplayName(current), round)
@@ -445,6 +652,13 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 				reason = "Coordinator 判定工作已完成"
 			}
 			fmt.Printf("🏁 Workflow 已完成：%s\n", truncate(reason, 120))
+			state, stateErr := e.journalState(journalCompleted, token, store, compactor, round, current, handoffMember{}, protocol, incoming, nil, currentPrompt)
+			if stateErr != nil {
+				return stateErr
+			}
+			if err := journal.save(state); err != nil {
+				return err
+			}
 			return nil
 		}
 		if route.Confidence < ppMinCoordConfidence {
@@ -507,6 +721,13 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		if verbose {
 			fmt.Printf("📏 Outbound relay metrics: %s\n", metrics)
 		}
+		preparedState, stateErr := e.journalState(journalRelayPrepared, token, store, compactor, round+1, next, next, nextProtocol, relay.Artifacts, nil, message)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(preparedState); err != nil {
+			return err
+		}
 		// A failed relay is not a failed current round. At this point pane1 has
 		// already completed, its receipt was validated, and its outbox was
 		// snapshotted. Going back to roundRetry would consequently wait for (or
@@ -514,6 +735,13 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		// prepared relay as the unit of recovery instead.
 		pendingRelayRetries := 0
 	pendingRelayRetry:
+		submitState, stateErr := e.journalState(journalRelaySubmitStarted, token, store, compactor, round+1, next, next, nextProtocol, relay.Artifacts, nil, message)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(submitState); err != nil {
+			return err
+		}
 		nextSubmit, err := sendToPane(ctx, e.Executor, next.Target, message, nextProtocol.EchoMarker)
 		if err != nil {
 			if pendingRelayRetries >= maxPromptResendsPerRound || !askPendingRelayRetry(ctx, err, next, e.ManualRoundPrompt) {
@@ -532,8 +760,26 @@ func (e handoffEngine) Run(ctx context.Context) (runErr error) {
 		current, baseline, protocol, incoming, submit = next, nextBaseline, nextProtocol, relay.Artifacts, nextSubmit
 		currentPrompt, currentEcho = message, nextProtocol.EchoMarker
 		compactor.recordPrompt(current, message)
+		confirmedState, stateErr := e.journalState(journalRelaySubmitConfirmed, token, store, compactor, round+1, current, handoffMember{}, protocol, incoming, nil, message)
+		if stateErr != nil {
+			return stateErr
+		}
+		if err := journal.save(confirmedState); err != nil {
+			return err
+		}
+		confirmedState.Phase = journalAwaitingMember
+		if err := journal.save(confirmedState); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("⏹️ 已達最大輪數 %d，workflow 停止\n", ppMaxRounds)
+	state, stateErr := e.journalState(journalCompleted, token, store, compactor, ppMaxRounds, current, handoffMember{}, protocol, incoming, nil, currentPrompt)
+	if stateErr != nil {
+		return stateErr
+	}
+	if err := journal.save(state); err != nil {
+		return err
+	}
 	return nil
 }
 

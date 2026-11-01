@@ -1658,6 +1658,22 @@ text_handoff:
 
 CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。
 
+#### Durable handoff resume
+
+對於跨較長時間的 file handoff，可加上絕對路徑的 `--run-state`。runner 會以原子方式寫入 run token、member target／組態 digest、artifact manifest digest、已驗證 receipt/artifact、待交接訊息與 guard/compaction 計數；啟用 journal 時 artifact root 會保留，供 resume 重新驗證。
+
+```bash
+tmux-ai pingpong --preset presets/review-fix.yaml \
+  --run-state /absolute/path/review-fix.run.json
+
+tmux-ai pingpong --preset presets/review-fix.yaml \
+  --resume-handoff /absolute/path/review-fix.run.json
+```
+
+恢復時 runner 會拒絕 member target、transport、artifact manifest 或其他已保存組態不一致的狀態。只有在人工檢視後才可使用 `--resume-allow-config-mismatch` 覆寫組態比對；artifact hash/manifest 不符永遠會停止。已驗證完成的 source round 不會再次執行；已準備但尚未送出的 relay 會使用保存的原訊息送出；已確認送出的 relay 只回到等待完成。
+
+若程序可能在 paste/Enter 開始後、提交確認寫入前中斷，runner 不會自動重送。先用 `--resume-relay-action observe` 顯示 target 現況與保存的 message digest，再明確以 `--resume-relay-action resend` 選擇重送；後者可能造成 target 執行兩次，僅應在確認未送達時使用。
+
 Coordinator mode 會自動要求每輪輸出 `HANDOFF_STATUS` JSON（`success`、`needs_followup` 或 `blocked`）。這是 runner control protocol，不應寫進 role、initial 或 handoff prompt。file coordinator 只可選 runner artifact IDs；text coordinator 只看到 payload metadata，不會取得或改寫 payload 原文。
 
 file transport 另外會要求 agent 把同一份 receipt JSON 寫入該輪 outbox 的 `_handoff_receipt.json`。畫面上的 receipt 仍是預設來源；只有在它被終端換行或重繪破壞時，runner 才改讀這個檔案，並因此省下一次 receipt repair 往返。這個檔案屬於 control plane：runner 不會把它列為 artifact，也不會轉交下一位 member。text transport 不使用它——該模式本來就不假設 runner 與 agent 共享 filesystem。

@@ -277,6 +277,7 @@ func runCoordinate() error {
 		InitialInstruction: decision.Instruction, InitialFingerprint: initial,
 		ResetBeforeStart: resetMembers,
 		SelectResponses:  true, CoordinatorControlsStop: true, Transport: transport, Compaction: compaction, Route: router,
+		RunStatePath: ppRunStatePath, ResumeHandoffPath: ppResumeHandoffPath, ResumeRelayAction: ppResumeRelayAction, ResumeAllowConfigMismatch: ppResumeAllowConfigMismatch,
 	}.Run(ctx)
 }
 

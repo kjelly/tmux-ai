@@ -77,17 +77,21 @@ type resolvedHandoffConfig struct {
 }
 
 var (
-	ppHandoffTransport     string
-	ppArtifactRoot         string
-	ppKeepArtifacts        bool
-	ppMaxArtifactFiles     int
-	ppMaxArtifactFileBytes int64
-	ppMaxArtifactTurnBytes int64
-	ppMaxArtifactRunFiles  int
-	ppMaxArtifactRunBytes  int64
-	ppMaxTextHandoffBytes  int
-	ppMaxTextHandoffLines  int
-	ppCompletionMode       string
+	ppHandoffTransport          string
+	ppArtifactRoot              string
+	ppKeepArtifacts             bool
+	ppMaxArtifactFiles          int
+	ppMaxArtifactFileBytes      int64
+	ppMaxArtifactTurnBytes      int64
+	ppMaxArtifactRunFiles       int
+	ppMaxArtifactRunBytes       int64
+	ppMaxTextHandoffBytes       int
+	ppMaxTextHandoffLines       int
+	ppCompletionMode            string
+	ppRunStatePath              string
+	ppResumeHandoffPath         string
+	ppResumeRelayAction         string
+	ppResumeAllowConfigMismatch bool
 )
 
 func addHandoffFlags(command *cobra.Command) {
@@ -103,6 +107,10 @@ func addHandoffFlags(command *cobra.Command) {
 	flags.IntVar(&ppMaxTextHandoffBytes, "max-text-handoff-bytes", 32*1024, "Maximum UTF-8 bytes in a text handoff")
 	flags.IntVar(&ppMaxTextHandoffLines, "max-text-handoff-lines", 200, "Maximum lines in a text handoff")
 	flags.StringVar(&ppCompletionMode, "completion-mode", "", "File handoff completion mode: manual or helper (overrides preset)")
+	flags.StringVar(&ppRunStatePath, "run-state", "", "Absolute path for durable handoff run state")
+	flags.StringVar(&ppResumeHandoffPath, "resume-handoff", "", "Resume a handoff run from an absolute run-state path")
+	flags.StringVar(&ppResumeRelayAction, "resume-relay-action", "", "For an ambiguous resumed relay: observe or resend")
+	flags.BoolVar(&ppResumeAllowConfigMismatch, "resume-allow-config-mismatch", false, "Allow resume when the saved handoff configuration differs")
 	addCompactionFlags(flags)
 }
 
