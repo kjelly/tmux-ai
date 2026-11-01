@@ -1,6 +1,8 @@
 # Build artifacts
 /tmux-ai
 /bin/
+__pycache__/
+*.pyc
 
 # IDE / editor
 .vscode/
