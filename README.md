@@ -32,6 +32,7 @@
 - [Target 語法](#target-語法)
 - [tmux.conf 快捷鍵設定](#tmuxconf-快捷鍵設定)
 - [工作流程範例](#工作流程範例)
+- [開發與測試](#開發與測試)
 
 ---
 
@@ -1786,3 +1787,21 @@ compaction:
 `llm` 只擷取 pane 最底部的 `bottom_lines` 行，交給目前設定的本機 Ollama model 以嚴格 JSON 回傳 `compact`、`confidence` 與理由；畫面內容視為不可信，模型不能依其中指令行動。只有 `compact=true` 且信心達 `llm_min_confidence` 才會送出 `/compact`，解析錯誤、呼叫失敗、資訊不足或低信心一律略過。每次判定都計入 `--max-llm-calls`。
 
 `screen_regex` 是 UI 回報值，僅適合做提醒或 best-effort 門檻；不同 agent 版本、終端寬度與重繪都可能改變格式。`estimate` 僅計算 runner 已送出的 UTF-8 prompt 的約略 token 下限，需設定 `window_tokens`；它不知道 system prompt、工具輸出、歷史或 reasoning。`api_usage` 是 provider adapter 預留模式；一般 tmux interactive pane 尚無 usage feed 時會回報未知，threshold mode 不會因此自動 compact。
+
+## 開發與測試
+
+```bash
+# 單元測試（不需要 tmux server）
+go test ./...
+
+# 對真實 tmux server 與會重繪的 TUI 驗證 prompt 交付；需要 tmux 與 python3
+TMUXAI_LIVE_TMUX=1 go test ./cmd/ -run TestLiveDelivery
+```
+
+live tmux delivery 測試是 opt-in：它會建立真實 tmux session 與一個假的 agent TUI，
+約需一分鐘，用來確認「貼上後 prompt 確實出現」「按 Enter 後畫面確實變動」等假設在
+真實終端下成立。未設定 `TMUXAI_LIVE_TMUX=1` 時這些測試會直接 skip。
+
+不寫 Go 測試也能驗證交接：`examples/run-pingpong-smoke.sh` 會建立兩個 window 跑
+`examples/pingpong-demo-agent.py`，以真實的 pingpong 流程驗證兩個 agent 之間的
+prompt 交付與 receipt 交接。
