@@ -74,7 +74,7 @@ func init() {
 	watchCmd.Flags().BoolVar(&watchOnce, "once", true, "Stop after first match")
 	watchCmd.Flags().IntVar(&watchLines, "lines", 50, "Lines of pane content to capture for matching and context")
 	watchCmd.Flags().BoolVar(&watchAbsent, "absent", false, "Trigger when pattern is NOT found (wait for text to disappear)")
-	watchCmd.Flags().StringVar(&watchRange, "range", "", "Python slice applied before matching, e.g. [-5:] for last 5 lines. Without --pattern triggers on any change in the range.")
+	watchCmd.Flags().StringVar(&watchRange, "range", "", "Python slice applied before matching, e.g. [-5:] for last 5 lines. With an empty pattern argument, triggers on any change in the range.")
 }
 
 func runWatch(paneID, pattern, thenPane string, absent bool, rangeExpr string) error {

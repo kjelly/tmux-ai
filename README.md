@@ -392,7 +392,7 @@ tmux-ai watch <pane> <pattern> [flags]
 | `--pane` | 監控的 pane | `--then` 的目標 pane |
 | `--keys` | — | pattern 符合時送出的原始按鍵（`\n` 代表 Enter） |
 | `--absent` | — | 反轉觸發條件：等文字**消失**才觸發（預設等文字出現） |
-| `--range` | — | Python slice 語法，只看指定範圍的行（如 `[-5:]`）；省略 `--pattern` 時只要範圍內有**任何變化**就觸發 |
+| `--range` | — | Python slice 語法，只看指定範圍的行（如 `[-5:]`）；pattern 傳空字串時只要範圍內有**任何變化**就觸發 |
 | `--interval` | `2000` | 輪詢間隔（毫秒） |
 | `--once` | `true` | 符合一次後停止 |
 | `--lines` | `50` | 擷取的 pane 行數（建議設大於 range 最大需求） |
