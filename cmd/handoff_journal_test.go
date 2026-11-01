@@ -2,6 +2,9 @@ package cmd
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -175,5 +178,155 @@ func TestLoadHandoffRunStateRejectsMessageDigestMismatch(t *testing.T) {
 	}
 	if _, err := loadHandoffRunState(path); err == nil || !strings.Contains(err.Error(), "digest") {
 		t.Fatalf("load error = %v", err)
+	}
+}
+
+// runStateJSON builds a run-state document that loadHandoffRunState accepts,
+// so each case can break exactly one field.
+func runStateJSON(t *testing.T, mutate func(map[string]any)) string {
+	t.Helper()
+	state := map[string]any{
+		"version":        1,
+		"updated_at":     "2026-01-01T00:00:00Z",
+		"phase":          string(journalAwaitingMember),
+		"run_token":      "token",
+		"config_sha256":  "config",
+		"members":        []map[string]any{{"ID": "pane1", "Target": "%1", "Role": "", "GoalMode": false}},
+		"round":          1,
+		"current_id":     "pane1",
+		"protocol":       map[string]any{},
+		"message":        "hello",
+		"message_sha256": digestString("hello"),
+	}
+	if mutate != nil {
+		mutate(state)
+	}
+	data, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
+}
+
+func TestLoadHandoffRunStateRejectsInvalidState(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   string
+	}{
+		{"unknown phase", func(s map[string]any) { s["phase"] = "made_up_phase" }, "unknown handoff run-state phase"},
+		{"missing run token", func(s map[string]any) { delete(s, "run_token") }, "incomplete"},
+		{"missing members", func(s map[string]any) { delete(s, "members") }, "incomplete"},
+		{"zero round", func(s map[string]any) { s["round"] = 0 }, "incomplete"},
+		{"unknown field", func(s map[string]any) { s["unexpected"] = true }, "parse handoff run state"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "run-state.json")
+			if err := os.WriteFile(path, []byte(runStateJSON(t, tc.mutate)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadHandoffRunState(path); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("load error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadHandoffRunStateRejectsMultipleObjects(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "run-state.json")
+	if err := os.WriteFile(path, []byte(runStateJSON(t, nil)+" "+runStateJSON(t, nil)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadHandoffRunState(path); err == nil || !strings.Contains(err.Error(), "exactly one JSON object") {
+		t.Fatalf("load error = %v", err)
+	}
+}
+
+func TestNewHandoffJournalRequiresAbsolutePath(t *testing.T) {
+	if _, err := newHandoffJournal("relative/run-state.json"); err == nil {
+		t.Fatal("relative run-state path was accepted")
+	}
+	journal, err := newHandoffJournal(filepath.Join(t.TempDir(), "run-state.json"))
+	if err != nil || journal == nil {
+		t.Fatalf("newHandoffJournal() = %v, %v", journal, err)
+	}
+	disabled, err := newHandoffJournal("")
+	if err != nil || disabled != nil {
+		t.Fatalf("empty path must disable the journal: %v, %v", disabled, err)
+	}
+}
+
+func TestRestoreGuardRejectsCorruptState(t *testing.T) {
+	valid := hex.EncodeToString(make([]byte, sha256.Size))
+	cases := []struct {
+		name  string
+		state journalGuard
+	}{
+		{"negative total bytes", journalGuard{TotalBytes: -1}},
+		{"negative llm calls", journalGuard{LLMCalls: -1}},
+		{"negative same target count", journalGuard{SameTargetCount: -1}},
+		{"invalid handoff hash", journalGuard{HandoffCounts: map[string]int{"not-hex": 1}}},
+		{"short handoff hash", journalGuard{HandoffCounts: map[string]int{"abcd": 1}}},
+		{"non positive handoff count", journalGuard{HandoffCounts: map[string]int{valid: 0}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			guard := newHandoffGuard()
+			if err := restoreGuard(guard, tc.state); err == nil {
+				t.Fatalf("restoreGuard() accepted invalid state: %#v", tc.state)
+			}
+		})
+	}
+}
+
+func TestRestoreGuardRestoresCounters(t *testing.T) {
+	guard := newHandoffGuard()
+	state := journalGuard{
+		TotalBytes: 128, LLMCalls: 2, LastTarget: "%1", SameTargetCount: 1,
+		HandoffCounts: map[string]int{hex.EncodeToString(make([]byte, sha256.Size)): 3},
+	}
+	if err := restoreGuard(guard, state); err != nil {
+		t.Fatal(err)
+	}
+	if guard.totalBytes != 128 || guard.llmCalls != 2 || guard.lastTarget != "%1" || guard.sameTargetCount != 1 {
+		t.Fatalf("guard = %#v", guard)
+	}
+	if len(guard.handoffCounts) != 1 {
+		t.Fatalf("handoff counts = %#v", guard.handoffCounts)
+	}
+	for _, count := range guard.handoffCounts {
+		if count != 3 {
+			t.Fatalf("handoff count = %d", count)
+		}
+	}
+}
+
+func TestRestoreCompactorRejectsInvalidState(t *testing.T) {
+	cases := []struct {
+		name  string
+		state journalCompaction
+	}{
+		{"negative round", journalCompaction{LastRound: map[string]int{"pane1": -1}}},
+		{"empty member", journalCompaction{Estimated: map[string]int{"": 1}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			compactor := newCompactor(resolvedCompactionConfig{}, newHandoffGuard())
+			if err := restoreCompactor(compactor, tc.state); err == nil {
+				t.Fatalf("restoreCompactor() accepted invalid state: %#v", tc.state)
+			}
+		})
+	}
+}
+
+func TestRestoreCompactorRestoresState(t *testing.T) {
+	compactor := newCompactor(resolvedCompactionConfig{}, newHandoffGuard())
+	state := journalCompaction{LastRound: map[string]int{"pane1": 4}, Estimated: map[string]int{"pane1": 100}}
+	if err := restoreCompactor(compactor, state); err != nil {
+		t.Fatal(err)
+	}
+	if compactor.lastRound["pane1"] != 4 || compactor.estimated["pane1"] != 100 {
+		t.Fatalf("compactor = %#v", compactor)
 	}
 }
