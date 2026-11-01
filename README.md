@@ -28,6 +28,7 @@
   - [follow](#follow--即時串流-pane-輸出)
   - [pingpong](#pingpong--兩個-agent-交替執行)
   - [coordinate](#coordinate--多-window-角色路由)
+  - [handoff complete](#handoff-complete--原子提交-file-handoff-receipt)
 - [Target 語法](#target-語法)
 - [tmux.conf 快捷鍵設定](#tmuxconf-快捷鍵設定)
 - [工作流程範例](#工作流程範例)
@@ -1382,6 +1383,38 @@ members:
 若需從全新對話開始，可在任一模式加上 `--new`。runner 會依 preset 成員順序（pingpong 則 pane1、pane2）先向每個 participating pane 送出並提交 `/new`，再送出第一個任務；`--dry-run` 只顯示預計動作，不會送出 `/new`。在 YAML preset 也可設定 `new_session: true`，而命令列 `--new` 可明確啟用。
 
 `coordinate` 與 `pingpong` 共用同一個 handoff engine、coordinator prompt/JSON schema 與 action mapping，因此完成標記、兩階段 envelope 驗證、policy stop gate、response reselection、bytes/LLM call 限制、重複交接防護、送出確認及 Ctrl-C 取消行為一致。主要安全 flags 與 `pingpong` 相同；`--completion-settle-timeout` 也可由 coordinate preset 的 `completion_settle_ms` 設定。可先加 `--dry-run` 檢查第一個 coordinator 決策與實際 prompt，而不操作 tmux。
+
+---
+
+### `handoff complete` — 原子提交 file handoff receipt
+
+```
+tmux-ai handoff complete --task <path> --prompt-head <nonce> --outcome <outcome> [flags]
+```
+
+Agent 端的 handoff helper。runner 在每輪 outbox 寫出 `_handoff_task.json` task manifest，agent 依 manifest 提交 receipt：helper 驗證 prompt head 後原子寫出 `_handoff_receipt.json`，並在 stdout 印出 status frame（begin marker、receipt JSON、end marker）與 completion marker，讓 runner 直接採用而不必等待畫面 marker。`--prompt-head` 必須是本輪 prompt 最開頭 head 行最後一個空白後的 nonce，填 `missing` 或其他 nonce 都會被拒絕；`--completion stop` 只有在該輪 task manifest 允許 stop 時才可用。
+
+**Flags：**
+
+| Flag | 預設 | 說明 |
+|------|------|------|
+| `--task` | — | runner 提供的 `_handoff_task.json` 絕對路徑（必填） |
+| `--prompt-head` | — | prompt head 的 nonce（必填） |
+| `--outcome` | — | `success`、`needs_followup` 或 `blocked`（必填） |
+| `--summary` | — | 短單行摘要（不可與 `--summary-file` 同時使用） |
+| `--summary-file` | — | 由檔案讀取摘要 |
+| `--tests-file` | — | 含 receipt tests 的 JSON 檔 |
+| `--completion` | `done` | completion marker：`done` 或 `stop` |
+
+**範例：**
+
+```bash
+tmux-ai handoff complete \
+  --task /absolute/path/rounds/0001-reviewer/outbox/_handoff_task.json \
+  --prompt-head 'a1b2c3d4e5f6' \
+  --outcome success \
+  --summary '已修正競態並通過 go test ./...'
+```
 
 ---
 
