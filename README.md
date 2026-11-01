@@ -769,6 +769,11 @@ steps:
 | `examples/multi-agent-review.yaml` | 兩個 agent 平行 review → 彙整結論 |
 | `examples/deploy-pipeline.yaml` | Build → Test → Deploy，失敗時 rollback |
 | `examples/review-pr.yaml` | Clone GitHub PR repo → 在新視窗啟動 Claude Code review |
+| `examples/implement-and-review.yaml` | Implementer 依規格實作並驗證 → reviewer 依同一份規格檢查變更（file handoff，`--param spec_file=…`） |
+| `examples/review-and-fix.yaml` | Reviewer 先 review（可指定規格檔）→ 發現問題時交給 fixer window 修正 |
+| `examples/pingpong-qwen35-4b-smoke.yaml` | Pingpong smoke test preset：planner/reviewer 快速往返，驗證交接與 coordinator 路由 |
+| `examples/pingpong-demo-agent.py` | Smoke test 用的極簡 deterministic agent（planner / reviewer），不需 Codex 或 Claude |
+| `examples/run-pingpong-smoke.sh` | Smoke test wrapper：建立兩個 window 跑 demo agent 並執行 pingpong |
 
 ---
 
