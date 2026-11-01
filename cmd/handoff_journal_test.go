@@ -48,6 +48,32 @@ func writeJournalState(t *testing.T, engine handoffEngine, statePath string, pha
 	}
 }
 
+// writeJournalStateWith saves a run state and lets the caller break one
+// recorded field before it reaches the disk.
+func writeJournalStateWith(t *testing.T, engine handoffEngine, statePath string, phase handoffJournalPhase, protocol roundControlProtocol, message string, mutate func(*handoffRunState)) {
+	t.Helper()
+	store, err := artifact.New(engine.Transport.Root, true, engine.Transport.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	compactor := newCompactor(engine.Compaction, engine.Guard)
+	state, err := engine.journalState(phase, "resume-token", store, compactor, 1, engine.Members["pane1"], engine.Members["pane1"], protocol, nil, nil, message)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mutate != nil {
+		mutate(&state)
+	}
+	journal, err := newHandoffJournal(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.save(state); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestHandoffJournalResumePreparedRelaySendsWithoutSourceReplay(t *testing.T) {
 	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
 	ex := tmux.NewFakeExecutor()
@@ -144,6 +170,107 @@ func TestHandoffJournalAmbiguousRelayResendSendsSavedMessage(t *testing.T) {
 	}
 	if len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != message {
 		t.Fatalf("resumed sends = %#v", ex.SendLinesCalls)
+	}
+}
+
+func TestHandoffResumeRejectsConflictingFlags(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "run-state.json")
+	engine := journalResumeEngine(t, t.TempDir(), statePath, tmux.NewFakeExecutor(), func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	engine.RunStatePath = statePath
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("resume error = %v", err)
+	}
+}
+
+func TestHandoffJournalRequiresFileTransport(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "run-state.json")
+	engine := journalResumeEngine(t, t.TempDir(), statePath, tmux.NewFakeExecutor(), func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	engine.Transport.Transport = handoffTransportText
+	engine.ResumeHandoffPath = ""
+	engine.RunStatePath = statePath
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "requires --handoff-transport=file") {
+		t.Fatalf("resume error = %v", err)
+	}
+}
+
+func TestHandoffJournalRejectsCompletedRun(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	writeJournalState(t, engine, statePath, journalCompleted, protocol, nil, "done")
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "already complete") {
+		t.Fatalf("resume error = %v", err)
+	}
+	if len(ex.SendLinesCalls) != 0 {
+		t.Fatalf("completed run sent a prompt: %#v", ex.SendLinesCalls)
+	}
+}
+
+func TestHandoffJournalRejectsUnknownMember(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	writeJournalStateWith(t, engine, statePath, journalAwaitingMember, protocol, "message", func(state *handoffRunState) {
+		state.CurrentID = "pane9"
+	})
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unknown member") {
+		t.Fatalf("resume error = %v", err)
+	}
+}
+
+func TestHandoffJournalRejectsMissingArtifactRoot(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	writeJournalStateWith(t, engine, statePath, journalAwaitingMember, protocol, "message", func(state *handoffRunState) {
+		state.ArtifactRoot = ""
+	})
+	err := engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "no artifact root") {
+		t.Fatalf("resume error = %v", err)
+	}
+}
+
+func TestHandoffJournalRejectsChangedArtifactManifest(t *testing.T) {
+	root, statePath := t.TempDir(), filepath.Join(t.TempDir(), "run-state.json")
+	ex := tmux.NewFakeExecutor()
+	protocol := newRoundControlProtocol(handoffTransportFile, "resume-token", 1, filepath.Join(root, "rounds", "0001-pane1", "outbox"), true)
+	engine := journalResumeEngine(t, root, statePath, ex, func(context.Context, int, handoffMember, turnResult, bool) (handoffRoute, error) {
+		return handoffRoute{Stop: true}, nil
+	})
+	writeJournalState(t, engine, statePath, journalAwaitingMember, protocol, nil, "message")
+	manifestPath := filepath.Join(root, "manifest.json")
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := strings.Replace(string(data), `"run_id": "`, `"run_id": "tampered-`, 1)
+	if tampered == string(data) {
+		t.Fatalf("manifest was not rewritten: %s", data)
+	}
+	if err := os.WriteFile(manifestPath, []byte(tampered), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = engine.Run(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "manifest digest differs") {
+		t.Fatalf("resume error = %v", err)
 	}
 }
 
