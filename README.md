@@ -1660,7 +1660,7 @@ CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--
 
 #### Durable handoff resume
 
-對於跨較長時間的 file handoff，可加上絕對路徑的 `--run-state`。runner 會以原子方式寫入 run token、member target／組態 digest、artifact manifest digest、已驗證 receipt/artifact、待交接訊息與 guard/compaction 計數；啟用 journal 時 artifact root 會保留，供 resume 重新驗證。
+對於跨較長時間的 file handoff，可加上絕對路徑的 `--run-state`。runner 會以原子方式寫入 run token、member target／組態 digest、artifact manifest digest、已驗證 receipt/artifact、待交接訊息與 guard/compaction 計數；啟用 journal 時 artifact root 會保留，供 resume 重新驗證。journal 只適用 file transport（`--handoff-transport file`），text transport 搭配 journal 會直接停止；`--run-state` 與 `--resume-handoff` 互斥，一次執行只能擇一。
 
 ```bash
 tmux-ai pingpong --preset presets/review-fix.yaml \
