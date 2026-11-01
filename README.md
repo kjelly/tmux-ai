@@ -1749,6 +1749,16 @@ text_handoff:
 
 CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。`--completion-mode` 也優先於 preset 的 `completion_mode`，只接受 `manual`（預設）或 `helper`；`helper` 需要 file transport，text transport 搭配 `helper` 會直接停止。
 
+Artifact limit flags 覆寫 preset 的 `artifacts` 上限，並在超過限制時停止而非截斷：
+
+| Flag | 預設 | 說明 |
+|------|------|------|
+| `--max-artifact-files-per-turn` | `8` | 每輪最多封存的 artifact 檔案數 |
+| `--max-artifact-file-bytes` | `1048576` | 單一 artifact 的 byte 上限 |
+| `--max-artifact-turn-bytes` | `4194304` | 單輪所有 artifact 的 byte 上限 |
+| `--max-artifact-run-files` | `64` | 整個 run 最多封存的 artifact 檔案數 |
+| `--max-artifact-run-bytes` | `33554432` | 整個 run 所有 artifact 的 byte 上限 |
+
 #### Durable handoff resume
 
 對於跨較長時間的 file handoff，可加上絕對路徑的 `--run-state`。runner 會以原子方式寫入 run token、member target／組態 digest、artifact manifest digest、已驗證 receipt/artifact、待交接訊息與 guard/compaction 計數；啟用 journal 時 artifact root 會保留，供 resume 重新驗證。journal 只適用 file transport（`--handoff-transport file`），text transport 搭配 journal 會直接停止；`--run-state` 與 `--resume-handoff` 互斥，一次執行只能擇一。
@@ -1789,6 +1799,8 @@ compaction:
 `llm` 只擷取 pane 最底部的 `bottom_lines` 行，交給目前設定的本機 Ollama model 以嚴格 JSON 回傳 `compact`、`confidence` 與理由；畫面內容視為不可信，模型不能依其中指令行動。只有 `compact=true` 且信心達 `llm_min_confidence` 才會送出 `/compact`，解析錯誤、呼叫失敗、資訊不足或低信心一律略過。每次判定都計入 `--max-llm-calls`。
 
 `screen_regex` 是 UI 回報值，僅適合做提醒或 best-effort 門檻；不同 agent 版本、終端寬度與重繪都可能改變格式。`estimate` 僅計算 runner 已送出的 UTF-8 prompt 的約略 token 下限，需設定 `window_tokens`；它不知道 system prompt、工具輸出、歷史或 reasoning。`api_usage` 是 provider adapter 預留模式；一般 tmux interactive pane 尚無 usage feed 時會回報未知，threshold mode 不會因此自動 compact。
+
+`context_meter.pattern` 與 `window_tokens` 也可由命令列覆寫：`--context-meter-pattern`（供 `screen_regex` 使用，需有百分比或 used/total 擷取）與 `--context-window-tokens`（供 `estimate` 使用）。
 
 ## 開發與測試
 
