@@ -1656,7 +1656,7 @@ text_handoff:
   max_payload_lines: 200
 ```
 
-CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。
+CLI 的 `--handoff-transport` 優先於 preset，未設定時使用 `text`。`--artifact-root`、`--keep-artifacts` 與 artifact limit flags 只能搭配 file transport；text limit flags 只能搭配 text transport。沒有 backend fallback：不合法 frame、artifact、hash 或 coordinator decision 都會在送出下一輪前停止。`--completion-mode` 也優先於 preset 的 `completion_mode`，只接受 `manual`（預設）或 `helper`；`helper` 需要 file transport，text transport 搭配 `helper` 會直接停止。
 
 #### Durable handoff resume
 
