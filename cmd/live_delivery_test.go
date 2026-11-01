@@ -81,7 +81,11 @@ func livePane(t *testing.T, mode string) (tmux.Executor, string) {
 		t.Fatalf("write fake agent: %v", err)
 	}
 	session := "tmuxai-live-" + mode + "-" + strings.ReplaceAll(t.Name(), "/", "-")
-	ex := tmux.NewExecutorWithOptions(tmux.Options{PasteChunkRunes: 500, PasteChunkDelay: 0})
+	// The fake TUI consumes its raw PTY input on a 200ms repaint cadence. A
+	// tiny inter-chunk delay keeps this stress test focused on tmux buffer
+	// isolation instead of overflowing that deliberately simple stand-in's
+	// input queue; the two panes still paste concurrently.
+	ex := tmux.NewExecutorWithOptions(tmux.Options{PasteChunkRunes: 500, PasteChunkDelay: 5 * time.Millisecond})
 	_, _ = ex.Exec("kill-session", "-t", session)
 	if _, err := ex.Exec("new-session", "-d", "-s", session, "-x", "80", "-y", "12", "python3 "+script+" "+mode); err != nil {
 		t.Fatalf("new-session: %v", err)
