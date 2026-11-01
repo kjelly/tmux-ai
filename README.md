@@ -32,6 +32,8 @@
 - [Target 語法](#target-語法)
 - [tmux.conf 快捷鍵設定](#tmuxconf-快捷鍵設定)
 - [工作流程範例](#工作流程範例)
+- [Agent 工具清單](#agent-工具清單)
+- [Handoff transport](#handoff-transport)
 - [開發與測試](#開發與測試)
 
 ---
