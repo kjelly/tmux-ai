@@ -330,3 +330,79 @@ func TestRestoreCompactorRestoresState(t *testing.T) {
 		t.Fatalf("compactor = %#v", compactor)
 	}
 }
+
+func TestJournalSourceRestoreRejectsTamperedState(t *testing.T) {
+	status := &handoffStatus{Version: 1, Outcome: "success", Summary: "done"}
+	source := journalSource{MemberID: "pane1", Narrative: "done", Status: status, StatusSHA256: digestStatus(status)}
+	if _, err := source.restore(nil, handoffTransportText); err != nil {
+		t.Fatalf("restore() error = %v", err)
+	}
+	tampered := source
+	tampered.StatusSHA256 = "deadbeef"
+	if _, err := tampered.restore(nil, handoffTransportText); err == nil || !strings.Contains(err.Error(), "incomplete") {
+		t.Fatalf("restore() error = %v", err)
+	}
+}
+
+func TestJournalSourceRestoreRequiresFileTransportForArtifacts(t *testing.T) {
+	status := &handoffStatus{Version: 1, Outcome: "success", Summary: "done"}
+	source := journalSource{MemberID: "pane1", Status: status, StatusSHA256: digestStatus(status), ProducedIDs: []string{"a-r0001-01-abcdefgh"}}
+	if _, err := source.restore(nil, handoffTransportText); err == nil || !strings.Contains(err.Error(), "require file transport") {
+		t.Fatalf("restore() error = %v", err)
+	}
+}
+
+func TestJournalConfigDigestDetectsConfigurationChanges(t *testing.T) {
+	engine := handoffEngine{
+		StartID: "pane1", InitialFingerprint: "do work",
+		Transport: resolvedHandoffConfig{Transport: handoffTransportFile},
+		Members:   map[string]handoffMember{"pane1": {ID: "pane1", Target: "%1"}},
+	}
+	base, err := engine.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := engine.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base != same {
+		t.Fatalf("digest is not stable: %q != %q", base, same)
+	}
+	moved := engine
+	moved.Members = map[string]handoffMember{"pane1": {ID: "pane1", Target: "%2"}}
+	movedDigest, err := moved.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if movedDigest == base {
+		t.Fatal("member target change did not change the configuration digest")
+	}
+	otherStart := engine
+	otherStart.StartID = "pane2"
+	otherStartDigest, err := otherStart.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherStartDigest == base {
+		t.Fatal("start member change did not change the configuration digest")
+	}
+	otherTransport := engine
+	otherTransport.Transport = resolvedHandoffConfig{Transport: handoffTransportText}
+	transportDigest, err := otherTransport.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transportDigest == base {
+		t.Fatal("transport change did not change the configuration digest")
+	}
+	otherCompaction := engine
+	otherCompaction.Compaction.Meter.WindowTokens = 8192
+	compactionDigest, err := otherCompaction.journalConfigDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compactionDigest == base {
+		t.Fatal("compaction change did not change the configuration digest")
+	}
+}
