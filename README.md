@@ -1290,6 +1290,30 @@ tmux-ai pingpong \
 從原始畫面挑選已完成回覆。selector 無法可靠確認完成時不會交接；即使 fallback
 成功，runner 也一律標為 `needs_followup`，不能直接觸發 stop。
 
+#### state-machine review/fix presets
+
+`presets/review-fix.yaml` 與 `presets/implement-review-fix.yaml` 是兩個不呼叫
+coordinator 的 state-machine preset：皆使用 file handoff 與
+`completion_mode: helper`（agent 以 runner 提供的執行檔路徑提交 receipt），
+並用 `routing.transitions` 直接決定下一個 member，coordinator LLM calls 為 0。
+
+- `presets/review-fix.yaml`：pane1 是唯讀 reviewer，pane2 是 fixer。初始工作交給
+  pane1；pane1 回報 `needs_followup` 才交給 pane2 修正，修正後一律交回 pane1 複查，
+  只有 pane1（`stop_members`）能核准完成。
+- `presets/implement-review-fix.yaml`：pane1 是 implementer/fixer，pane2 是唯讀
+  reviewer。初始工作交給 pane1 實作，之後交給 pane2 review；pane2 回報
+  `needs_followup` 才交回 pane1 修正，只有 pane2（`stop_members`）能核准完成。
+
+兩個 preset 都以 receipt 判定完成：`review-fix.yaml` 的 `round_timeout` 為 `0`，
+不設 wall-clock 上限，只由已驗證的 receipt/marker 決定是否完成。
+
+```bash
+tmux-ai pingpong \
+  --preset ./presets/review-fix.yaml \
+  --pane1 %1 \
+  --pane2 %2
+```
+
 #### 範例
 
 ```bash
