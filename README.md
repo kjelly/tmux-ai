@@ -563,12 +563,26 @@ tmux-ai workflow validate <file.yaml>
 | type | 說明 |
 |------|------|
 | `run` | Agent 執行自然語言指令（預設） |
+| `send` | 直接把指令送進已在執行的 agent pane（不經 LLM planner） |
 | `watch` | 輪詢 pane 直到 pattern 出現，output 是捕獲內容 |
 | `shell` | 直接執行 bash 指令（不經 LLM） |
 | `launch` | 開新視窗、啟動程式、等待就緒、送入指令（不經 LLM） |
 | `wait` | 等待到自然語言指定的時間點（不經 LLM） |
 | `relay` | 擷取 from pane → agent 在 to pane 操作 |
 | `broadcast` | 同一指令平行發給多個 pane |
+
+`run` 會先請 LLM planner 決定是否以及如何送出指令；`send` 則把 `instruction` 直接貼進
+已在執行中的 agent pane，不呼叫 planner，送出後等待畫面輸出穩定再擷取為 step output。
+啟用 artifact handoff 時，`send` step 會得到自己的 outbox，agent 必須把 handoff 檔案寫在
+該 outbox 內：
+
+```yaml
+- name: ask-existing-agent
+  type: send
+  pane: "{{params.reviewer_pane}}"
+  instruction: >-
+    依照 {{steps.implement.output}} 的內容檢查最新變更，並把結論寫成本輪 handoff 檔案。
+```
 
 **Template 語法：**
 
