@@ -1249,6 +1249,18 @@ tmux-ai pingpong \
 
 收到 Ctrl-C 或 SIGTERM 時，pending handoff 會立即取消。若尚未貼上，tmux 不會收到任何文字；若正在貼上後的 submit delay，計時器會取消且不會再送 Enter，避免停止後才延遲提交 agent 任務。
 
+#### Pingpong preset 欄位
+
+`--preset` 的 YAML 可設定下列 pingpong 專屬欄位（handoff、artifact 與 compaction 欄位見 [Handoff transport](#handoff-transport)）：
+
+| 欄位 | 說明 |
+|------|------|
+| `pane1_role` / `pane2_role` | 該 pane 的角色描述，附加在每則送給它的訊息前；命令列 `--pane1-role` 已有值時不覆寫。 |
+| `pane1_goal_mode` / `pane2_goal_mode` | 只為該 pane 的一般任務加上 `/goal ` 前綴；命令列 `--pane1-goal-mode` 明確設定時優先。 |
+| `to_pane1_prompt` / `to_pane2_prompt` | relay 到該 pane 時附加的交接指令；命令列 `--to-pane1-prompt` 已有值時不覆寫。 |
+| `coordinator_timeout` | 每次 coordinator 決策的 timeout 秒數；`0` 或未設定時沿用命令列／預設值（60 秒）。 |
+| `submit_delay` | 貼上訊息後等待多少毫秒再送出 Enter；`0` 或未設定時沿用命令列／預設值（500 毫秒）。 |
+
 #### 訊息結構
 
 每次 relay 時，目標 pane 收到的完整訊息：
