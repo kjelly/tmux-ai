@@ -1,6 +1,7 @@
 package artifact
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -167,5 +168,90 @@ func TestStoreCollectIsIdempotentForAnUnchangedTurn(t *testing.T) {
 	}
 	if _, err := store.Collect("reviewer", 5, outbox, nil); err == nil || !strings.Contains(err.Error(), "changed after snapshot") {
 		t.Fatalf("mutated second collect error = %v, want snapshot mutation failure", err)
+	}
+}
+
+func TestOpenRejectsUnusableStore(t *testing.T) {
+	t.Run("empty root", func(t *testing.T) {
+		if _, err := Open("", true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "artifact root is required") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+	t.Run("invalid limits", func(t *testing.T) {
+		if _, err := Open(t.TempDir(), true, Limits{}); err == nil || !strings.Contains(err.Error(), "invalid artifact limits") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+	t.Run("missing manifest", func(t *testing.T) {
+		if _, err := Open(t.TempDir(), true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "read artifact manifest") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+	t.Run("invalid manifest json", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte("{"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(root, true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "parse artifact manifest") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+	t.Run("unsupported manifest version", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte(`{"version":2,"run_id":"abc"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(root, true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "invalid artifact manifest") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+	t.Run("missing run id", func(t *testing.T) {
+		root := t.TempDir()
+		if err := os.WriteFile(filepath.Join(root, "manifest.json"), []byte(`{"version":1,"run_id":""}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(root, true, DefaultLimits()); err == nil || !strings.Contains(err.Error(), "invalid artifact manifest") {
+			t.Fatalf("Open() error = %v", err)
+		}
+	})
+}
+
+func TestNewResolvesRelativeRootAndWritesManifest(t *testing.T) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(t.TempDir(), "artifact-root")
+	if err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(cwd, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filepath.IsAbs(relative) {
+		t.Skip("temporary directory is not addressable with a relative path")
+	}
+	store, err := New(relative, true, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if !filepath.IsAbs(store.Root()) {
+		t.Fatalf("store root %q is not absolute", store.Root())
+	}
+	if store.Root() != root {
+		t.Fatalf("store root = %q, want %q", store.Root(), root)
+	}
+	data, err := os.ReadFile(filepath.Join(store.Root(), "manifest.json"))
+	if err != nil {
+		t.Fatalf("read initial manifest: %v", err)
+	}
+	var manifest Manifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatalf("parse initial manifest: %v", err)
+	}
+	if manifest.Version != 1 || manifest.RunID == "" {
+		t.Fatalf("initial manifest = %#v", manifest)
 	}
 }
