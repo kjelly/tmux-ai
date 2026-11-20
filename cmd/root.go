@@ -22,6 +22,9 @@ var (
 
 const defaultModel = "gemma4:31b"
 
+// Commands with no LLM path must not advertise an unused endpoint/model.
+const noLLMAnnotation = "tmux-ai/no-llm"
+
 type userConfig struct {
 	Model         string `yaml:"model"`
 	Host          string `yaml:"host"`
@@ -98,7 +101,7 @@ func applyUserConfig(config userConfig, changed func(string) bool, getenv func(s
 	}
 }
 
-func loadAndApplyUserConfig(_ *cobra.Command, _ []string) error {
+func loadAndApplyUserConfig(cmd *cobra.Command, _ []string) error {
 	path, err := defaultConfigPath()
 	if err != nil {
 		return err
@@ -112,7 +115,9 @@ func loadAndApplyUserConfig(_ *cobra.Command, _ []string) error {
 		applyUserConfig(config, flags.Changed, os.Getenv)
 	}
 
-	fmt.Fprintf(os.Stderr, "🧠 LLM 設定：endpoint=%s/api/chat model=%s\n", ollamaHost, model)
+	if cmd.Annotations[noLLMAnnotation] != "true" {
+		fmt.Fprintf(cmd.ErrOrStderr(), "🧠 LLM 設定：endpoint=%s/api/chat model=%s\n", ollamaHost, model)
+	}
 	return nil
 }
 

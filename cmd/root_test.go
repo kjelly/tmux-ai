@@ -1,9 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func TestLoadUserConfig(t *testing.T) {
@@ -49,5 +53,46 @@ func TestApplyUserConfigRespectsFlagAndEnvironmentPrecedence(t *testing.T) {
 	})
 	if model != "flag-model" || ollamaHost != "http://env" {
 		t.Fatalf("flag/environment precedence was overwritten: model=%q host=%q", model, ollamaHost)
+	}
+}
+
+func TestPRLoopDoesNotAdvertiseUnusedLLMThroughRoot(t *testing.T) {
+	dir := fakePRGH(t)
+	t.Setenv("TMUXAI_TEST_PR_JSON", `{"number":333,"state":"OPEN","isDraft":false}`)
+	oldPath := configPath
+	configPath = filepath.Join(dir, "missing-config.yaml")
+	t.Cleanup(func() { configPath = oldPath })
+
+	root := &cobra.Command{Use: "tmux-ai", PersistentPreRunE: loadAndApplyUserConfig}
+	root.AddCommand(newPRLoopCommand())
+	root.SetArgs([]string{"pr-loop", "333", "--repo", "owner/repo", "--draft-pane", "1", "--ready-pane", "2", "--dry-run", "--stable-polls", "1"})
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(stdout.String()+stderr.String(), "LLM 設定") {
+		t.Fatalf("pr-loop advertised an unused LLM: stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "$pr-review-merge 333") {
+		t.Fatalf("native command decision was lost: %s", stdout.String())
+	}
+}
+
+func TestRootStillReportsLLMForUnmarkedCommands(t *testing.T) {
+	oldPath := configPath
+	configPath = filepath.Join(t.TempDir(), "missing-config.yaml")
+	t.Cleanup(func() { configPath = oldPath })
+	root := &cobra.Command{Use: "tmux-ai", PersistentPreRunE: loadAndApplyUserConfig}
+	root.AddCommand(&cobra.Command{Use: "llm-command", Run: func(*cobra.Command, []string) {}})
+	root.SetArgs([]string{"llm-command"})
+	var stderr bytes.Buffer
+	root.SetErr(&stderr)
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "LLM 設定：endpoint=") {
+		t.Fatalf("LLM configuration log was lost: %s", stderr.String())
 	}
 }

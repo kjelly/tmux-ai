@@ -1061,27 +1061,81 @@ tmux-ai follow %25 --from-start | tee build-$(date +%s).log
 
 ### `pr-loop` — 依 PR 狀態執行原生 Skill 指令
 
+要讓 runner 自動啟動 coding agent，可指定兩個角色的執行檔和各自的提示詞：
+
 ```bash
-tmux-ai pr-loop 333 --repo owner/repo \
-  --draft-pane my-project:1 \
-  --ready-pane my-project:2 \
+tmux-ai pr-loop 333 334 335 --repo owner/repo \
+  --draft-agent claude \
+  --ready-agent codex \
   --draft-command '/pr-ready {pr}' \
   --ready-command '$pr-review-merge {pr}'
 ```
 
-`pr-loop` 使用 GitHub CLI `gh` 查詢 PR，依三種狀態循環執行：
+此模式可從一般 shell 或 tmux 執行，需安裝 tmux、已登入的 GitHub CLI，以及指定的 agent。
+`--draft-agent` 和 `--ready-agent` 接受執行檔名稱或路徑，`--draft-command` 和
+`--ready-command` 接受送到 agent 輸入框的單行文字。runner 會將 `{pr}` 換成 PR 編號。
+需要傳啟動參數時，可指定自己的啟動腳本。
+
+runner 會建立一份專用 clone，先 checkout PR branch，再於新 tmux session 啟動該階段需要的
+agent。同一支 PR 可重用已啟動的 agent，換下一支 PR 時會啟動新程序和對話。runner 會印出
+session 名稱和 clone 路徑。若 agent 顯示登入或信任目錄提示，可進該 session 處理。
+`--agent-start-timeout` 預設為一分鐘，可延長等待啟動的時間。
+若發生錯誤或中斷，runner 會保留已啟動的 pane 與 clone 供檢查。批次成功後，只有在
+確認 clone 沒有本地變更、未發佈的 commit 或 stash 時才會移除。
+
+若要沿用已啟動的 agent，改用 `--draft-pane` 和 `--ready-pane`：
+
+```bash
+tmux-ai pr-loop 333 334 335 \
+  --draft-pane 1 \
+  --ready-pane 2 \
+  --draft-command '/pr-ready {pr}' \
+  --ready-command '$pr-review-merge {pr}'
+```
+
+PR 編號依輸入順序處理。使用已啟動的 pane 時，runner 等 GitHub 確認上一支已合併，
+並等兩個 agent 回到輸入提示，再分別送出 `/new`。若 Codex 顯示選單且選中
+`Use current Git worktree`，runner 會按 Enter 確認。兩個 pane 都恢復輸入提示後，
+runner 才開始下一支。已合併的 PR 會跳過；PR 關閉未合併、查詢或執行失敗會停下
+整批。單支 PR、第一支開始前與最後一支完成後都無須由 runner 送出 `/new`。
+
+在 repo 目錄或其子目錄執行時，可省略 `--repo`，讓 GitHub CLI `gh` 從目前
+工作目錄判斷 repository；也沿用 `gh` 的 `GH_REPO` 環境變數設定。需要指定其他
+repository 時，使用 `--repo owner/repo` 覆寫。這裡的工作目錄是 runner 的目錄。
+
+在同一個 tmux session 內執行時，`--draft-pane 1 --ready-pane 2` 表示該 session
+的 window 1、2（使用 window 的 active pane，數字不是 pane index）。Runner 透過
+`TMUX_PANE` 確定所屬 session，不受其他 client 切換 session 影響；在 tmux 外執行
+時請使用 `my-project:1`、`my-project:2` 等完整 target。Alias 仍優先解析。
+
+`pr-loop` 使用 `gh` 查詢 PR，依三種狀態循環執行：
 
 | PR 狀態 | 動作 |
 |---------|------|
-| `draft`（OPEN 且 isDraft=true） | 在 `--draft-pane` 送出 `--draft-command` |
-| `ready`（OPEN 且 isDraft=false） | 在 `--ready-pane` 送出 `--ready-command` |
-| `merged`（MERGED） | 成功結束，不再送出任何指令 |
+| `draft`（OPEN 且 isDraft=true） | 先切到 PR branch，再在 `--draft-pane` 送出 `--draft-command` |
+| `ready`（OPEN 且 isDraft=false） | 先切到 PR branch，再在 `--ready-pane` 送出 `--ready-command` |
+| `merged`（MERGED） | 完成該 PR，批次可繼續處理下一支 |
 
 PR 一開始已 ready 時會直接執行審查 skill；審查轉回 draft 後會再次執行修正
 skill，再等 ready，如此循環到 merged。關閉但未合併的 PR 屬於異常，會以錯誤
 結束，不會當成 merged。啟用 auto-merge 或等待 CI 都仍是 ready。
 
-指令會原文貼入 agent，再送一次 Enter。**不加入角色、prompt wrapper、
+每次進入 draft 修正或 ready 審查階段時，runner 會先從 GitHub 查詢 PR 的 branch 與 URL，
+再在該階段目標 pane 的 `pane_current_path` 執行 `gh pr checkout <PR-URL>`；確認 branch
+正確後才送出原生 skill。該目錄必須是 runner 可存取的本機 Git 工作目錄，包含
+獨立 worktree；SSH／container 內無法從 runner 存取的目錄不適用此切換機制。
+若已在 PR branch，則直接保留現有修改繼續，不會重新 checkout 或更新 branch。
+若 PR branch 已在同一 repository 的另一個 worktree 使用，runner 會自動找到
+該目錄並保留兩邊的修改，略過 checkout，在該回合的 skill 指令後附加該 worktree
+的明確路徑，要求 agent 在那裡執行編輯、測試、commit 與 push。這是交給 agent
+執行的工作目錄指示，不會直接變更執行中 agent process 的 cwd，也不會重啟 agent。
+該 worktree 必須可從 runner 存取，且仍在 PR branch；否則停止且不送出指令。
+若需要切換 branch 但有 staged、unstaged 或 untracked 變更，流程會停止，
+不會自動 stash、reset 或強制 checkout。查詢、checkout 或切換後驗證失敗時，
+該回合的 skill 不會送出。
+
+一般情況下指令會原文貼入 agent，再送一次 Enter；改用既有 worktree 時，會保留
+原生 skill 開頭並附加上述目錄指示。**不加入角色、prompt wrapper、
 `/goal`、receipt 或完成標記**，因此可由 agent 原生辨識 `/command` 或 `$skill`。
 Skill 名稱與完整指令都可透過上述兩個 command flags 修改；`{pr}` 會代入 PR 編號。
 在 shell 中使用單引號包住 `$skill`，避免被 shell 當成變數展開。
@@ -1089,35 +1143,60 @@ Skill 名稱與完整指令都可透過上述兩個 command flags 修改；`{pr}
 前置條件：`gh` 已登入且可讀取指定 repository；兩個 pane 已啟動對應 agent，
 並位於正確 repository，輸入區為空。目標支援 `%ID`、alias、`session:window`
 與 `session:window.pane`，啟動後固定到解析出的 pane ID；更換 pane 後需重新啟動。
-請在第三個 window 或其他 terminal 執行 runner，同一個 PR 同時只執行一個 runner。
+請在第三個 window 或其他 terminal 執行 runner，每組 pane 同時只交給一個 runner。
 此指令不需要 Ollama。
 
-完成判定只依 PR 狀態，不判讀 agent 畫面是否 idle。Skill 應在完成該階段工作後才
-改變 PR 狀態，這就是交接訊號；狀態連續確認後，runner 即可啟動下一階段，即使
-前一個 agent 還在輸出收尾文字。同一階段等待期間只送出一次指令，狀態不變、
-畫面靜止或 head commit 更新都不會自動重送。
+同一支 PR 的階段交接依 GitHub PR 狀態判定。Skill 應在完成該階段工作後才改變
+PR 狀態；狀態連續確認後，runner 即可啟動下一階段，即使前一個 agent 還在收尾。
+同一階段等待期間只送出一次指令，狀態不變、畫面靜止或 head commit 更新都不會
+自動重送。若審查 skill 把 PR 送進 merge queue，runner 會等 GitHub 確認合併。
 
 | Flag | 預設 | 說明 |
 |------|------|------|
-| `--repo` | 必填 | `[HOST/]OWNER/REPO` |
-| `--draft-pane` / `--ready-pane` | 必填 | 草稿修正／ready 審查的不同 pane |
+| `--repo` | 目前 repo | 選填；`[HOST/]OWNER/REPO`，省略時由 `gh` 判斷 |
+| `--draft-agent` / `--ready-agent` | 空 | 草稿修正／Ready 審查的可執行程式，與 pane 參數擇一組 |
+| `--agent-start-timeout` | `1m` | 自動啟動後等待 agent 輸入提示的上限 |
+| `--draft-pane` / `--ready-pane` | 空 | 已啟動 agent 的 window 編號或完整 pane target，與 agent 參數擇一組 |
 | `--draft-command` | `/pr-ready {pr}` | 草稿階段的原生指令 |
 | `--ready-command` | `$pr-review-merge {pr}` | ready 階段的原生指令 |
 | `--poll-interval` | `10s` | GitHub 查詢間隔 |
-| `--stable-polls` | `2` | 送出指令前，連續觀察到相同狀態的次數；merged 立即停止 |
-| `--phase-timeout` | `1h` | 送出指令／開始 observe 後等待狀態變更的上限；`0` 不限制 |
+| `--stable-polls` | `2` | 送出指令前，連續觀察到相同狀態的次數；merged 立即完成該 PR |
+| `--phase-timeout` | `24h` | 每次等待 PR 狀態變更或批次換支時等待 pane 輸入提示的上限；`0` 不限制 |
 | `--submit-delay` | `1s` | 貼上後等待多久再送 Enter |
-| `--max-actions` | `20` | 原生指令送出次數上限，超過時以錯誤結束 |
-| `--observe` | `false` | 跳過起始階段的指令，等待下一次狀態變更 |
-| `--dry-run` | `false` | 查詢並印出初始動作後結束，不連線 tmux、不送指令 |
+| `--max-actions` | `20` | 每支 PR 的原生指令送出次數上限，超過時以錯誤結束 |
+| `--observe` | `false` | 跳過清單中第一支 PR 起始階段的指令，等待下一次狀態變更 |
+| `--watch-pane` | `false` | 監看目前階段的 agent 畫面並提醒；只有明確設定 `--phase-timeout` 才會套用階段逾時 |
+| `--dry-run` | `false` | 依序查詢並印出每支 PR 的初始動作，不連線 tmux、不切 branch、不送指令 |
+
+若要透過畫面追蹤 agent 的工作，可以開啟 pane 監看：
+
+```bash
+tmux-ai pr-loop 333 --draft-pane 1 --ready-pane 2 --watch-pane
+```
+
+每次確認 PR 仍在目前階段時，runner 會讀取對應 pane 的可見畫面，回報可辨識的執行指示
+（如 `esc to interrupt`）與可見輸出變化，略過可辨識的忙碌計時列與輸入列。若畫面出現
+等待核准或輸入的提示，或已觀察到活動後回到輸入提示，就會在 runner 終端印出提醒並送出
+終端鈴聲。鈴聲的呈現取決於終端與 tmux 設定。同一提示持續顯示時只提醒一次，流程會繼續
+監看 PR。可搭配 `--observe` 監看已在進行的工作。
+
+畫面訊號取決於 agent 的介面與文字。畫面靜止或只有忙碌指示時，無法確定工作是否有進展。
+下一階段的交接仍依 GitHub PR 狀態判定。
+
+未開啟 pane 監看時，runner 預設每階段最多等待 24 小時。手動關閉等待上限的用法如下。
+
+```bash
+tmux-ai pr-loop 333 --draft-pane 1 --ready-pane 2 --phase-timeout 0
+```
 
 GitHub 查詢每次最多等待 30 秒；連續失敗三次便停止，失敗期間不使用舊狀態送出
 指令。傳送失敗可能已部分貼上，runner 會停止，不會自動重送 Enter。Ctrl-C 或
 SIGTERM 可停止 runner；已送入 agent 的工作仍會繼續。
 
-Runner 不保存跨程序的送出紀錄。若重新啟動時 agent 正在工作，使用相同參數
-加上 `--observe`，可跳過起始狀態的指令；若需要重新執行該階段，則不加
-`--observe`。重新啟動前應先查看 pane，處理可能尚未送出的輸入。
+Runner 不保存跨程序的送出紀錄。批次中斷後可從當前 PR 和後續編號重新執行。
+如果 agent 還在處理當前 PR，將該 PR 放在第一個並加上 `--observe`；
+若需要重新執行該階段，則省略此旗標。重新啟動前先查看 pane，處理可能尚未送出的輸入。
+若中斷發生在上一支合併後、`/new` 完成前，重啟前先在兩個 pane 完成 `/new`。
 
 ---
 

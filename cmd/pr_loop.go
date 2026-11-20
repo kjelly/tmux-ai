@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,13 +29,14 @@ const (
 )
 
 type prLoopOptions struct {
-	Number                     int
-	Repo, DraftPane, ReadyPane string
-	DraftCommand, ReadyCommand string
-	PollInterval, PhaseTimeout time.Duration
-	SubmitDelay                time.Duration
-	StablePolls, MaxActions    int
-	Observe, DryRun            bool
+	Number                         int
+	Repo, DraftPane, ReadyPane     string
+	DraftAgent, ReadyAgent         string
+	DraftCommand, ReadyCommand     string
+	PollInterval, PhaseTimeout     time.Duration
+	SubmitDelay, AgentStartTimeout time.Duration
+	StablePolls, MaxActions        int
+	Observe, DryRun, WatchPane     bool
 }
 
 func init() { rootCmd.AddCommand(newPRLoopCommand()) }
@@ -42,84 +44,226 @@ func init() { rootCmd.AddCommand(newPRLoopCommand()) }
 func newPRLoopCommand() *cobra.Command {
 	var options prLoopOptions
 	command := &cobra.Command{
-		Use:   "pr-loop <PR-number>",
-		Short: "Run native agent commands according to PR state: draft, ready, merged",
-		Long: `Poll GitHub PR state with gh, without an LLM or agent completion detection.
-Draft PRs receive --draft-command; ready PRs receive --ready-command; merged PRs stop.
-Commands are pasted verbatim with Enter, with no role, prompt wrapper, or receipt.
+		Use:         "pr-loop <PR-number> [PR-number...]",
+		Short:       "Run native agent commands according to PR state: draft, ready, merged",
+		Annotations: map[string]string{noLLMAnnotation: "true"},
+		Long: `Poll GitHub PR state with gh, without an LLM.
+Draft PRs receive --draft-command; ready PRs receive --ready-command; merged PRs are done.
+PRs are processed in the given order. Each must merge before the next starts.
+Use --draft-agent and --ready-agent to launch fresh agents per PR in a dedicated checkout.
+With prestarted panes, wait for both panes and send /new between PRs.
+An error stops the batch. A PR that is already merged is skipped.
+Before each draft or ready command, check out the PR branch in the target pane's local directory.
+Switching branches requires a clean worktree; an already checked-out PR branch is kept.
+If the branch is in another local worktree, append instructions to work there instead.
+This guides the agent; it does not change the running agent's working directory.
+Commands keep the native skill first and are pasted with Enter, without a role or receipt.
 Each observed phase is dispatched once; unchanged state never resends a command.
-Both panes must already be running agents in the correct repository with empty inputs.
-Use --observe to wait for the next state change when resuming an already running task.
+When using --draft-pane and --ready-pane, start both agents before invoking pr-loop.
+Use --observe to wait for the next state change on the first listed PR when resuming.
+Use --watch-pane to report visible agent activity and alert on prompts that may need attention.
+With --watch-pane, a phase timeout applies only if --phase-timeout is explicitly set.
+Without --repo, gh selects the repository from the working directory (or GH_REPO).
+Bare window numbers select windows in the session containing $TMUX_PANE.
 
 Example:
-  tmux-ai pr-loop 333 --repo owner/repo \
-    --draft-pane project:1 --ready-pane project:2 \
+  tmux-ai pr-loop 333 334 335 \
+    --draft-pane 1 --ready-pane 2 \
     --draft-command '/pr-ready {pr}' --ready-command '$pr-review-merge {pr}'`,
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			number, err := strconv.Atoi(args[0])
-			if err != nil || number <= 0 {
-				return fmt.Errorf("PR number must be a positive integer")
+			numbers, err := parsePRLoopNumbers(args)
+			if err != nil {
+				return err
 			}
-			options.Number = number
-			if err := options.validate(); err != nil {
+			runOptions := options
+			if runOptions.WatchPane && !cmd.Flags().Changed("phase-timeout") {
+				runOptions.PhaseTimeout = 0
+			}
+			if err := runOptions.validate(); err != nil {
 				return err
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			ex := tmux.NewExecutor()
-			aliases := newResolver().Aliases
-			resolved := false
-			send := func(ctx context.Context, phase prPhase, text string) error {
-				if !resolved {
-					for _, target := range []*string{&options.DraftPane, &options.ReadyPane} {
-						pane, err := ex.ResolveTarget(aliases.Resolve(*target))
-						if err != nil {
-							return fmt.Errorf("resolve pane %q: %w", *target, err)
-						}
-						*target = pane
-					}
-					if options.DraftPane == options.ReadyPane {
-						return fmt.Errorf("draft and ready targets resolve to the same pane")
-					}
-					resolved = true
-				}
-				pane := options.ReadyPane
-				if phase == prDraft {
-					pane = options.DraftPane
-				}
-				return sendNativePRCommand(ctx, ex, pane, text, options.SubmitDelay)
+			out := cmd.OutOrStdout()
+			var managed *managedPRAgents
+			if runOptions.launchAgents() {
+				managed = &managedPRAgents{executor: ex, options: runOptions, out: out}
 			}
-			return runPRLoop(ctx, options, queryPRPhase, send, waitPRPoll, time.Now, cmd.OutOrStdout())
+			aliases := newResolver().Aliases
+			var draftPane, readyPane string
+			paneForPhase := func(phase prPhase) (string, error) {
+				if draftPane == "" {
+					draft, ready, err := resolvePRLoopTargets(ex, aliases.Resolve, runOptions.DraftPane, runOptions.ReadyPane, os.Getenv("TMUX_PANE"))
+					if err != nil {
+						return "", err
+					}
+					draftPane, readyPane = draft, ready
+				}
+				if phase == prDraft {
+					return draftPane, nil
+				}
+				return readyPane, nil
+			}
+			for index, number := range numbers {
+				runOptions.Number = number
+				runOptions.Observe = options.Observe && index == 0
+				if len(numbers) > 1 {
+					fmt.Fprintf(out, "[%d/%d] PR #%d\n", index+1, len(numbers), number)
+				}
+				send := func(ctx context.Context, phase prPhase, text string) error {
+					if managed != nil {
+						return managed.send(ctx, number, phase, text)
+					}
+					pane, err := paneForPhase(phase)
+					if err != nil {
+						return err
+					}
+					return sendPreparedPRCommand(ctx, ex, pane, runOptions.Repo, number, text, runOptions.SubmitDelay, out)
+				}
+
+				resetPanes := managed == nil && index+1 < len(numbers) && !runOptions.DryRun
+				prActive := false
+				var watchPane func(prPhase)
+				watch := prPaneWatch{executor: ex, number: number, out: out}
+				if resetPanes || runOptions.WatchPane {
+					watchPane = func(phase prPhase) {
+						prActive = true
+						if runOptions.WatchPane {
+							if managed != nil {
+								if pane := managed.panes[phase]; pane != "" {
+									watch.poll(phase, pane)
+								}
+								return
+							}
+							pane, _ := paneForPhase(phase)
+							watch.poll(phase, pane)
+						}
+					}
+				}
+				if err := runPRLoop(ctx, runOptions, queryPRPhase, send, watchPane, waitPRPoll, time.Now, out); err != nil {
+					if len(numbers) == 1 {
+						return err
+					}
+					return fmt.Errorf("PR #%d [%d/%d]: %w", number, index+1, len(numbers), err)
+				}
+				if managed != nil {
+					if err := managed.finishPR(ctx); err != nil {
+						return fmt.Errorf("after PR #%d: %w", number, err)
+					}
+				} else if resetPanes && prActive {
+					if _, err := paneForPhase(prDraft); err != nil {
+						return fmt.Errorf("after PR #%d: %w", number, err)
+					}
+					if err := resetPRPanes(ctx, ex, []string{draftPane, readyPane}, runOptions, out); err != nil {
+						return fmt.Errorf("after PR #%d: %w", number, err)
+					}
+				}
+			}
+			if managed != nil {
+				managed.cleanupCheckout(ctx)
+			}
+			return nil
 		},
 	}
 	flags := command.Flags()
-	flags.StringVar(&options.Repo, "repo", "", "GitHub repository: [HOST/]OWNER/REPO (required)")
-	flags.StringVar(&options.DraftPane, "draft-pane", "", "Agent for draft PRs: alias, %ID, or session:window.pane (required)")
-	flags.StringVar(&options.ReadyPane, "ready-pane", "", "Agent for ready PRs: alias, %ID, or session:window.pane (required)")
+	flags.StringVar(&options.Repo, "repo", "", "GitHub repository: [HOST/]OWNER/REPO (default: gh's current repository)")
+	flags.StringVar(&options.DraftPane, "draft-pane", "", "Prestarted agent for draft PRs: window number, alias, %ID, or session:window.pane")
+	flags.StringVar(&options.ReadyPane, "ready-pane", "", "Prestarted agent for ready PRs: window number, alias, %ID, or session:window.pane")
+	flags.StringVar(&options.DraftAgent, "draft-agent", "", "Executable to launch for draft PRs, e.g. claude")
+	flags.StringVar(&options.ReadyAgent, "ready-agent", "", "Executable to launch for ready PRs, e.g. codex")
+	flags.DurationVar(&options.AgentStartTimeout, "agent-start-timeout", time.Minute, "Maximum wait for a launched agent's input prompt")
 	flags.StringVar(&options.DraftCommand, "draft-command", "/pr-ready {pr}", "Native draft-phase skill/command; {pr} is replaced by the PR number")
 	flags.StringVar(&options.ReadyCommand, "ready-command", "$pr-review-merge {pr}", "Native ready-phase skill/command; {pr} is replaced by the PR number")
 	flags.DurationVar(&options.PollInterval, "poll-interval", 10*time.Second, "Interval between GitHub state queries")
 	flags.IntVar(&options.StablePolls, "stable-polls", 2, "Consecutive observations required before dispatch")
-	flags.DurationVar(&options.PhaseTimeout, "phase-timeout", time.Hour, "Maximum wait for a state change after dispatch/observe (0 disables)")
+	flags.DurationVar(&options.PhaseTimeout, "phase-timeout", 24*time.Hour, "Maximum wait for a state change or for panes to return to a prompt between PRs (0 disables)")
 	flags.DurationVar(&options.SubmitDelay, "submit-delay", time.Second, "Delay between pasting the native command and pressing Enter")
-	flags.IntVar(&options.MaxActions, "max-actions", 20, "Maximum native command dispatches")
-	flags.BoolVar(&options.Observe, "observe", false, "Skip the initial phase's command and wait for a state change")
-	flags.BoolVar(&options.DryRun, "dry-run", false, "Show the initial action without sending input or connecting to tmux")
+	flags.IntVar(&options.MaxActions, "max-actions", 20, "Maximum native command dispatches per PR")
+	flags.BoolVar(&options.Observe, "observe", false, "Skip the first listed PR's initial command and wait for a state change")
+	flags.BoolVar(&options.WatchPane, "watch-pane", false, "Report visible activity in the active agent pane and alert when it may need attention")
+	flags.BoolVar(&options.DryRun, "dry-run", false, "Show the initial action for each PR without sending input or connecting to tmux")
 	return command
 }
 
-func (o prLoopOptions) validate() error {
-	parts := strings.Split(o.Repo, "/")
-	if len(parts) < 2 || len(parts) > 3 || strings.IndexFunc(o.Repo, unicode.IsSpace) >= 0 || strings.ContainsAny(o.Repo, "\\:") {
-		return fmt.Errorf("--repo must be [HOST/]OWNER/REPO")
+func parsePRLoopNumbers(args []string) ([]int, error) {
+	numbers := make([]int, 0, len(args))
+	seen := make(map[int]bool, len(args))
+	for _, arg := range args {
+		number, err := strconv.Atoi(arg)
+		if err != nil || number <= 0 {
+			return nil, fmt.Errorf("PR number must be a positive integer: %q", arg)
+		}
+		if seen[number] {
+			return nil, fmt.Errorf("duplicate PR number: %d", number)
+		}
+		seen[number] = true
+		numbers = append(numbers, number)
 	}
-	for _, part := range parts {
-		if part == "" || strings.HasPrefix(part, "-") || part == "." || part == ".." {
+	return numbers, nil
+}
+
+// Anchor numeric windows to the caller pane's session, never tmux's most recent
+// client or a numeric session name. Resolve both targets once to pin pane IDs.
+func resolvePRLoopTargets(ex tmux.Executor, alias func(string) string, draft, ready, callerPane string) (string, string, error) {
+	targets := []string{alias(draft), alias(ready)}
+	session := ""
+	for i, target := range targets {
+		if target != "" && strings.Trim(target, "0123456789") == "" {
+			if callerPane == "" {
+				return "", "", fmt.Errorf("window numbers require a current tmux pane (TMUX_PANE); use session:window outside tmux")
+			}
+			if session == "" {
+				out, err := ex.Exec("display-message", "-p", "-t", callerPane, "#{session_id}")
+				if err != nil {
+					return "", "", fmt.Errorf("find current tmux session: %w", err)
+				}
+				session = strings.TrimSpace(out)
+				if session == "" {
+					return "", "", fmt.Errorf("cannot determine the current tmux session; use session:window")
+				}
+			}
+			target = session + ":" + target
+		}
+		pane, err := ex.ResolveTarget(target)
+		if err != nil {
+			return "", "", fmt.Errorf("resolve pane %q: %w", target, err)
+		}
+		if pane == "" {
+			return "", "", fmt.Errorf("cannot resolve pane %q", target)
+		}
+		targets[i] = pane
+	}
+	if targets[0] == targets[1] {
+		return "", "", fmt.Errorf("draft and ready targets resolve to the same pane")
+	}
+	return targets[0], targets[1], nil
+}
+
+func (o prLoopOptions) validate() error {
+	if o.Repo != "" {
+		parts := strings.Split(o.Repo, "/")
+		if len(parts) < 2 || len(parts) > 3 || strings.IndexFunc(o.Repo, unicode.IsSpace) >= 0 || strings.ContainsAny(o.Repo, "\\:") {
 			return fmt.Errorf("--repo must be [HOST/]OWNER/REPO")
 		}
+		for _, part := range parts {
+			if part == "" || strings.HasPrefix(part, "-") || part == "." || part == ".." {
+				return fmt.Errorf("--repo must be [HOST/]OWNER/REPO")
+			}
+		}
 	}
-	if strings.TrimSpace(o.DraftPane) == "" || strings.TrimSpace(o.ReadyPane) == "" || o.DraftPane == o.ReadyPane {
+	if o.launchAgents() {
+		if strings.TrimSpace(o.DraftAgent) == "" || strings.TrimSpace(o.ReadyAgent) == "" {
+			return fmt.Errorf("--draft-agent and --ready-agent must be specified together")
+		}
+		if o.DraftPane != "" || o.ReadyPane != "" {
+			return fmt.Errorf("choose either --draft-agent and --ready-agent or --draft-pane and --ready-pane")
+		}
+		if o.AgentStartTimeout <= 0 {
+			return fmt.Errorf("--agent-start-timeout must be positive")
+		}
+	} else if strings.TrimSpace(o.DraftPane) == "" || strings.TrimSpace(o.ReadyPane) == "" || o.DraftPane == o.ReadyPane {
 		return fmt.Errorf("--draft-pane and --ready-pane must be nonempty, different targets")
 	}
 	for _, text := range []string{o.DraftCommand, o.ReadyCommand} {
@@ -131,6 +275,10 @@ func (o prLoopOptions) validate() error {
 		return fmt.Errorf("poll interval, stable polls, and max actions must be positive; timeouts/delays must not be negative")
 	}
 	return nil
+}
+
+func (o prLoopOptions) launchAgents() bool {
+	return o.DraftAgent != "" || o.ReadyAgent != ""
 }
 
 // GitHub has OPEN/CLOSED/MERGED and a separate isDraft boolean. Only these
@@ -168,7 +316,12 @@ func parsePRPhase(data []byte, number int) (prPhase, error) {
 func queryPRPhase(ctx context.Context, repo string, number int) (prPhase, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	command := exec.CommandContext(ctx, "gh", "pr", "view", strconv.Itoa(number), "--repo", repo, "--json", "number,state,isDraft")
+	args := []string{"pr", "view", strconv.Itoa(number)}
+	if repo != "" {
+		args = append(args, "--repo", repo)
+	}
+	args = append(args, "--json", "number,state,isDraft")
+	command := exec.CommandContext(ctx, "gh", args...)
 	// gh must never open a browser or prompt for credentials inside the runner.
 	command.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 	data, err := command.Output()
@@ -185,7 +338,7 @@ type prQueryError struct{ error }
 type prPhaseQuery func(context.Context, string, int) (prPhase, error)
 type prCommandSender func(context.Context, prPhase, string) error
 
-func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send prCommandSender, wait func(context.Context, time.Duration) error, now func() time.Time, out io.Writer) error {
+func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send prCommandSender, watchPane func(prPhase), wait func(context.Context, time.Duration) error, now func() time.Time, out io.Writer) error {
 	var dispatched, candidate prPhase
 	var phaseStarted time.Time
 	stable, actions, queryErrors := 0, 0, 0
@@ -234,12 +387,26 @@ func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send pr
 					if phase == prDraft {
 						text, pane = o.DraftCommand, o.DraftPane
 					}
+					if o.launchAgents() {
+						pane = o.ReadyAgent
+						if phase == prDraft {
+							pane = o.DraftAgent
+						}
+					}
 					text = strings.ReplaceAll(text, "{pr}", strconv.Itoa(o.Number))
 					fmt.Fprintf(out, "PR %s#%d: %s -> %s: %s\n", o.Repo, o.Number, phase, pane, text)
+					if o.DryRun && o.launchAgents() {
+						fmt.Fprintln(out, "Would prepare a managed checkout, launch the agent in tmux, and send the native command.")
+					} else if o.DryRun {
+						fmt.Fprintln(out, "Would prepare the PR branch in the target pane's working directory, or append instructions to use its existing worktree, before sending the native command.")
+					}
 					if o.DryRun {
 						return nil
 					}
 					if err := send(ctx, phase, text); err != nil {
+						if errors.Is(err, errPRBranchPreparation) {
+							return err
+						}
 						return fmt.Errorf("native command delivery failed; delivery may be partial, inspect pane before restarting: %w", err)
 					}
 					actions++
@@ -249,6 +416,9 @@ func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send pr
 				}
 				dispatched, phaseStarted = phase, now()
 				fmt.Fprintln(out, "Waiting for PR state to change; unchanged state will not resend the command.")
+			}
+			if watchPane != nil && phase == dispatched && ctx.Err() == nil {
+				watchPane(phase)
 			}
 		}
 		if !phaseStarted.IsZero() && o.PhaseTimeout > 0 && now().Sub(phaseStarted) >= o.PhaseTimeout {
@@ -271,19 +441,130 @@ func waitPRPoll(ctx context.Context, delay time.Duration) error {
 	}
 }
 
+const prNewSessionCommand = "/new"
+
+var (
+	prNewInput           = regexp.MustCompile("(?m)^[ \\t]*[›❯>][ \\t]*/new[ \\t]*$")
+	prNewCurrentWorktree = regexp.MustCompile("(?m)^[ \\t]*[›❯>][ \\t]*(?:1\\.[ \\t]*)?Use current Git worktree(?:[ \\t]|$)")
+	prNewError           = regexp.MustCompile("(?i)(?:unknown command:?\\s*/new|failed to (?:start a fresh session|read new session defaults))")
+)
+
+func resetPRPanes(ctx context.Context, ex tmux.Executor, panes []string, o prLoopOptions, out io.Writer) error {
+	// GitHub can report a merge while the previous agents are still finishing.
+	for _, pane := range panes {
+		if err := waitForPRPanePrompt(ctx, ex, pane, o, out); err != nil {
+			return err
+		}
+	}
+	for _, pane := range panes {
+		fmt.Fprintf(out, "Starting a new conversation in pane %s with %s.\n", pane, prNewSessionCommand)
+		if err := resetPRPane(ctx, ex, pane, o, out); err != nil {
+			return fmt.Errorf("reset pane %s: %w", pane, err)
+		}
+	}
+	return nil
+}
+
+func resetPRPane(ctx context.Context, ex tmux.Executor, pane string, o prLoopOptions, out io.Writer) error {
+	poll := min(o.PollInterval, 200*time.Millisecond)
+	// Require the slash command to reach the composer before submitting. The
+	// prompt can look identical in the old and new conversations.
+	confirmPaste := func() error {
+		return waitForPRPaneScreen(ctx, ex, pane, poll, promptEchoTimeout, "show /new in its input prompt", io.Discard,
+			func(screen string) (bool, error) { return prNewInput.MatchString(screen), nil })
+	}
+	if err := submitNativePRCommand(ctx, ex, pane, prNewSessionCommand, o.SubmitDelay, confirmPaste); err != nil {
+		return err
+	}
+	sawWorktreePicker, selected := false, false
+	return waitForPRPaneScreen(ctx, ex, pane, poll, o.PhaseTimeout, "finish /new and return to its input prompt", out,
+		func(screen string) (bool, error) {
+			if prNewError.MatchString(screen) {
+				return false, fmt.Errorf("agent reported a failure starting a new conversation")
+			}
+			if strings.Contains(screen, "Where should the new conversation run?") {
+				sawWorktreePicker = true
+				if !selected && prNewCurrentWorktree.MatchString(screen) {
+					if err := ctx.Err(); err != nil {
+						return false, err
+					}
+					if _, err := ex.Exec("send-keys", "-t", pane, "Enter"); err != nil {
+						return false, err
+					}
+					selected = true
+				}
+				return false, nil
+			}
+			activity, _ := inspectPRPaneScreen(screen)
+			if activity != prPanePrompt || prNewInput.MatchString(screen) {
+				return false, nil
+			}
+			if sawWorktreePicker && !selected {
+				return false, fmt.Errorf("/new checkout selection was not confirmed")
+			}
+			return true, nil
+		})
+}
+
+func waitForPRPanePrompt(ctx context.Context, ex tmux.Executor, pane string, o prLoopOptions, out io.Writer) error {
+	return waitForPRPaneScreen(ctx, ex, pane, o.PollInterval, o.PhaseTimeout, "return to its input prompt", out,
+		func(screen string) (bool, error) {
+			activity, _ := inspectPRPaneScreen(screen)
+			return activity == prPanePrompt, nil
+		})
+}
+
+func waitForPRPaneScreen(ctx context.Context, ex tmux.Executor, pane string, poll, timeout time.Duration, expectation string, out io.Writer, check func(string) (bool, error)) error {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	reported := false
+	for ctx.Err() == nil {
+		if _, err := nativePRPaneState(ex, pane); err != nil {
+			return err
+		}
+		screen, err := ex.CaptureScreenClean(pane)
+		if err != nil {
+			return fmt.Errorf("read pane %s before starting the next PR: %w", pane, err)
+		}
+		if ready, err := check(screen); ready || err != nil {
+			return err
+		}
+		if !reported {
+			fmt.Fprintf(out, "Waiting for pane %s to %s.\n", pane, expectation)
+			reported = true
+		}
+		if err := waitPRPoll(ctx, poll); err != nil {
+			return fmt.Errorf("waiting for pane %s to %s: %w", pane, expectation, err)
+		}
+	}
+	return fmt.Errorf("waiting for pane %s to %s: %w", pane, expectation, ctx.Err())
+}
+
 func sendNativePRCommand(ctx context.Context, ex tmux.Executor, pane, text string, delay time.Duration) error {
+	return submitNativePRCommand(ctx, ex, pane, text, delay, nil)
+}
+
+func submitNativePRCommand(ctx context.Context, ex tmux.Executor, pane, text string, delay time.Duration, beforeEnter func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	state := readPaneState(ex, pane)
-	if !state.Known || state.Dead || state.InMode || isShellCommand(state.Command) || state.Command == "" {
-		return fmt.Errorf("pane %s must have a live foreground agent outside copy-mode; state=%+v", pane, state)
+	state, err := nativePRPaneState(ex, pane)
+	if err != nil {
+		return err
 	}
 	if err := ex.SendTextContext(ctx, pane, text); err != nil {
 		return err
 	}
 	if err := waitPRPoll(ctx, delay); err != nil {
 		return err
+	}
+	if beforeEnter != nil {
+		if err := beforeEnter(); err != nil {
+			return err
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -297,6 +578,14 @@ func sendNativePRCommand(ctx context.Context, ex tmux.Executor, pane, text strin
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	_, err := ex.Exec("send-keys", "-t", pane, "Enter")
+	_, err = ex.Exec("send-keys", "-t", pane, "Enter")
 	return err
+}
+
+func nativePRPaneState(ex tmux.Executor, pane string) (paneState, error) {
+	state := readPaneState(ex, pane)
+	if !state.Known || state.Dead || state.InMode || isShellCommand(state.Command) || state.Command == "" {
+		return state, fmt.Errorf("pane %s must have a live foreground agent outside copy-mode; state=%+v", pane, state)
+	}
+	return state, nil
 }

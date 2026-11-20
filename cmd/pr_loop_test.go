@@ -77,6 +77,7 @@ func exercisePRLoop(t *testing.T, o prLoopOptions, observations []prObservation,
 			sent = append(sent, string(phase)+":"+text)
 			return sendErr
 		},
+		nil,
 		func(_ context.Context, delay time.Duration) error { now = now.Add(delay); return nil },
 		func() time.Time { return now }, &out)
 	return sent, out.String(), err
@@ -195,7 +196,7 @@ func TestPRLoopCustomSkillsAndDryRun(t *testing.T) {
 
 func TestPRLoopRejectsInvalidOptions(t *testing.T) {
 	for _, change := range []func(*prLoopOptions){
-		func(o *prLoopOptions) { o.Repo = "" },
+		func(o *prLoopOptions) { o.Repo = " " },
 		func(o *prLoopOptions) { o.Repo = "https://github.com/owner/repo" },
 		func(o *prLoopOptions) { o.Repo = "owner/" },
 		func(o *prLoopOptions) { o.DraftPane = "" },
@@ -236,6 +237,64 @@ func TestNativePRCommandDelivery(t *testing.T) {
 		if !reflect.DeepEqual(last, []string{"send-keys", "-t", "%1", "Enter"}) {
 			t.Fatalf("missing final Enter: %v", last)
 		}
+	}
+}
+
+func TestPRLoopNumericTargetsUseCallerSession(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	ex.ResolveResult = map[string]string{"$7:1": "%11", "$7:2": "%12", "1": "%wrong-session", "2": "%wrong-pane"}
+	ex.ExecHook = func(args []string) (string, bool, error) {
+		if !reflect.DeepEqual(args, []string{"display-message", "-p", "-t", "%99", "#{session_id}"}) {
+			t.Fatalf("session lookup did not use caller pane: %v", args)
+		}
+		return "$7\n", true, nil
+	}
+	identity := func(target string) string { return target }
+	draft, ready, err := resolvePRLoopTargets(ex, identity, "1", "2", "%99")
+	if err != nil || draft != "%11" || ready != "%12" || len(ex.ExecCalls) != 1 {
+		t.Fatalf("resolved=(%q,%q), session lookups=%d, err=%v", draft, ready, len(ex.ExecCalls), err)
+	}
+}
+
+func TestPRLoopExplicitTargetsAndAliasesNeedNoCallerSession(t *testing.T) {
+	for _, test := range []struct{ draft, ready string }{
+		{"project:1", "project:2.0"},
+		{"fixer", "reviewer"},
+		{"1", "2"}, // Existing numeric aliases retain their precedence.
+		{"%11", "%12"},
+	} {
+		ex := tmux.NewFakeExecutor()
+		ex.ResolveResult = map[string]string{"project:1": "%11", "project:2.0": "%12"}
+		aliases := map[string]string{"fixer": "%11", "reviewer": "%12", "1": "%11", "2": "%12"}
+		alias := func(target string) string {
+			if mapped, ok := aliases[target]; ok {
+				return mapped
+			}
+			return target
+		}
+		draft, ready, err := resolvePRLoopTargets(ex, alias, test.draft, test.ready, "")
+		if err != nil || draft != "%11" || ready != "%12" || len(ex.ExecCalls) != 0 {
+			t.Fatalf("targets=%+v: resolved=(%q,%q), err=%v", test, draft, ready, err)
+		}
+	}
+}
+
+func TestPRLoopTargetResolutionFailures(t *testing.T) {
+	identity := func(target string) string { return target }
+	ex := tmux.NewFakeExecutor()
+	if _, _, err := resolvePRLoopTargets(ex, identity, "1", "2", ""); err == nil || !strings.Contains(err.Error(), "session:window") {
+		t.Fatalf("numeric targets outside tmux should fail: %v", err)
+	}
+	if _, _, err := resolvePRLoopTargets(ex, identity, "1", "2", "%99"); err == nil {
+		t.Fatal("accepted an unknown caller session")
+	}
+	ex.ExecError = errors.New("caller pane no longer exists")
+	if _, _, err := resolvePRLoopTargets(ex, identity, "1", "2", "%99"); !errors.Is(err, ex.ExecError) {
+		t.Fatalf("lost session lookup failure: %v", err)
+	}
+	ex.ResolveResult = map[string]string{"project:1": "%11", "same-pane": "%11"}
+	if _, _, err := resolvePRLoopTargets(ex, identity, "project:1", "same-pane", ""); err == nil {
+		t.Fatal("accepted two targets resolving to the same pane")
 	}
 }
 
@@ -289,7 +348,7 @@ func TestPRLoopCancellation(t *testing.T) {
 	}
 	err := runPRLoop(ctx, testPRLoopOptions(),
 		func(context.Context, string, int) (prPhase, error) { t.Fatal("queried after cancel"); return "", nil },
-		nil, nil, time.Now, &bytes.Buffer{})
+		nil, nil, nil, time.Now, &bytes.Buffer{})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("loop did not cancel: %v", err)
 	}
@@ -311,7 +370,26 @@ func fakePRGH(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	script := `#!/bin/sh
-if [ "$*" != 'pr view 333 --repo owner/repo --json number,state,isDraft' ]; then
+case "$*" in
+  'pr view 333 --repo owner/repo --json number,url,headRefName'|'pr view 333 --json number,url,headRefName')
+    printf '%s' '{"number":333,"url":"https://github.com/owner/repo/pull/333","headRefName":"pr-333"}'
+    exit 0 ;;
+  'pr checkout https://github.com/owner/repo/pull/333')
+    printf '%s\n' "$PWD" >> "$TMUXAI_TEST_CHECKOUT_LOG"
+    exec git switch pr-333 ;;
+  'pr view 334 --repo owner/repo --json number,url,headRefName')
+    printf '%s' '{"number":334,"url":"https://github.com/owner/repo/pull/334","headRefName":"pr-334"}'
+    exit 0 ;;
+  'pr checkout https://github.com/owner/repo/pull/334')
+    printf '%s\n' "$PWD" >> "$TMUXAI_TEST_CHECKOUT_LOG"
+    exec git switch pr-334 ;;
+  'pr view 334 --repo owner/repo --json number,state,isDraft')
+    case "$(cat "$TMUXAI_TEST_PR_STATE")" in
+      *MERGED*) exec cat "$TMUXAI_TEST_PR_STATE_NEXT" ;;
+      *) exit 2 ;;
+    esac ;;
+esac
+if [ "$*" != "$TMUXAI_TEST_GH_ARGS" ]; then
   echo 'unexpected gh arguments' >&2
   exit 2
 fi
@@ -325,27 +403,195 @@ fi
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
+	t.Setenv("TMUXAI_TEST_GH_ARGS", "pr view 333 --repo owner/repo --json number,state,isDraft")
 	return dir
+}
+
+func TestPRLoopBatchCommand(t *testing.T) {
+	for _, tt := range []struct {
+		name, wantQueries, wantError string
+		args, wantOutput             []string
+	}{
+		{
+			name: "dry-run in argument order", args: []string{"335", "334", "333", "--observe", "--dry-run"},
+			wantQueries: "335\n334\n333\n",
+			wantOutput:  []string{"[1/3] PR #335", "initial command skipped", "[2/3] PR #334", "$pr-review-merge 334", "[3/3] PR #333", "merged"},
+		},
+		{
+			name: "closed stops before next PR", args: []string{"333", "336", "334"},
+			wantQueries: "333\n336\n", wantError: "PR #336 [2/3]: PR #336 is closed without being merged",
+		},
+		{
+			name: "duplicate rejected before GitHub access", args: []string{"333", "0333"},
+			wantError: "duplicate PR number: 333",
+		},
+		{
+			name: "invalid number rejected before GitHub access", args: []string{"333", "abc"},
+			wantError: "PR number must be a positive integer",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := fakePRGH(t)
+			logPath := filepath.Join(dir, "queries.log")
+			t.Setenv("TMUXAI_TEST_PR_QUERY_LOG", logPath)
+			const gh = `#!/bin/sh
+printf '%s\n' "$3" >> "$TMUXAI_TEST_PR_QUERY_LOG"
+case "$3" in
+  333) printf '%s' '{"number":333,"state":"MERGED"}' ;;
+  334) printf '%s' '{"number":334,"state":"OPEN","isDraft":false}' ;;
+  335) printf '%s' '{"number":335,"state":"OPEN","isDraft":true}' ;;
+  336) printf '%s' '{"number":336,"state":"CLOSED"}' ;;
+  *) exit 2 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(gh), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			command := newPRLoopCommand()
+			command.SetArgs(append(tt.args, "--draft-pane", "project:1", "--ready-pane", "project:2", "--stable-polls", "1"))
+			var out bytes.Buffer
+			command.SetOut(&out)
+			command.SetErr(&out)
+			err := command.Execute()
+			if tt.wantError == "" && err != nil || tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("error = %v, want %q", err, tt.wantError)
+			}
+			queries, err := os.ReadFile(logPath)
+			if err != nil && !(tt.wantQueries == "" && errors.Is(err, os.ErrNotExist)) || string(queries) != tt.wantQueries {
+				t.Fatalf("queries = %q (%v), want %q", queries, err, tt.wantQueries)
+			}
+			remaining := out.String()
+			for _, want := range tt.wantOutput {
+				_, after, found := strings.Cut(remaining, want)
+				if !found {
+					t.Fatalf("output = %q, missing %q after preceding actions", out.String(), want)
+				}
+				remaining = after
+			}
+		})
+	}
+}
+
+func TestPRLoopWaitsForPanePromptBetweenPRs(t *testing.T) {
+	ex := tmux.NewFakeExecutor()
+	ex.ExecResult["display-message -p -t %1 "+paneStateFormat] = "0|0||codex"
+	captures := []string{"• Working (1s • esc to interrupt)\n› Ask anything", "Waiting for your approval", "› Ask anything"}
+	ex.CaptureHook = func(_ string, _ int) (string, error) {
+		if len(captures) == 0 {
+			t.Fatal("wait continued after the agent's prompt returned")
+		}
+		screen := captures[0]
+		captures = captures[1:]
+		return screen, nil
+	}
+	o := testPRLoopOptions()
+	o.PollInterval = time.Millisecond
+	o.PhaseTimeout = time.Second
+	var out bytes.Buffer
+	if err := waitForPRPanePrompt(context.Background(), ex, "%1", o, &out); err != nil {
+		t.Fatal(err)
+	}
+	if len(captures) != 0 || strings.Count(out.String(), "Waiting for pane %1") != 1 {
+		t.Fatalf("returned too early or reported repeatedly: captures=%v output=%q", captures, out.String())
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ex.CaptureHook = func(_ string, _ int) (string, error) {
+		cancel()
+		return "Waiting for your approval", nil
+	}
+	if err := waitForPRPanePrompt(ctx, ex, "%1", o, &out); !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want cancellation", err)
+	}
+}
+
+func TestPRLoopResetsPaneBetweenPRs(t *testing.T) {
+	const picker = "Where should the new conversation run?\n› 1. Use current Git worktree  Keep using the current working directory\n  2. Create new Git worktree"
+	for _, tt := range []struct {
+		name, wantError string
+		screens         []string
+		wantEnters      int
+	}{
+		{"direct reset", "", []string{"❯ /new", "❯"}, 1},
+		{"worktree picker", "", []string{"› /new", "› /new", picker, picker, "› Ask anything"}, 2},
+		{"picker canceled", "checkout selection was not confirmed", []string{"› /new", strings.Replace(picker, "› 1.", "  1.", 1), "› Ask anything"}, 1},
+		{"agent rejected reset", "failure starting a new conversation", []string{"› /new", "Unknown command: /new\n› Ask anything"}, 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ex := tmux.NewFakeExecutor()
+			ex.ExecResult["display-message -p -t %1 "+paneStateFormat] = "0|0||codex"
+			screens := tt.screens
+			ex.CaptureHook = func(_ string, _ int) (string, error) {
+				if len(screens) == 0 {
+					t.Fatal("kept polling after the last screen")
+				}
+				screen := screens[0]
+				screens = screens[1:]
+				return screen, nil
+			}
+			o := testPRLoopOptions()
+			o.PollInterval, o.PhaseTimeout = time.Millisecond, time.Second
+			var out bytes.Buffer
+			err := resetPRPane(context.Background(), ex, "%1", o, &out)
+			gotError := ""
+			if err != nil {
+				gotError = err.Error()
+			}
+			if (gotError == "") != (tt.wantError == "") || !strings.Contains(gotError, tt.wantError) {
+				t.Fatalf("error = %q, want %q", gotError, tt.wantError)
+			}
+			enters := 0
+			for _, call := range ex.ExecCalls {
+				if reflect.DeepEqual(call, []string{"send-keys", "-t", "%1", "Enter"}) {
+					enters++
+				}
+			}
+			if len(screens) != 0 || len(ex.SendLinesCalls) != 1 || ex.SendLinesCalls[0].Content != "/new" || enters != tt.wantEnters {
+				t.Fatalf("captures remaining = %v, pasted = %v, Enter presses = %d", screens, ex.SendLinesCalls, enters)
+			}
+		})
+	}
 }
 
 func TestPRLoopCommandWithFakeGH(t *testing.T) {
 	fakePRGH(t)
-	for _, state := range []string{"OPEN", "MERGED"} {
-		t.Setenv("TMUXAI_TEST_PR_JSON", fmt.Sprintf(`{"number":333,"state":%q,"isDraft":false}`, state))
-		command := newPRLoopCommand()
-		command.SetArgs([]string{"333", "--repo", "owner/repo", "--draft-pane", "project:1", "--ready-pane", "project:2", "--dry-run", "--stable-polls", "1"})
-		var out bytes.Buffer
-		command.SetOut(&out)
-		if err := command.Execute(); err != nil {
-			t.Fatal(err)
+	for _, repo := range []string{"owner/repo", ""} {
+		o := testPRLoopOptions()
+		o.Repo = repo
+		if err := o.validate(); err != nil {
+			t.Fatalf("repo=%q should be accepted: %v", repo, err)
 		}
-		want := "$pr-review-merge 333"
-		if state == "MERGED" {
-			want = "merged; stopped"
+		expected := "pr view 333 --repo owner/repo --json number,state,isDraft"
+		if repo == "" {
+			expected = "pr view 333 --json number,state,isDraft"
 		}
-		if !strings.Contains(out.String(), want) {
-			t.Fatalf("command output = %s; want %s", out.String(), want)
+		t.Setenv("TMUXAI_TEST_GH_ARGS", expected)
+		for _, state := range []string{"OPEN", "MERGED"} {
+			t.Setenv("TMUXAI_TEST_PR_JSON", fmt.Sprintf(`{"number":333,"state":%q,"isDraft":false}`, state))
+			command := newPRLoopCommand()
+			args := []string{"333", "--draft-pane", "project:1", "--ready-pane", "project:2", "--dry-run", "--stable-polls", "1"}
+			if repo != "" {
+				args = append(args, "--repo", repo)
+			}
+			command.SetArgs(args)
+			var out bytes.Buffer
+			command.SetOut(&out)
+			if err := command.Execute(); err != nil {
+				t.Fatal(err)
+			}
+			want := "$pr-review-merge 333"
+			if state == "MERGED" {
+				want = "merged; stopped"
+			}
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("command output = %s; want %s", out.String(), want)
+			}
+			if prepared := strings.Contains(out.String(), "Would prepare the PR branch"); prepared != (state == "OPEN") {
+				t.Fatalf("unexpected branch preparation preview: %s", out.String())
+			}
 		}
 	}
 }
@@ -374,33 +620,52 @@ func TestLivePRLoopNativeCommands(t *testing.T) {
 }
 
 // Run the command itself against two real panes. Only gh is faked: the agent
-// stand-ins publish draft -> ready -> draft -> ready -> merged after receiving
-// exactly the expected native command. No GitHub repository is contacted.
+// stand-ins publish draft -> ready -> draft -> ready -> merged for the first PR,
+// and draft -> ready -> merged for the second. No GitHub repository is contacted.
 func TestLivePRLoopCycleWithFakeGH(t *testing.T) {
 	if os.Getenv("TMUXAI_LIVE_TMUX") != "1" {
 		t.Skip("set TMUXAI_LIVE_TMUX=1 to run live PR loop tests")
 	}
 	dir := fakePRGH(t)
+	repoDir := initPRCheckoutRepository(t, filepath.Join(dir, "repo"))
+	checkoutGit(t, repoDir, "branch", "pr-334")
 	statePath := filepath.Join(dir, "pr.json")
+	nextStatePath := filepath.Join(dir, "next-pr.json")
 	logPath := filepath.Join(dir, "commands.log")
+	checkoutLog := filepath.Join(dir, "checkout.log")
+	t.Setenv("TMUXAI_TEST_CHECKOUT_LOG", checkoutLog)
 	t.Setenv("TMUXAI_TEST_PR_STATE", statePath)
+	t.Setenv("TMUXAI_TEST_PR_STATE_NEXT", nextStatePath)
 	if err := os.WriteFile(statePath, []byte(`{"number":333,"state":"OPEN","isDraft":true}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(nextStatePath, []byte(`{"number":334,"state":"OPEN","isDraft":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	script := filepath.Join(dir, "agent.py")
-	const agent = `import json, os, sys
-role, state, log = sys.argv[1:]
-expected = "/custom-ready 333" if role == "draft" else "$custom-review 333"
+	const agent = `import json, os, subprocess, sys
+role, first_state, next_state, log = sys.argv[1:]
+expected = "/custom-ready" if role == "draft" else "$custom-review"
 count = 0
 while True:
     text = input("> ")
+    if text == "/new":
+        with open(log, "a") as out:
+            out.write(role + ":/new\n")
+        print("\033[2J\033[H", end="", flush=True)
+        continue
+    command, number = text.split(" ")
+    if command != expected or number not in ("333", "334"):
+        sys.exit(2)
+    if subprocess.check_output(["git", "branch", "--show-current"], text=True).strip() != "pr-" + number:
+        sys.exit(3)
     with open(log, "a") as out:
         out.write(role + ":" + text + "\n")
-    if text != expected:
-        sys.exit(2)
     count += 1
-    merged = role == "ready" and count == 2
-    value = {"number":333, "state":"MERGED" if merged else "OPEN", "isDraft":role == "ready" and not merged}
+    subprocess.run(["git", "switch", "main"], check=True)
+    state = first_state if number == "333" else next_state
+    merged = role == "ready" and (number == "334" or count == 2)
+    value = {"number":int(number), "state":"MERGED" if merged else "OPEN", "isDraft":role == "ready" and not merged}
     temporary = state + "." + role
     with open(temporary, "w") as out:
         json.dump(value, out)
@@ -412,13 +677,13 @@ while True:
 	ex := tmux.NewExecutor()
 	session := fmt.Sprintf("tmuxai-pr-loop-%d", os.Getpid())
 	agentCommand := func(role string) string {
-		return "python3 " + shellQuote(script) + " " + role + " " + shellQuote(statePath) + " " + shellQuote(logPath)
+		return "python3 " + shellQuote(script) + " " + role + " " + shellQuote(statePath) + " " + shellQuote(nextStatePath) + " " + shellQuote(logPath)
 	}
-	if _, err := ex.Exec("new-session", "-d", "-s", session, "-n", "draft", agentCommand("draft")); err != nil {
+	if _, err := ex.Exec("new-session", "-d", "-s", session, "-n", "draft", "-c", repoDir, agentCommand("draft")); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _, _ = ex.Exec("kill-session", "-t", session) })
-	if _, err := ex.Exec("new-window", "-d", "-t", session, "-n", "ready", agentCommand("ready")); err != nil {
+	if _, err := ex.Exec("new-window", "-d", "-t", session, "-n", "ready", "-c", repoDir, agentCommand("ready")); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -437,8 +702,21 @@ while True:
 	}
 	command := newPRLoopCommand()
 	command.SetContext(ctx)
-	command.SetArgs([]string{"333", "--repo", "owner/repo",
-		"--draft-pane", session + ":draft", "--ready-pane", session + ":ready",
+	callerPane, err := ex.ResolveTarget(session + ":draft")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMUX_PANE", callerPane)
+	draftIndex, err := ex.Exec("display-message", "-p", "-t", callerPane, "#{window_index}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readyIndex, err := ex.Exec("display-message", "-p", "-t", session+":ready", "#{window_index}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.SetArgs([]string{"333", "334", "--repo", "owner/repo",
+		"--draft-pane", strings.TrimSpace(draftIndex), "--ready-pane", strings.TrimSpace(readyIndex),
 		"--draft-command", "/custom-ready {pr}", "--ready-command", "$custom-review {pr}",
 		"--poll-interval", "25ms", "--submit-delay", "50ms", "--max-actions", "4"})
 	var out bytes.Buffer
@@ -450,8 +728,12 @@ while True:
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "draft:/custom-ready 333\nready:$custom-review 333\ndraft:/custom-ready 333\nready:$custom-review 333\n"
-	if string(commands) != want || !strings.Contains(out.String(), "merged; stopped") {
+	want := "draft:/custom-ready 333\nready:$custom-review 333\ndraft:/custom-ready 333\nready:$custom-review 333\ndraft:/new\nready:/new\ndraft:/custom-ready 334\nready:$custom-review 334\n"
+	if string(commands) != want || strings.Count(out.String(), "merged; stopped") != 2 {
 		t.Fatalf("commands=%q; output=%s", commands, out.String())
+	}
+	checkouts, err := os.ReadFile(checkoutLog)
+	if err != nil || string(checkouts) != strings.Repeat(repoDir+"\n", 6) {
+		t.Fatalf("each draft and ready phase must check out the PR branch first: %q, err=%v", checkouts, err)
 	}
 }
