@@ -30,6 +30,8 @@ func TestParsePRPhase(t *testing.T) {
 	}{
 		{"draft", `{"number":333,"state":"OPEN","isDraft":true}`, prDraft},
 		{"ready", `{"number":333,"state":"OPEN","isDraft":false}`, prReady},
+		{"queued", `{"number":333,"state":"OPEN","isDraft":false,"labels":[{"name":"merge-queue"}]}`, prQueued},
+		{"draft with lingering queue label", `{"number":333,"state":"OPEN","isDraft":true,"labels":[{"name":"merge-queue"}]}`, prDraft},
 		{"auto-merge still ready", `{"number":333,"state":"OPEN","isDraft":false,"autoMergeRequest":{}}`, prReady},
 		{"merged", `{"number":333,"state":"MERGED"}`, prMerged},
 		{"closed", `{"number":333,"state":"CLOSED","isDraft":false}`, ""},
@@ -43,6 +45,39 @@ func TestParsePRPhase(t *testing.T) {
 			phase, err := parsePRPhase([]byte(test.json), 333)
 			if phase != test.phase || (err != nil) != (test.phase == "") {
 				t.Fatalf("parsePRPhase() = %q, %v; want %q", phase, err, test.phase)
+			}
+		})
+	}
+}
+
+func TestPRLoopMergeTrain(t *testing.T) {
+	o := testPRLoopOptions()
+	o.StablePolls = 1
+	for _, tt := range []struct {
+		name    string
+		phases  []prPhase
+		want    []string
+		wantErr string
+		dryRun  bool
+		observe bool
+		timeout time.Duration
+	}{
+		{name: "review enqueues", phases: []prPhase{prReady, prQueued, prQueued, prMerged}, want: []string{"ready:$pr-review-merge 333"}},
+		{name: "already queued", phases: []prPhase{prQueued, prQueued, prMerged}},
+		{name: "already queued dry run", phases: []prPhase{prQueued}, dryRun: true},
+		{name: "drafted after enqueue", phases: []prPhase{prQueued, prDraft, prMerged}, want: []string{"draft:/pr-ready 333"}, observe: true},
+		{name: "withdrawn from queue", phases: []prPhase{prQueued, prReady}, wantErr: "left the merge train"},
+		{name: "queue timeout", phases: []prPhase{prQueued, prQueued}, wantErr: "stayed in waiting for merge train", timeout: time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			options := o
+			options.DryRun, options.Observe, options.PhaseTimeout = tt.dryRun, tt.observe, tt.timeout
+			sent, out, err := exercisePRLoop(t, options, phaseObservations(tt.phases...), nil)
+			if !reflect.DeepEqual(sent, tt.want) || strings.Count(out, "is in the merge train") != 1 {
+				t.Fatalf("dispatches=%v; output=%s", sent, out)
+			}
+			if tt.wantErr == "" && err != nil || tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr)) {
+				t.Fatalf("error=%v, want %q", err, tt.wantErr)
 			}
 		})
 	}
@@ -383,7 +418,7 @@ case "$*" in
   'pr checkout https://github.com/owner/repo/pull/334')
     printf '%s\n' "$PWD" >> "$TMUXAI_TEST_CHECKOUT_LOG"
     exec git switch pr-334 ;;
-  'pr view 334 --repo owner/repo --json number,state,isDraft')
+  'pr view 334 --repo owner/repo --json number,state,isDraft,labels')
     case "$(cat "$TMUXAI_TEST_PR_STATE")" in
       *MERGED*) exec cat "$TMUXAI_TEST_PR_STATE_NEXT" ;;
       *) exit 2 ;;
@@ -405,7 +440,7 @@ fi
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
-	t.Setenv("TMUXAI_TEST_GH_ARGS", "pr view 333 --repo owner/repo --json number,state,isDraft")
+	t.Setenv("TMUXAI_TEST_GH_ARGS", "pr view 333 --repo owner/repo --json number,state,isDraft,labels")
 	return dir
 }
 
@@ -564,9 +599,9 @@ func TestPRLoopCommandWithFakeGH(t *testing.T) {
 		if err := o.validate(); err != nil {
 			t.Fatalf("repo=%q should be accepted: %v", repo, err)
 		}
-		expected := "pr view 333 --repo owner/repo --json number,state,isDraft"
+		expected := "pr view 333 --repo owner/repo --json number,state,isDraft,labels"
 		if repo == "" {
-			expected = "pr view 333 --json number,state,isDraft"
+			expected = "pr view 333 --json number,state,isDraft,labels"
 		}
 		t.Setenv("TMUXAI_TEST_GH_ARGS", expected)
 		for _, state := range []string{"OPEN", "MERGED"} {

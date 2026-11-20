@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/llmore/tmux-ai/internal/ollama"
 	"github.com/llmore/tmux-ai/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -25,6 +26,7 @@ type prPhase string
 const (
 	prDraft  prPhase = "draft"
 	prReady  prPhase = "ready"
+	prQueued prPhase = "waiting for merge train"
 	prMerged prPhase = "merged"
 )
 
@@ -35,8 +37,10 @@ type prLoopOptions struct {
 	DraftCommand, ReadyCommand     string
 	PollInterval, PhaseTimeout     time.Duration
 	SubmitDelay, AgentStartTimeout time.Duration
+	DiagnoseIdleAfter              time.Duration
 	StablePolls, MaxActions        int
 	Observe, DryRun, WatchPane     bool
+	PilotSkills                    bool
 }
 
 func init() { rootCmd.AddCommand(newPRLoopCommand()) }
@@ -49,8 +53,10 @@ func newPRLoopCommand() *cobra.Command {
 		Annotations: map[string]string{noLLMAnnotation: "true"},
 		Long: `Poll GitHub PR state with gh, without an LLM.
 Draft PRs receive --draft-command; ready PRs receive --ready-command; merged PRs are done.
+Ready PRs labeled merge-queue wait for the merge train without dispatching a command.
 PRs are processed in the given order. Each must merge before the next starts.
 Use --draft-agent and --ready-agent to launch fresh agents per PR in a dedicated checkout.
+Use --pilot-skills to launch from the verified default branch and let Pilot's skills own checkout and report results.
 With prestarted panes, wait for both panes and send /new between PRs.
 An error stops the batch. A PR that is already merged is skipped.
 Before each draft or ready command, check out the PR branch in the target pane's local directory.
@@ -62,7 +68,7 @@ Each observed phase is dispatched once; unchanged state never resends a command.
 When using --draft-pane and --ready-pane, start both agents before invoking pr-loop.
 Use --observe to wait for the next state change on the first listed PR when resuming.
 Use --watch-pane to report visible agent activity and alert on prompts that may need attention.
-With --watch-pane, a phase timeout applies only if --phase-timeout is explicitly set.
+Use --diagnose-idle-after to optionally ask Ollama for a diagnostic when a pane stops progressing.
 Without --repo, gh selects the repository from the working directory (or GH_REPO).
 Bare window numbers select windows in the session containing $TMUX_PANE.
 
@@ -77,9 +83,6 @@ Example:
 				return err
 			}
 			runOptions := options
-			if runOptions.WatchPane && !cmd.Flags().Changed("phase-timeout") {
-				runOptions.PhaseTimeout = 0
-			}
 			if err := runOptions.validate(); err != nil {
 				return err
 			}
@@ -87,6 +90,13 @@ Example:
 			defer stop()
 			ex := tmux.NewExecutor()
 			out := cmd.OutOrStdout()
+			var diagnose func(context.Context, string) (prPaneDiagnosis, error)
+			if runOptions.DiagnoseIdleAfter > 0 && !runOptions.DryRun {
+				client := ollama.NewClient(ollamaHost, model)
+				diagnose = func(ctx context.Context, screen string) (prPaneDiagnosis, error) {
+					return diagnosePRPane(ctx, client, screen)
+				}
+			}
 			var managed *managedPRAgents
 			if runOptions.launchAgents() {
 				managed = &managedPRAgents{executor: ex, options: runOptions, out: out}
@@ -125,24 +135,32 @@ Example:
 
 				resetPanes := managed == nil && index+1 < len(numbers) && !runOptions.DryRun
 				prActive := false
-				var watchPane func(prPhase)
-				watch := prPaneWatch{executor: ex, number: number, out: out}
-				if resetPanes || runOptions.WatchPane {
-					watchPane = func(phase prPhase) {
-						prActive = true
-						if runOptions.WatchPane {
-							if managed != nil {
-								if pane := managed.panes[phase]; pane != "" {
-									watch.poll(phase, pane)
-								}
-								return
+				watch := prPaneWatch{executor: ex, number: number, out: out, quiet: !runOptions.WatchPane,
+					diagnoseAfter: runOptions.DiagnoseIdleAfter, diagnose: diagnose}
+				checkPane := func(ctx context.Context, phase prPhase) error {
+					prActive = true
+					if managed != nil {
+						if runOptions.PilotSkills {
+							if err := managed.checkPilotResult(ctx, phase); err != nil {
+								return err
 							}
-							pane, _ := paneForPhase(phase)
-							watch.poll(phase, pane)
 						}
+						if pane := managed.panes[phase]; pane != "" {
+							return watch.poll(ctx, phase, pane, time.Now())
+						}
+						return nil
 					}
+					pane, err := paneForPhase(phase)
+					if err != nil {
+						return err
+					}
+					return watch.poll(ctx, phase, pane, time.Now())
 				}
-				if err := runPRLoop(ctx, runOptions, queryPRPhase, send, watchPane, waitPRPoll, time.Now, out); err != nil {
+				query := queryPRPhase
+				if runOptions.PilotSkills {
+					query = queryPilotPRPhase
+				}
+				if err := runPRLoop(ctx, runOptions, query, send, checkPane, waitPRPoll, time.Now, out); err != nil {
 					if len(numbers) == 1 {
 						return err
 					}
@@ -173,6 +191,7 @@ Example:
 	flags.StringVar(&options.ReadyPane, "ready-pane", "", "Prestarted agent for ready PRs: window number, alias, %ID, or session:window.pane")
 	flags.StringVar(&options.DraftAgent, "draft-agent", "", "Executable to launch for draft PRs, e.g. claude")
 	flags.StringVar(&options.ReadyAgent, "ready-agent", "", "Executable to launch for ready PRs, e.g. codex")
+	flags.BoolVar(&options.PilotSkills, "pilot-skills", false, "Start managed agents on the verified default branch and read Pilot skill results")
 	flags.DurationVar(&options.AgentStartTimeout, "agent-start-timeout", time.Minute, "Maximum wait for a launched agent's input prompt")
 	flags.StringVar(&options.DraftCommand, "draft-command", "/pr-ready {pr}", "Native draft-phase skill/command; {pr} is replaced by the PR number")
 	flags.StringVar(&options.ReadyCommand, "ready-command", "$pr-review-merge {pr}", "Native ready-phase skill/command; {pr} is replaced by the PR number")
@@ -183,6 +202,7 @@ Example:
 	flags.IntVar(&options.MaxActions, "max-actions", 20, "Maximum native command dispatches per PR")
 	flags.BoolVar(&options.Observe, "observe", false, "Skip the first listed PR's initial command and wait for a state change")
 	flags.BoolVar(&options.WatchPane, "watch-pane", false, "Report visible activity in the active agent pane and alert when it may need attention")
+	flags.DurationVar(&options.DiagnoseIdleAfter, "diagnose-idle-after", 0, "Ask Ollama for a diagnostic after this long without visible pane progress (0 disables)")
 	flags.BoolVar(&options.DryRun, "dry-run", false, "Show the initial action for each PR without sending input or connecting to tmux")
 	return command
 }
@@ -242,6 +262,9 @@ func resolvePRLoopTargets(ex tmux.Executor, alias func(string) string, draft, re
 }
 
 func (o prLoopOptions) validate() error {
+	if o.PilotSkills && !o.launchAgents() {
+		return fmt.Errorf("--pilot-skills requires --draft-agent and --ready-agent")
+	}
 	if o.Repo != "" {
 		parts := strings.Split(o.Repo, "/")
 		if len(parts) < 2 || len(parts) > 3 || strings.IndexFunc(o.Repo, unicode.IsSpace) >= 0 || strings.ContainsAny(o.Repo, "\\:") {
@@ -274,6 +297,9 @@ func (o prLoopOptions) validate() error {
 	if o.PollInterval <= 0 || o.StablePolls <= 0 || o.MaxActions <= 0 || o.PhaseTimeout < 0 || o.SubmitDelay < 0 {
 		return fmt.Errorf("poll interval, stable polls, and max actions must be positive; timeouts/delays must not be negative")
 	}
+	if o.DiagnoseIdleAfter < 0 {
+		return fmt.Errorf("--diagnose-idle-after must not be negative")
+	}
 	return nil
 }
 
@@ -281,13 +307,16 @@ func (o prLoopOptions) launchAgents() bool {
 	return o.DraftAgent != "" || o.ReadyAgent != ""
 }
 
-// GitHub has OPEN/CLOSED/MERGED and a separate isDraft boolean. Only these
-// three workflow phases are actionable; CLOSED without merge is an error.
+// GitHub has OPEN/CLOSED/MERGED and a separate isDraft boolean. A merge-train
+// label on a ready PR indicates a handoff to the train, not a completed merge.
 func parsePRPhase(data []byte, number int) (prPhase, error) {
 	var pr struct {
 		Number  int    `json:"number"`
 		State   string `json:"state"`
 		IsDraft *bool  `json:"isDraft"`
+		Labels  []struct {
+			Name string `json:"name"`
+		} `json:"labels"`
 	}
 	if err := json.Unmarshal(data, &pr); err != nil {
 		return "", fmt.Errorf("invalid GitHub PR JSON: %w", err)
@@ -305,6 +334,11 @@ func parsePRPhase(data []byte, number int) (prPhase, error) {
 		if *pr.IsDraft {
 			return prDraft, nil
 		}
+		for _, label := range pr.Labels {
+			if strings.EqualFold(label.Name, "merge-queue") {
+				return prQueued, nil
+			}
+		}
 		return prReady, nil
 	case "CLOSED":
 		return "", fmt.Errorf("PR #%d is closed without being merged; stopping", number)
@@ -320,7 +354,7 @@ func queryPRPhase(ctx context.Context, repo string, number int) (prPhase, error)
 	if repo != "" {
 		args = append(args, "--repo", repo)
 	}
-	args = append(args, "--json", "number,state,isDraft")
+	args = append(args, "--json", "number,state,isDraft,labels")
 	command := exec.CommandContext(ctx, "gh", args...)
 	// gh must never open a browser or prompt for credentials inside the runner.
 	command.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
@@ -338,7 +372,7 @@ type prQueryError struct{ error }
 type prPhaseQuery func(context.Context, string, int) (prPhase, error)
 type prCommandSender func(context.Context, prPhase, string) error
 
-func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send prCommandSender, watchPane func(prPhase), wait func(context.Context, time.Duration) error, now func() time.Time, out io.Writer) error {
+func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send prCommandSender, checkPane func(context.Context, prPhase) error, wait func(context.Context, time.Duration) error, now func() time.Time, out io.Writer) error {
 	var dispatched, candidate prPhase
 	var phaseStarted time.Time
 	stable, actions, queryErrors := 0, 0, 0
@@ -347,6 +381,7 @@ func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send pr
 			return err
 		}
 		phase, err := query(ctx, o.Repo, o.Number)
+		var inspect prPhase
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
@@ -363,68 +398,100 @@ func runPRLoop(ctx context.Context, o prLoopOptions, query prPhaseQuery, send pr
 			fmt.Fprintf(out, "PR query failed (%d/3): %v\n", queryErrors, err)
 		} else {
 			queryErrors = 0
-			if phase == prMerged {
+			switch phase {
+			case prMerged:
 				fmt.Fprintf(out, "PR %s#%d: merged; stopped.\n", o.Repo, o.Number)
 				return nil
-			}
-			if phase != prDraft && phase != prReady {
-				return fmt.Errorf("invalid PR workflow phase %q", phase)
-			}
-			if phase != candidate {
-				candidate, stable = phase, 1
-			} else if stable < o.StablePolls {
-				stable++
-			}
-			if stable >= o.StablePolls && phase != dispatched {
-				if o.Observe && dispatched == "" {
-					fmt.Fprintf(out, "PR %s#%d: observing %s; initial command skipped.\n", o.Repo, o.Number, phase)
-					o.Observe = false
-				} else {
-					if actions >= o.MaxActions {
-						return fmt.Errorf("reached --max-actions=%d before merge", o.MaxActions)
-					}
-					text, pane := o.ReadyCommand, o.ReadyPane
-					if phase == prDraft {
-						text, pane = o.DraftCommand, o.DraftPane
-					}
-					if o.launchAgents() {
-						pane = o.ReadyAgent
-						if phase == prDraft {
-							pane = o.DraftAgent
-						}
-					}
-					text = strings.ReplaceAll(text, "{pr}", strconv.Itoa(o.Number))
-					fmt.Fprintf(out, "PR %s#%d: %s -> %s: %s\n", o.Repo, o.Number, phase, pane, text)
-					if o.DryRun && o.launchAgents() {
-						fmt.Fprintln(out, "Would prepare a managed checkout, launch the agent in tmux, and send the native command.")
-					} else if o.DryRun {
-						fmt.Fprintln(out, "Would prepare the PR branch in the target pane's working directory, or append instructions to use its existing worktree, before sending the native command.")
-					}
-					if o.DryRun {
-						return nil
-					}
-					if err := send(ctx, phase, text); err != nil {
-						if errors.Is(err, errPRBranchPreparation) {
-							return err
-						}
-						return fmt.Errorf("native command delivery failed; delivery may be partial, inspect pane before restarting: %w", err)
-					}
-					actions++
+			case prQueued:
+				if dispatched != prQueued {
+					fmt.Fprintf(out, "PR #%d is in the merge train (merge-queue); waiting for GitHub to confirm merge.\n", o.Number)
+					dispatched, phaseStarted = prQueued, now()
 				}
 				if o.DryRun {
 					return nil
 				}
-				dispatched, phaseStarted = phase, now()
-				fmt.Fprintln(out, "Waiting for PR state to change; unchanged state will not resend the command.")
-			}
-			if watchPane != nil && phase == dispatched && ctx.Err() == nil {
-				watchPane(phase)
+				o.Observe = false
+				candidate, stable = "", 0
+			case prDraft, prReady:
+				if phase == prReady && dispatched == prQueued {
+					return fmt.Errorf("PR #%d left the merge train while still ready; inspect GitHub before retrying", o.Number)
+				}
+				if phase != candidate {
+					candidate, stable = phase, 1
+				} else if stable < o.StablePolls {
+					stable++
+				}
+				if stable >= o.StablePolls && phase != dispatched {
+					if o.Observe && dispatched == "" {
+						fmt.Fprintf(out, "PR %s#%d: observing %s; initial command skipped.\n", o.Repo, o.Number, phase)
+						o.Observe = false
+					} else {
+						if actions >= o.MaxActions {
+							return fmt.Errorf("reached --max-actions=%d before merge", o.MaxActions)
+						}
+						text, pane := o.ReadyCommand, o.ReadyPane
+						if phase == prDraft {
+							text, pane = o.DraftCommand, o.DraftPane
+						}
+						if o.launchAgents() {
+							pane = o.ReadyAgent
+							if phase == prDraft {
+								pane = o.DraftAgent
+							}
+						}
+						text = strings.ReplaceAll(text, "{pr}", strconv.Itoa(o.Number))
+						fmt.Fprintf(out, "PR %s#%d: %s -> %s: %s\n", o.Repo, o.Number, phase, pane, text)
+						if o.DryRun && o.PilotSkills {
+							fmt.Fprintln(out, "Would launch on the verified default branch and let the Pilot skill check out the PR.")
+						} else if o.DryRun && o.launchAgents() {
+							fmt.Fprintln(out, "Would prepare a managed checkout, launch the agent in tmux, and send the native command.")
+						} else if o.DryRun {
+							fmt.Fprintln(out, "Would prepare the PR branch in the target pane's working directory, or append instructions to use its existing worktree, before sending the native command.")
+						}
+						if o.DryRun {
+							return nil
+						}
+						if err := send(ctx, phase, text); err != nil {
+							if errors.Is(err, errPRBranchPreparation) {
+								return err
+							}
+							return fmt.Errorf("native command delivery failed; delivery may be partial, inspect pane before restarting: %w", err)
+						}
+						actions++
+					}
+					if o.DryRun {
+						return nil
+					}
+					dispatched, phaseStarted = phase, now()
+					fmt.Fprintln(out, "Waiting for PR state to change; unchanged state will not resend the command.")
+				}
+				if phase == dispatched {
+					inspect = phase
+				}
+			default:
+				return fmt.Errorf("invalid PR workflow phase %q", phase)
 			}
 		}
-		if !phaseStarted.IsZero() && o.PhaseTimeout > 0 && now().Sub(phaseStarted) >= o.PhaseTimeout {
-			return fmt.Errorf("PR stayed in %s for %s; inspect the agent, no command resent", dispatched, o.PhaseTimeout)
+		if inspect != "" && checkPane != nil && ctx.Err() == nil {
+			checkCtx, cancel := ctx, func() {}
+			if !phaseStarted.IsZero() && o.PhaseTimeout > 0 {
+				checkCtx, cancel = context.WithTimeout(ctx, o.PhaseTimeout-now().Sub(phaseStarted))
+			}
+			err := checkPane(checkCtx, inspect)
+			cancel()
+			if err != nil {
+				return err
+			}
 		}
-		if err := wait(ctx, o.PollInterval); err != nil {
+		pollDelay := o.PollInterval
+		if !phaseStarted.IsZero() && o.PhaseTimeout > 0 {
+			remaining := o.PhaseTimeout - now().Sub(phaseStarted)
+			if remaining <= 0 {
+				return fmt.Errorf("PR #%d stayed in %s for %s; no command resent", o.Number, dispatched, o.PhaseTimeout)
+			}
+			pollDelay = min(pollDelay, remaining)
+		}
+		if err := wait(ctx, pollDelay); err != nil {
 			return err
 		}
 	}

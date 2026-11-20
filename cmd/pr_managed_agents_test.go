@@ -97,6 +97,15 @@ func TestLivePRLoopLaunchesManagedAgents(t *testing.T) {
 	const clone = `if [ "$1 $2 $3" = 'repo clone https://github.com/owner/repo' ]; then
   exec git clone -q "$TMUXAI_TEST_PR_SOURCE" "$4"
 fi
+if [ "$*" = 'pr view 334 --repo owner/repo --json number,state,isDraft,labels' ]; then
+  case "$(cat "$TMUXAI_TEST_PR_STATE_NEXT")" in
+    *merge-queue*)
+      cat "$TMUXAI_TEST_PR_STATE_NEXT"
+      printf '%s' '{"number":334,"state":"MERGED"}' > "$TMUXAI_TEST_PR_STATE_NEXT.train"
+      mv "$TMUXAI_TEST_PR_STATE_NEXT.train" "$TMUXAI_TEST_PR_STATE_NEXT"
+      exit 0 ;;
+  esac
+fi
 `
 	script := strings.Replace(string(gh), "case \"$*\" in", clone+"case \"$*\" in", 1)
 	t.Setenv("TMUXAI_TEST_CHECKOUT_LOG", filepath.Join(dir, "checkout-log"))
@@ -120,11 +129,15 @@ while True:
     if prompt != (f"/repair {number}" if role == "draft" else f"$review {number}"):
         sys.exit(2)
     count += 1
-    merged = role == "ready" and (number == 334 or count == 2)
+    queued = role == "ready" and number == 334
+    merged = role == "ready" and not queued and count == 2
     with open(path + ".tmp", "w") as out:
         json.dump({"number": number, "state": "MERGED" if merged else "OPEN",
-                   "isDraft": role == "ready" and not merged}, out)
+                   "isDraft": role == "ready" and not (queued or merged),
+                   "labels": [{"name": "merge-queue"}] if queued else []}, out)
     os.replace(path + ".tmp", path)
+    if queued:
+        sys.exit(0)
 `
 	if err := os.WriteFile(agentPath, []byte(agent), 0o600); err != nil {
 		t.Fatal(err)
@@ -163,6 +176,9 @@ while True:
 		"ready:$review 333", "ready:start:pr-334", "ready:$review 334"}
 	if got := strings.Split(strings.TrimSpace(string(data)), "\n"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("managed agent lifecycle = %v, want %v\n%s", got, want, out.String())
+	}
+	if !strings.Contains(out.String(), "PR #334 is in the merge train") {
+		t.Fatalf("missing merge train wait after reviewer exited:\n%s", out.String())
 	}
 	entries, err := os.ReadDir(filepath.Join(cache, "tmux-ai"))
 	if err != nil || len(entries) != 0 {

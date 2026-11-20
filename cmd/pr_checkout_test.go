@@ -49,7 +49,7 @@ func checkoutFixture(t *testing.T) (string, string, *tmux.FakeExecutor) {
 	t.Setenv("TMUXAI_TEST_CHECKOUT_JSON", `{"number":333,"url":"https://github.com/owner/repo/pull/333","headRefName":"pr-333"}`)
 	const gh = `#!/bin/sh
 case "$*" in
-  'pr view 333 --repo owner/repo --json number,state,isDraft')
+  'pr view 333 --repo owner/repo --json number,state,isDraft,labels')
     printf '{"number":333,"state":"OPEN","isDraft":%s}' "${TMUXAI_TEST_IS_DRAFT:-true}" ;;
   'pr view 333 --repo owner/repo --json number,url,headRefName'|'pr view 333 --json number,url,headRefName')
     printf '%s' "$TMUXAI_TEST_CHECKOUT_JSON" ;;

@@ -25,6 +25,8 @@ type managedPRAgents struct {
 	session      string
 	panes        map[prPhase]string
 	activePane   string
+	pilotBase    *pilotStartupBranch
+	pilotTask    *pilotPRTask
 }
 
 var prNumberedSelection = regexp.MustCompile("^[›❯>][ \\t]*[0-9]+[.)][ \\t]")
@@ -61,6 +63,14 @@ func (a *managedPRAgents) send(ctx context.Context, number int, phase prPhase, p
 			return err
 		}
 	}
+	if a.options.PilotSkills {
+		task, err := a.preparePilotTask(ctx, number, phase)
+		if err != nil {
+			return err
+		}
+		a.pilotTask = task
+		prompt += " --pr-loop-task=" + strconv.Quote(task.path)
+	}
 	if err := sendNativePRCommand(ctx, a.executor, pane, prompt, a.options.SubmitDelay); err != nil {
 		return err
 	}
@@ -94,6 +104,9 @@ func (a *managedPRAgents) prepareCheckout(ctx context.Context, number int) error
 		if _, err := runPRCheckoutCommand(ctx, "", "gh", "repo", "clone", baseURL, a.checkout); err != nil {
 			return err
 		}
+	}
+	if a.options.PilotSkills {
+		return a.verifyPilotStartup(ctx)
 	}
 	branch, err := runPRCheckoutCommand(ctx, a.checkout, "git", "branch", "--show-current")
 	if err != nil {
@@ -222,12 +235,19 @@ func (a *managedPRAgents) finishPR(ctx context.Context) error {
 		}
 	}
 	a.session, a.activePane, a.panes = "", "", nil
+	a.pilotTask = nil
 	return nil
 }
 
 func (a *managedPRAgents) cleanupCheckout(ctx context.Context) {
 	if a.checkout == "" {
 		return
+	}
+	if a.options.PilotSkills {
+		if _, err := os.Lstat(filepath.Join(a.checkout, ".pr-ready")); !os.IsNotExist(err) {
+			fmt.Fprintf(a.out, "Retained managed checkout at %s for Pilot's PR evidence.\n", a.checkout)
+			return
+		}
 	}
 	for _, args := range [][]string{
 		{"status", "--porcelain=v1", "--untracked-files=normal"},

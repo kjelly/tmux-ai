@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/llmore/tmux-ai/internal/tmux"
 )
@@ -67,47 +69,69 @@ type prPaneWatch struct {
 	executor tmux.Executor
 	number   int
 	out      io.Writer
+	quiet    bool
 
-	phase       prPhase
-	last        prPaneActivity
-	lastOutput  string
-	haveCapture bool
-	sawActivity bool
+	diagnoseAfter time.Duration
+	diagnose      func(context.Context, string) (prPaneDiagnosis, error)
+
+	phase        prPhase
+	last         prPaneActivity
+	lastActivity prPaneActivity
+	lastOutput   string
+	lastProgress time.Time
+	haveCapture  bool
+	sawActivity  bool
+	diagnosed    bool
+	unavailable  int
 }
 
-func (w *prPaneWatch) poll(phase prPhase, paneID string) {
+func (w *prPaneWatch) poll(ctx context.Context, phase prPhase, paneID string, now time.Time) error {
 	if w.phase != phase {
-		w.phase, w.last, w.lastOutput = phase, 0, ""
-		w.haveCapture, w.sawActivity = false, false
-	}
-	if paneID == "" {
-		w.report(phase, paneID, prPaneUnavailable)
-		return
+		w.phase, w.last, w.lastActivity, w.lastOutput = phase, 0, 0, ""
+		w.haveCapture, w.sawActivity, w.diagnosed = false, false, false
+		w.unavailable = 0
+		w.lastProgress = now
 	}
 	state := readPaneState(w.executor, paneID)
+	var unavailable prPaneActivity
 	switch {
-	case !state.Known:
-		w.report(phase, paneID, prPaneUnavailable)
-		return
+	case paneID == "" || !state.Known || state.Command == "" && !state.Dead:
+		unavailable = prPaneUnavailable
 	case state.Dead:
-		w.report(phase, paneID, prPaneExited)
-		return
+		unavailable = prPaneExited
 	case isShellCommand(state.Command):
-		w.report(phase, paneID, prPaneShell)
-		return
-	case state.InMode:
+		unavailable = prPaneShell
+	}
+	if unavailable != 0 {
+		w.report(phase, paneID, unavailable)
+		w.unavailable++
+		// Recheck GitHub before treating an exit as fatal. A successful
+		// command can exit as its final GitHub update becomes visible.
+		if w.unavailable >= 2 {
+			return fmt.Errorf("PR #%d %s pane %s: %s before the PR state changed", w.number, phase, paneID, prPaneUnavailableReason(unavailable))
+		}
+		return nil
+	}
+	w.unavailable = 0
+	if state.InMode {
 		w.report(phase, paneID, prPaneInMode)
-		return
+		return nil
+	}
+	if w.quiet && w.diagnose == nil {
+		return nil
 	}
 	screen, err := w.executor.CaptureScreenClean(paneID)
 	if err != nil {
 		w.report(phase, paneID, prPaneUnavailable)
-		return
+		return nil
 	}
 	activity, output := inspectPRPaneScreen(screen)
 	changed := w.haveCapture && output != "" && output != w.lastOutput
-	w.haveCapture, w.lastOutput = true, output
-	if changed {
+	if !w.haveCapture || output != w.lastOutput || activity != w.lastActivity {
+		w.lastProgress, w.diagnosed = now, false
+	}
+	w.haveCapture, w.lastActivity, w.lastOutput = true, activity, output
+	if changed && !w.quiet {
 		fmt.Fprintf(w.out, "PR #%d %s pane %s: visible output changed.\n", w.number, phase, paneID)
 	}
 	w.sawActivity = w.sawActivity || changed || activity == prPaneWorking || activity == prPaneNeedsInput
@@ -115,10 +139,32 @@ func (w *prPaneWatch) poll(phase prPhase, paneID string) {
 		activity = prPaneReturnedToPrompt
 	}
 	w.report(phase, paneID, activity)
+	if w.diagnose != nil && !w.diagnosed && strings.TrimSpace(screen) != "" &&
+		now.Sub(w.lastProgress) >= w.diagnoseAfter && ctx.Err() == nil {
+		w.diagnosed = true
+		diagnosis, err := w.diagnose(ctx, screen)
+		if err != nil {
+			fmt.Fprintf(w.out, "PR #%d %s pane %s: Ollama diagnostic unavailable: %v\n", w.number, phase, paneID, err)
+		} else {
+			fmt.Fprintf(w.out, "PR #%d %s pane %s: Ollama diagnostic (%s): %s\n", w.number, phase, paneID, diagnosis.State, diagnosis.Summary)
+		}
+	}
+	return nil
+}
+
+func prPaneUnavailableReason(activity prPaneActivity) string {
+	switch activity {
+	case prPaneExited:
+		return "agent exited"
+	case prPaneShell:
+		return "agent returned to a shell"
+	default:
+		return "agent pane became unavailable"
+	}
 }
 
 func (w *prPaneWatch) report(phase prPhase, paneID string, activity prPaneActivity) {
-	if w.last == activity {
+	if w.quiet || w.last == activity {
 		return
 	}
 	w.last = activity

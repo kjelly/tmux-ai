@@ -1083,6 +1083,14 @@ session 名稱和 clone 路徑。若 agent 顯示登入或信任目錄提示，�
 若發生錯誤或中斷，runner 會保留已啟動的 pane 與 clone 供檢查。批次成功後，只有在
 確認 clone 沒有本地變更、未發佈的 commit 或 stash 時才會移除。
 
+使用 Pilot 的 `pr-ready` 和 `pr-review-merge` 時，在自動啟動參數加上 `--pilot-skills`。
+這個模式需要 Pilot 預設分支已包含 `pr_loop_result.py`。Runner 從 clone 中驗證的
+`origin` 預設分支啟動 agent，把切換、核對 PR HEAD 和還原 checkout 交給 skill。
+每次派工都附上獨立的結果路徑。GitHub 仍確認 Ready、Draft、入列和合併。若 skill 結束時
+回報當前 PR HEAD 的 `DRAFT-BLOCKED` 或 `WAITING`，runner 會停在該 PR 並顯示原因。
+Ready PR 的 `needs-person` 也會在核對 GitHub 帳號及目前 HEAD 的留言後停下。
+Pilot 模式會保留包含 `.pr-ready/` 驗證紀錄的 clone。
+
 若要沿用已啟動的 agent，改用 `--draft-pane` 和 `--ready-pane`：
 
 ```bash
@@ -1114,6 +1122,7 @@ repository 時，使用 `--repo owner/repo` 覆寫。這裡的工作目錄是 ru
 |---------|------|
 | `draft`（OPEN 且 isDraft=true） | 先切到 PR branch，再在 `--draft-pane` 送出 `--draft-command` |
 | `ready`（OPEN 且 isDraft=false） | 先切到 PR branch，再在 `--ready-pane` 送出 `--ready-command` |
+| `waiting for merge train`（Ready 且有 `merge-queue` 標籤） | 顯示已入列，等 GitHub 確認合併或轉回 Draft |
 | `merged`（MERGED） | 完成該 PR，批次可繼續處理下一支 |
 
 PR 一開始已 ready 時會直接執行審查 skill；審查轉回 draft 後會再次執行修正
@@ -1149,23 +1158,27 @@ Skill 名稱與完整指令都可透過上述兩個 command flags 修改；`{pr}
 同一支 PR 的階段交接依 GitHub PR 狀態判定。Skill 應在完成該階段工作後才改變
 PR 狀態；狀態連續確認後，runner 即可啟動下一階段，即使前一個 agent 還在收尾。
 同一階段等待期間只送出一次指令，狀態不變、畫面靜止或 head commit 更新都不會
-自動重送。若審查 skill 把 PR 送進 merge queue，runner 會等 GitHub 確認合併。
+自動重送。看到 Pilot 的 `merge-queue` 標籤後，runner 會開始計算該次排隊的逾時，
+並持續查詢 GitHub。若排隊期間退回 Draft，runner 會交給 fixer。若標籤移除後仍是 Ready，
+runner 會停止並請你確認 GitHub 上的原因。
 
 | Flag | 預設 | 說明 |
 |------|------|------|
 | `--repo` | 目前 repo | 選填；`[HOST/]OWNER/REPO`，省略時由 `gh` 判斷 |
 | `--draft-agent` / `--ready-agent` | 空 | 草稿修正／Ready 審查的可執行程式，與 pane 參數擇一組 |
+| `--pilot-skills` | `false` | 自動啟動模式從已驗證的預設分支載入 Pilot skill，並讀取本輪結果 |
 | `--agent-start-timeout` | `1m` | 自動啟動後等待 agent 輸入提示的上限 |
 | `--draft-pane` / `--ready-pane` | 空 | 已啟動 agent 的 window 編號或完整 pane target，與 agent 參數擇一組 |
 | `--draft-command` | `/pr-ready {pr}` | 草稿階段的原生指令 |
 | `--ready-command` | `$pr-review-merge {pr}` | ready 階段的原生指令 |
 | `--poll-interval` | `10s` | GitHub 查詢間隔 |
 | `--stable-polls` | `2` | 送出指令前，連續觀察到相同狀態的次數；merged 立即完成該 PR |
-| `--phase-timeout` | `24h` | 每次等待 PR 狀態變更或批次換支時等待 pane 輸入提示的上限；`0` 不限制 |
+| `--phase-timeout` | `24h` | 等待狀態變更、merge train 或 pane 輸入提示的各階段上限；`0` 不限制 |
 | `--submit-delay` | `1s` | 貼上後等待多久再送 Enter |
 | `--max-actions` | `20` | 每支 PR 的原生指令送出次數上限，超過時以錯誤結束 |
 | `--observe` | `false` | 跳過清單中第一支 PR 起始階段的指令，等待下一次狀態變更 |
-| `--watch-pane` | `false` | 監看目前階段的 agent 畫面並提醒；只有明確設定 `--phase-timeout` 才會套用階段逾時 |
+| `--watch-pane` | `false` | 監看目前階段的 agent 畫面並提醒 |
+| `--diagnose-idle-after` | `0` | 畫面持續多久未有可辨識進展後，請 Ollama 診斷；`0` 停用 |
 | `--dry-run` | `false` | 依序查詢並印出每支 PR 的初始動作，不連線 tmux、不切 branch、不送指令 |
 
 若要透過畫面追蹤 agent 的工作，可以開啟 pane 監看：
@@ -1180,10 +1193,20 @@ tmux-ai pr-loop 333 --draft-pane 1 --ready-pane 2 --watch-pane
 終端鈴聲。鈴聲的呈現取決於終端與 tmux 設定。同一提示持續顯示時只提醒一次，流程會繼續
 監看 PR。可搭配 `--observe` 監看已在進行的工作。
 
-畫面訊號取決於 agent 的介面與文字。畫面靜止或只有忙碌指示時，無法確定工作是否有進展。
-下一階段的交接仍依 GitHub PR 狀態判定。
+runner 在每次取得本階段相同的 GitHub 狀態後，也會檢查 pane 的程序。連續兩次發現 agent
+已退出、回到 shell，或 pane 無法讀取時，runner 會指出 PR 和階段並結束。GitHub 已顯示
+入列或合併時，可以繼續等待 merge train 或完成該 PR。
 
-未開啟 pane 監看時，runner 預設每階段最多等待 24 小時。手動關閉等待上限的用法如下。
+`--diagnose-idle-after` 可搭配 `--watch-pane`。它只把有限長度的最近可見畫面送到
+設定的 Ollama `--host` 和 `--model`，用來提示是否在等輸入、遇到工具錯誤或仍在工作。
+每次持續停滯只會查一次；模型結果和錯誤只會顯示在 runner，GitHub 狀態仍決定交接。
+
+```bash
+tmux-ai pr-loop 333 --draft-agent claude --ready-agent codex \
+  --watch-pane --diagnose-idle-after 5m --phase-timeout 2h
+```
+
+runner 預設每階段最多等待 24 小時。手動關閉等待上限的用法如下。
 
 ```bash
 tmux-ai pr-loop 333 --draft-pane 1 --ready-pane 2 --phase-timeout 0
